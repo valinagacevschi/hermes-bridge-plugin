@@ -46,6 +46,21 @@ planned.
 
 ## Install
 
+One-liner (downloads + installs; prompts on the terminal):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/valinagacevschi/hermes-bridge-plugin/main/install.sh | bash
+```
+
+Non-interactive — pre-set any of the env vars to skip the prompts:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/valinagacevschi/hermes-bridge-plugin/main/install.sh \
+  | HERMES_BRIDGE_PROFILE_ID=my-profile HERMES_BRIDGE_API_KEY=hb_… bash
+```
+
+Or from a checkout:
+
 ```bash
 git clone https://github.com/valinagacevschi/hermes-bridge-plugin.git
 cd hermes-bridge-plugin
@@ -53,9 +68,10 @@ cd hermes-bridge-plugin
 ```
 
 `install.sh` copies the `hermes_bridge/` package into
-`~/.hermes/plugins/platforms/hermes_bridge/`, installs the Python deps into the Hermes
-venv, enables the plugin in `~/.hermes/config.yaml`, prompts for the env vars below, and
-generates + displays your PSK as a QR to scan on the phone.
+`~/.hermes/plugins/platforms/hermes_bridge/` (downloading a release tarball first when run
+via `curl`), installs the Python deps into the Hermes venv, enables the plugin in
+`~/.hermes/config.yaml`, records the env vars below, and generates + displays your PSK as a
+QR to scan on the phone.
 
 ### Manual install
 

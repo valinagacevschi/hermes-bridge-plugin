@@ -1,16 +1,44 @@
 #!/usr/bin/env bash
 # Install the Hermes Bridge plugin into the local Hermes agent.
+#
+# Two ways to run:
+#   1. From a checkout:   ./install.sh
+#   2. Straight from the web:
+#        curl -fsSL https://raw.githubusercontent.com/valinagacevschi/hermes-bridge-plugin/main/install.sh | bash
+#
+# Non-interactive (e.g. CI, or to skip the prompts) — pre-set any of:
+#   HERMES_BRIDGE_RELAY_URL  HERMES_BRIDGE_PROFILE_ID  HERMES_BRIDGE_API_KEY
+#        curl -fsSL .../install.sh | HERMES_BRIDGE_PROFILE_ID=me HERMES_BRIDGE_API_KEY=hb_… bash
 set -euo pipefail
 
+REPO_SLUG="valinagacevschi/hermes-bridge-plugin"
+REPO_REF="${HERMES_BRIDGE_REF:-main}"
+DEFAULT_RELAY_URL="wss://herelay.appcenter.ro"
+
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
-# The installable package lives in the hermes_bridge/ subdir; the repo root also
-# holds README/LICENSE/tests which must NOT be copied into the Hermes plugin dir.
-PLUGIN_SRC="$REPO_ROOT/hermes_bridge"
 PLUGIN_DEST="$HERMES_HOME/plugins/platforms/hermes_bridge"
 VENV_PIP="$HERMES_HOME/hermes-agent/venv/bin/pip"
 HERMES_ENV="$HERMES_HOME/.env"
 HERMES_CONFIG="$HERMES_HOME/config.yaml"
+
+# --- Resolve the source: local checkout if present, else download the tarball ---
+# Under `curl | bash` there's no script file on disk, so BASH_SOURCE won't point
+# at a checkout — fall back to downloading a pinned tarball.
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
+if [[ -n "$SELF_DIR" && -d "$SELF_DIR/hermes_bridge" ]]; then
+  SRC_ROOT="$SELF_DIR"
+else
+  command -v curl >/dev/null 2>&1 || { echo "ERROR: curl is required"; exit 1; }
+  command -v tar  >/dev/null 2>&1 || { echo "ERROR: tar is required";  exit 1; }
+  echo "Downloading $REPO_SLUG ($REPO_REF)…"
+  TMP_DIR="$(mktemp -d)"
+  trap 'rm -rf "$TMP_DIR"' EXIT
+  curl -fsSL "https://github.com/$REPO_SLUG/archive/refs/heads/$REPO_REF.tar.gz" \
+    | tar -xz -C "$TMP_DIR"
+  SRC_ROOT="$TMP_DIR/hermes-bridge-plugin-$REPO_REF"
+fi
+PLUGIN_SRC="$SRC_ROOT/hermes_bridge"
+REQ_FILE="$SRC_ROOT/requirements.txt"
 
 echo "Installing Hermes Bridge plugin → $PLUGIN_DEST"
 mkdir -p "$PLUGIN_DEST"
@@ -23,7 +51,7 @@ if [[ ! -x "$VENV_PIP" ]]; then
   exit 1
 fi
 echo "Installing Python dependencies via hermes venv..."
-"$VENV_PIP" install -r "$REPO_ROOT/requirements.txt" --quiet
+"$VENV_PIP" install -r "$REQ_FILE" --quiet
 
 # Enable the plugin in config.yaml (non-bundled plugins require explicit opt-in).
 if [[ -f "$HERMES_CONFIG" ]]; then
@@ -43,23 +71,44 @@ else
   echo "      - platforms/hermes_bridge"
 fi
 
-# Prompt for env vars if not already set.
+# --- Env vars: use pre-set values, else prompt on the terminal ---
+# Reads come from /dev/tty so prompting still works under `curl | bash` (where
+# stdin is the piped script, not the keyboard).
+ask() {  # ask <var-name> <prompt> <default>
+  local __var="$1" __prompt="$2" __default="${3:-}" __ans=""
+  # Try the terminal; silently fall back to the default when there's no usable
+  # tty (e.g. a fully non-interactive `curl | bash` with no controlling terminal).
+  # `2>/dev/null` MUST precede `< /dev/tty`: bash applies redirects left-to-right,
+  # so silencing stderr first suppresses the "Device not configured" message when
+  # opening the tty fails (no controlling terminal).
+  if [[ -r /dev/tty ]]; then
+    read -rp "$__prompt" __ans 2>/dev/null < /dev/tty || __ans=""
+  fi
+  printf -v "$__var" '%s' "${__ans:-$__default}"
+}
+
 if [[ -f "$HERMES_ENV" ]] && grep -q "HERMES_BRIDGE_RELAY_URL" "$HERMES_ENV"; then
   echo "Env vars already in $HERMES_ENV — skipping"
 else
-  echo ""
-  read -rp "Relay WebSocket URL [ws://localhost:8082]: " relay_url
-  relay_url="${relay_url:-ws://localhost:8082}"
+  relay_url="${HERMES_BRIDGE_RELAY_URL:-}"
+  [[ -z "$relay_url" ]] && ask relay_url "Relay WebSocket URL [$DEFAULT_RELAY_URL]: " "$DEFAULT_RELAY_URL"
 
-  read -rp "Profile ID (e.g. work-macbook): " profile_id
+  profile_id="${HERMES_BRIDGE_PROFILE_ID:-}"
+  [[ -z "$profile_id" ]] && ask profile_id "Profile ID: " ""
   if [[ -z "$profile_id" ]]; then
-    echo "ERROR: profile_id is required"
+    echo "ERROR: profile_id is required (set HERMES_BRIDGE_PROFILE_ID or run interactively)"
     exit 1
   fi
 
-  echo "" >> "$HERMES_ENV"
-  echo "HERMES_BRIDGE_RELAY_URL=$relay_url" >> "$HERMES_ENV"
-  echo "HERMES_BRIDGE_PROFILE_ID=$profile_id" >> "$HERMES_ENV"
+  api_key="${HERMES_BRIDGE_API_KEY:-}"
+  [[ -z "$api_key" ]] && ask api_key "API key (hb_…), blank if pairing later: " ""
+
+  {
+    echo ""
+    echo "HERMES_BRIDGE_RELAY_URL=$relay_url"
+    echo "HERMES_BRIDGE_PROFILE_ID=$profile_id"
+    [[ -n "$api_key" ]] && echo "HERMES_BRIDGE_API_KEY=$api_key"
+  } >> "$HERMES_ENV"
   echo "Wrote env vars to $HERMES_ENV"
 fi
 
