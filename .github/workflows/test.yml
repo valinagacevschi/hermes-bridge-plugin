@@ -1,0 +1,26 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+      # crypto interop suite is a standalone script (exits non-zero on failure)
+      - name: Crypto interop tests
+        run: python tests/test_crypto.py
+      # adapter RPC suite is unittest-style — pytest-collectable
+      - name: Adapter RPC tests
+        run: python -m pytest tests/test_rpc.py -q

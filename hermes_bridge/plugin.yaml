@@ -1,0 +1,8 @@
+kind: platform
+name: hermes_bridge
+label: Hermes Bridge
+description: Connects Hermes to the Hermes Bridge mobile relay via outbound WebSocket.
+version: 0.1.0
+required_env:
+  - HERMES_BRIDGE_RELAY_URL
+  - HERMES_BRIDGE_PROFILE_ID
