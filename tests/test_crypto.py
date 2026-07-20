@@ -37,7 +37,7 @@ import crypto as _crypto_mod
 def _reset_cache():
     _crypto_mod._nonce_cache = deque(maxlen=_crypto_mod.MAX_NONCE_CACHE)
 
-from crypto import seal, open_frame, VERSION, NONCE_BYTES
+from crypto import seal, open_frame, seal_blob, open_blob, VERSION, NONCE_BYTES
 
 PSK = bytes(range(32))  # 0x00..0x1f — deterministic test key
 PROFILE = "test_profile"
@@ -177,6 +177,39 @@ try:
         fail("known-vector JS→Python interop", f"got {_kv_payload}")
 except Exception as exc:
     fail("known-vector JS→Python interop", f"raised {type(exc).__name__}: {exc}")
+
+# ---------------------------------------------------------------------------
+# 8. Sealed-blob round-trip + no-replay-guard + profile binding
+#    (attachments/voice use seal_blob/open_blob, not seal/open_frame — see
+#    crypto.py's _build_blob_aad docstring for why they're a separate path.)
+# ---------------------------------------------------------------------------
+blob_plain = b"hello blob bytes \xff\x00"
+sealed = seal_blob(PROFILE, blob_plain, PSK)
+opened = open_blob(PROFILE, sealed, PSK)
+if opened == blob_plain:
+    ok("blob round-trip seal_blob→open_blob")
+else:
+    fail("blob round-trip seal_blob→open_blob", f"got {opened!r}")
+
+# Re-open (no replay/nonce-dedup guard on blobs — see crypto.py docstring)
+# must ALSO succeed.
+opened_again = open_blob(PROFILE, sealed, PSK)
+if opened_again == blob_plain:
+    ok("blob re-open (no replay guard) succeeds")
+else:
+    fail("blob re-open (no replay guard) succeeds", f"got {opened_again!r}")
+
+if open_blob("other_profile", sealed, PSK) is None:
+    ok("blob profile binding: wrong profile rejected")
+else:
+    fail("blob profile binding: wrong profile rejected")
+
+_tampered = bytearray(sealed)
+_tampered[1 + NONCE_BYTES] ^= 0xFF
+if open_blob(PROFILE, bytes(_tampered), PSK) is None:
+    ok("blob tampered ciphertext rejected")
+else:
+    fail("blob tampered ciphertext rejected")
 
 # ---------------------------------------------------------------------------
 # Summary

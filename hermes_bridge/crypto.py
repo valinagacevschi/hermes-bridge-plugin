@@ -130,6 +130,60 @@ def open_frame(
     return parsed
 
 
+def _build_blob_aad(profile_id: str) -> bytes:
+    # Deliberately separate from _build_aad() above (no `direction`) — a
+    # sealed blob must never be decryptable as a message frame or vice versa.
+    return f"blob|{profile_id}".encode()
+
+
+def seal_blob(profile_id: str, plaintext: bytes, psk: bytes) -> bytes:
+    """
+    Encrypt raw attachment bytes for the sealed-blob relay store
+    (PRD_Features.md §2.3). Deliberately NOT built on seal()/open_frame()
+    above: those wrap plaintext in JSON + a `ts` replay-window + a
+    nonce-dedup cache, which fits live wire messages but actively breaks
+    stored blobs — a blob may be fetched (and re-fetched) far more than 60s
+    after it was sealed, and more than once. seal_blob/open_blob skip all of
+    that: just raw bytes in, raw bytes out, authenticity from the AEAD tag
+    alone.
+
+    Returns raw sealed bytes: 0x01 || nonce(24) || ciphertext (callers handle
+    their own transport encoding — see adapter.py's blob upload/download).
+    """
+    nonce = randombytes(NONCE_BYTES)
+    aad = _build_blob_aad(profile_id)
+    ct = crypto_aead_xchacha20poly1305_ietf_encrypt(
+        message=plaintext,
+        aad=aad,
+        nonce=nonce,
+        key=psk,
+    )
+    return VERSION + nonce + ct
+
+
+def open_blob(profile_id: str, sealed: bytes, psk: bytes) -> Optional[bytes]:
+    """
+    Decrypt a sealed blob. Returns None if malformed, tampered, or the wrong
+    key/profile — no replay/staleness check (see seal_blob doc comment).
+    """
+    if len(sealed) < 41 or sealed[0:1] != VERSION:
+        return None
+
+    nonce = sealed[1 : 1 + NONCE_BYTES]
+    ct = sealed[1 + NONCE_BYTES :]
+    aad = _build_blob_aad(profile_id)
+
+    try:
+        return crypto_aead_xchacha20poly1305_ietf_decrypt(
+            ciphertext=ct,
+            aad=aad,
+            nonce=nonce,
+            key=psk,
+        )
+    except Exception:
+        return None
+
+
 def load_psk(path: Optional[str] = None) -> bytes:
     """
     Load the 32-byte PSK from disk.
