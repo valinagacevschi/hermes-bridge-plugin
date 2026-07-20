@@ -40,9 +40,18 @@ sent to the relay**. The relay stores and forwards opaque ciphertext.
 
 ## Access
 
-The relay is currently **invite-only**. To get a `profile_id` + `hb_` API key that the
-plugin authenticates with, request access from the maintainer. Self-serve signup is
-planned.
+The relay is currently **invite-only**. The maintainer generates an invite — a
+speakable short code like `5-TEAL-9` — tied to a `profile_id`. Enter that code in the
+**Hermes Bridge** app (or follow the invite link); the app claims it and receives back
+a `profile_id` + `hb_…` API key.
+
+That claim is phone-side only — it does **not** configure this plugin. The Mac-side
+adapter authenticates with the relay the same way it always has: `HERMES_BRIDGE_PROFILE_ID`
++ `HERMES_BRIDGE_API_KEY` env vars (WS query param + `Authorization: Bearer` on REST
+calls — see `hermes_bridge/adapter.py`). So after the phone claims its code, copy the
+**same** `profile_id` and `api_key` the app now shows into this plugin's env vars (via
+`install.sh`'s prompts, or by hand in `~/.hermes/.env`) — they have to match on both
+ends for the relay to route between them.
 
 ## Install
 
@@ -96,10 +105,15 @@ QR to scan on the phone.
 
 ## Pairing your phone
 
-1. Run `install.sh` — it prints/QR-encodes your PSK.
-2. Install the **Hermes Bridge** app from the App Store.
-3. In the app, scan the PSK QR (or enter the hex manually).
-4. Start the gateway: `hermes gateway run`.
+1. Get an invite code (`5-TEAL-9` style) from the maintainer.
+2. Install the **Hermes Bridge** app from the App Store and enter the code — the app
+   claims it and shows you a `profile_id` + `hb_…` API key.
+3. Run `install.sh` on the Mac and enter that **same** `profile_id`/`api_key` when
+   prompted (this is the step that actually configures the plugin — see Access, above).
+   It also prints/QR-encodes your PSK.
+4. Back in the app, scan the PSK QR (or enter the hex manually) — this is the separate
+   E2E encryption key, unrelated to the invite/API key.
+5. Start the gateway: `hermes gateway run`.
 
 Your agent's replies now reach the phone; scheduled/cron outputs arrive as push
 notifications with a durable inbox so nothing is lost while the app is closed.
