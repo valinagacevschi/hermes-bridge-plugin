@@ -6,11 +6,11 @@ relay. Chat with your agent from your phone; trigger it on a schedule and get th
 pushed to you — even when the app is closed.
 
 ```
-┌─────────────┐   sealed frames    ┌──────────────┐   sealed frames   ┌───────────┐
+┌─────────────┐   sealed frames    ┌───────────────┐   sealed frames   ┌───────────┐
 │ Hermes      │◀──────wss─────────▶│ Hermes Bridge │◀─────SSE/wss─────▶│  mobile   │
 │ agent       │   (this plugin)    │  cloud relay  │                   │   app     │
 │ (your Mac)  │                    │  (hosted)     │                   │ (iOS)     │
-└─────────────┘                    └──────────────┘                   └───────────┘
+└─────────────┘                    └───────────────┘                   └───────────┘
         the relay only ever sees ciphertext — it can't read your messages
 ```
 
@@ -36,22 +36,21 @@ sent to the relay**. The relay stores and forwards opaque ciphertext.
   loads into it and imports its `gateway.platforms.base`).
 - Python 3.9+ with `websockets` and `PyNaCl` (installed into the Hermes venv by the
   installer).
-- `qrencode` + `xxd` if you want a scannable PSK QR (`brew install qrencode`).
+- `curl`, `jq`, `qrencode`, `xxd` — used by `install.sh`/`pair-phone.sh` to self-serve a
+  pairing from the relay and print the QR (`brew install jq qrencode`; curl/xxd ship with
+  macOS).
 
 ## Access
 
-The relay is currently **invite-only**. The maintainer generates an invite — a
-speakable short code like `5-TEAL-9` — tied to a `profile_id`. Enter that code in the
-**Hermes Bridge** app (or follow the invite link); the app claims it and receives back
-a `profile_id` + `hb_…` API key.
+**Self-serve — no maintainer, no invite request, no admin secret.** `install.sh` calls the
+relay's public `POST /api/pair/provision` itself, which mints your own isolated
+`profile_id` + `hb_…` API key (`tenant_selfserve`, rate-limited per IP) and a one-time
+phone-pairing invite in the same response. There's nothing to request access to — running
+the installer *is* signup.
 
-That claim is phone-side only — it does **not** configure this plugin. The Mac-side
-adapter authenticates with the relay the same way it always has: `HERMES_BRIDGE_PROFILE_ID`
-+ `HERMES_BRIDGE_API_KEY` env vars (WS query param + `Authorization: Bearer` on REST
-calls — see `hermes_bridge/adapter.py`). So after the phone claims its code, copy the
-**same** `profile_id` and `api_key` the app now shows into this plugin's env vars (via
-`install.sh`'s prompts, or by hand in `~/.hermes/.env`) — they have to match on both
-ends for the relay to route between them.
+The invite token is single-use and expires in 1 hour. If it lapses before you scan it (or
+you want to pair a second phone later), re-run the `pair-phone.sh` the installer drops next
+to the plugin — it mints a fresh invite for your *existing* profile, no re-provisioning.
 
 ## Install
 
@@ -61,11 +60,12 @@ One-liner (downloads + installs; prompts on the terminal):
 curl -fsSL https://raw.githubusercontent.com/valinagacevschi/hermes-bridge-plugin/main/install.sh | bash
 ```
 
-Non-interactive — pre-set any of the env vars to skip the prompts:
+Non-interactive — pre-set your own already-claimed credentials to skip self-serve
+provisioning entirely (e.g. restoring a previous install):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/valinagacevschi/hermes-bridge-plugin/main/install.sh \
-  | HERMES_BRIDGE_PROFILE_ID=my-profile HERMES_BRIDGE_API_KEY=hb_… bash
+  | HERMES_BRIDGE_PROFILE_ID=profile_ss_xxxx HERMES_BRIDGE_API_KEY=hb_… bash
 ```
 
 Or from a checkout:
@@ -76,11 +76,11 @@ cd hermes-bridge-plugin
 ./install.sh
 ```
 
-`install.sh` copies the `hermes_bridge/` package into
+`install.sh` copies the `hermes_bridge/` package + `pair-phone.sh` into
 `~/.hermes/plugins/platforms/hermes_bridge/` (downloading a release tarball first when run
 via `curl`), installs the Python deps into the Hermes venv, enables the plugin in
-`~/.hermes/config.yaml`, records the env vars below, and generates + displays your PSK as a
-QR to scan on the phone.
+`~/.hermes/config.yaml`, self-serve provisions a profile/API key (see Access, above),
+generates a PSK, and prints one combined QR (invite token + PSK) to scan on the phone.
 
 ### Manual install
 
@@ -92,28 +92,32 @@ QR to scan on the phone.
      enabled:
        - platforms/hermes_bridge
    ```
-4. Set the env vars (below) in `~/.hermes/.env`.
-5. Generate a 32-byte PSK at `~/.hermes/psk` (`chmod 600`) and load it on the phone.
+4. `curl -sf -X POST https://herelay.appcenter.ro/api/pair/provision -d '{}'` and write the
+   returned `profile_id`/`api_key` (below) into `~/.hermes/.env`, alongside
+   `HERMES_BRIDGE_RELAY_URL=wss://herelay.appcenter.ro`.
+5. Generate a 32-byte PSK at `~/.hermes/psk` (`chmod 600`).
+6. Combine the response's `token` + the PSK hex into `{"token":"...","psk":"..."}` and scan
+   that on the phone (or run `pair-phone.sh` once step 4/5 are done, to do this for you).
 
 ## Environment variables
 
 | Var | Value |
 |-----|-------|
 | `HERMES_BRIDGE_RELAY_URL` | `wss://herelay.appcenter.ro` (the hosted relay) |
-| `HERMES_BRIDGE_PROFILE_ID` | your profile id (from Access, above) |
-| `HERMES_BRIDGE_API_KEY` | your `hb_…` key (from Access, above) |
+| `HERMES_BRIDGE_PROFILE_ID` | from self-serve provisioning (see Access, above) |
+| `HERMES_BRIDGE_API_KEY` | from self-serve provisioning (see Access, above) |
 
 ## Pairing your phone
 
-1. Get an invite code (`5-TEAL-9` style) from the maintainer.
-2. Install the **Hermes Bridge** app from the App Store and enter the code — the app
-   claims it and shows you a `profile_id` + `hb_…` API key.
-3. Run `install.sh` on the Mac and enter that **same** `profile_id`/`api_key` when
-   prompted (this is the step that actually configures the plugin — see Access, above).
-   It also prints/QR-encodes your PSK.
-4. Back in the app, scan the PSK QR (or enter the hex manually) — this is the separate
-   E2E encryption key, unrelated to the invite/API key.
-5. Start the gateway: `hermes gateway run`.
+1. Run `install.sh` on the Mac — it self-serve provisions and prints a combined QR
+   (invite token + PSK).
+2. Install the **Hermes Bridge** app from the App Store.
+3. In the app: **Pair new device** → scan the QR.
+4. Start the gateway: `hermes gateway run`.
+
+Invite expired, or pairing a second phone to the same laptop? Run
+`~/.hermes/plugins/platforms/hermes_bridge/pair-phone.sh` — it mints a fresh invite for
+your existing profile and reprints the QR, no re-provisioning.
 
 Your agent's replies now reach the phone; scheduled/cron outputs arrive as push
 notifications with a durable inbox so nothing is lost while the app is closed.
@@ -123,12 +127,13 @@ notifications with a durable inbox so nothing is lost while the app is closed.
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt pytest
-python tests/test_crypto.py        # crypto interop (standalone script)
-python -m pytest tests/test_rpc.py # adapter RPC dispatch (unittest)
+python tests/test_crypto.py                                                    # crypto interop (standalone script)
+python -m pytest tests/test_rpc.py tests/test_streaming.py tests/test_attachments.py
 ```
 
 The tests run **without** a Hermes install: `test_crypto.py` imports `crypto.py` directly
-(PyNaCl only), and `test_rpc.py` stubs `gateway.platforms.base`.
+(PyNaCl only), and the other three stub `gateway.platforms.base`/`tools.*` via
+`tests/testutil.py`.
 
 ## Troubleshooting
 

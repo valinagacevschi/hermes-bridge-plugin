@@ -71,7 +71,13 @@ else
   echo "      - platforms/hermes_bridge"
 fi
 
-# --- Env vars: use pre-set values, else prompt on the terminal ---
+# --- pair-phone.sh: deploy alongside the plugin so re-pairing later doesn't
+# need this repo/tarball again — it's self-contained (only touches
+# $HERMES_HOME/.env + $HERMES_HOME/psk + the public relay). ---
+cp "$SRC_ROOT/pair-phone.sh" "$PLUGIN_DEST/pair-phone.sh"
+chmod +x "$PLUGIN_DEST/pair-phone.sh"
+
+# --- Provisioning: use pre-set values, else self-serve from the relay ---
 # Reads come from /dev/tty so prompting still works under `curl | bash` (where
 # stdin is the piped script, not the keyboard).
 ask() {  # ask <var-name> <prompt> <default>
@@ -87,29 +93,53 @@ ask() {  # ask <var-name> <prompt> <default>
   printf -v "$__var" '%s' "${__ans:-$__default}"
 }
 
-if [[ -f "$HERMES_ENV" ]] && grep -q "HERMES_BRIDGE_RELAY_URL" "$HERMES_ENV"; then
-  echo "Env vars already in $HERMES_ENV — skipping"
+# `token` (a one-time phone-pairing invite) is only set when this run actually
+# provisions — used below to decide whether to print the combined QR.
+token=""
+
+if [[ -f "$HERMES_ENV" ]] && grep -q "HERMES_BRIDGE_API_KEY" "$HERMES_ENV"; then
+  echo "Laptop already provisioned ($HERMES_ENV has HERMES_BRIDGE_API_KEY) — skipping"
+  echo "To pair a phone, run: $PLUGIN_DEST/pair-phone.sh"
+elif [[ -n "${HERMES_BRIDGE_PROFILE_ID:-}" && -n "${HERMES_BRIDGE_API_KEY:-}" ]]; then
+  # Bringing your own already-claimed credentials (e.g. restoring a previous
+  # install) — write them directly, no self-serve call, no phone invite to
+  # print (use pair-phone.sh after if you also need to re-pair a phone).
+  {
+    echo ""
+    echo "HERMES_BRIDGE_RELAY_URL=${HERMES_BRIDGE_RELAY_URL:-$DEFAULT_RELAY_URL}"
+    echo "HERMES_BRIDGE_PROFILE_ID=$HERMES_BRIDGE_PROFILE_ID"
+    echo "HERMES_BRIDGE_API_KEY=$HERMES_BRIDGE_API_KEY"
+  } >> "$HERMES_ENV"
+  echo "Wrote pre-set env vars to $HERMES_ENV"
 else
-  relay_url="${HERMES_BRIDGE_RELAY_URL:-}"
-  [[ -z "$relay_url" ]] && ask relay_url "Relay WebSocket URL [$DEFAULT_RELAY_URL]: " "$DEFAULT_RELAY_URL"
+  # Self-serve provisioning — no admin/maintainer involved. Mints a profile +
+  # laptop api_key + a one-time phone-pairing invite from the public relay.
+  for cmd in curl jq qrencode xxd; do
+    command -v "$cmd" >/dev/null || { echo "ERROR: $cmd not installed"; exit 1; }
+  done
 
-  profile_id="${HERMES_BRIDGE_PROFILE_ID:-}"
-  [[ -z "$profile_id" ]] && ask profile_id "Profile ID: " ""
-  if [[ -z "$profile_id" ]]; then
-    echo "ERROR: profile_id is required (set HERMES_BRIDGE_PROFILE_ID or run interactively)"
-    exit 1
-  fi
+  echo ""
+  ask relay_base "Relay URL [https://herelay.appcenter.ro]: " "https://herelay.appcenter.ro"
+  relay_ws="${relay_base/https:/wss:}"
+  relay_ws="${relay_ws/http:/ws:}"
 
-  api_key="${HERMES_BRIDGE_API_KEY:-}"
-  [[ -z "$api_key" ]] && ask api_key "API key (hb_…), blank if pairing later: " ""
+  echo "Provisioning via $relay_base ..."
+  RESP="$(curl -sf -X POST "$relay_base/api/pair/provision" -H "Content-Type: application/json" -d '{}')" \
+    || { echo "ERROR: provisioning failed (relay unreachable or rate-limited)"; exit 1; }
+
+  profile_id="$(jq -r '.profile_id' <<<"$RESP")"
+  api_key="$(jq -r '.api_key' <<<"$RESP")"
+  token="$(jq -r '.token' <<<"$RESP")"
+  [[ -n "$profile_id" && "$profile_id" != "null" && -n "$api_key" && "$api_key" != "null" ]] \
+    || { echo "ERROR: unexpected provision response: $RESP"; exit 1; }
 
   {
     echo ""
-    echo "HERMES_BRIDGE_RELAY_URL=$relay_url"
+    echo "HERMES_BRIDGE_RELAY_URL=$relay_ws"
     echo "HERMES_BRIDGE_PROFILE_ID=$profile_id"
-    [[ -n "$api_key" ]] && echo "HERMES_BRIDGE_API_KEY=$api_key"
+    echo "HERMES_BRIDGE_API_KEY=$api_key"
   } >> "$HERMES_ENV"
-  echo "Wrote env vars to $HERMES_ENV"
+  echo "Provisioned profile $profile_id — wrote env vars to $HERMES_ENV"
 fi
 
 # Generate the E2E PSK if not already present.
@@ -123,21 +153,23 @@ else
   echo "Generating E2E PSK (32 random bytes)..."
   python3 -c "import os, sys; sys.stdout.buffer.write(os.urandom(32))" > "$PSK_FILE"
   chmod 600 "$PSK_FILE"
-  PSK_HEX=$(xxd -p "$PSK_FILE" | tr -d '\n')
   echo "PSK written to $PSK_FILE (chmod 600)"
+fi
+
+# Print the phone-pairing QR (invite token + PSK, combined so one scan does
+# both). If provisioning was skipped above (already provisioned, or bring-
+# your-own-credentials), `token` is unset here — fall back to pair-phone.sh,
+# which mints a fresh invite for the existing profile.
+if [[ -n "$token" && "$token" != "null" ]]; then
+  PSK_HEX="$(xxd -p "$PSK_FILE" | tr -d '\n')"
+  PAYLOAD="$(jq -cn --arg t "$token" --arg p "$PSK_HEX" '{token:$t, psk:$p}')"
   echo ""
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "  IMPORTANT: Store this PSK on your phone (one-time setup)"
+  echo "  Open Hermes Bridge on your phone -> Pair new device -> scan:"
   echo ""
-  echo "  PSK hex: $PSK_HEX"
-  echo ""
-  if command -v qrencode >/dev/null 2>&1; then
-    echo "  Scan with the Hermes mobile app:"
-    qrencode -t ANSIUTF8 "$PSK_HEX"
-  else
-    echo "  (Install qrencode for a scannable QR: brew install qrencode)"
-    echo "  Then re-run this script, or manually enter the hex above in the app."
-  fi
+  qrencode -t ANSIUTF8 "$PAYLOAD"
+  echo "  Invite expires in 1 hour. If it lapses, re-run:"
+  echo "    $PLUGIN_DEST/pair-phone.sh"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 fi
 

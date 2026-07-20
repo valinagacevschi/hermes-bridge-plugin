@@ -22,9 +22,23 @@
   the first `hermes_bridge`/`gateway` import, which the monorepo's own file order
   doesn't always guarantee (it doesn't need to, there — real Hermes is installed).
 
-- **The short-code pairing protocol didn't require a plugin code change.** The
-  Mac-side adapter's protocol (`HERMES_BRIDGE_PROFILE_ID`/`HERMES_BRIDGE_API_KEY` env
+- **The short-code pairing protocol didn't require a plugin code change (at the time).**
+  The Mac-side adapter's protocol (`HERMES_BRIDGE_PROFILE_ID`/`HERMES_BRIDGE_API_KEY` env
   vars, `?api_key=` on the WS URL, `Authorization: Bearer` on REST calls) was already
-  compatible — claiming an invite just gets the phone the same `profile_id`/`api_key`
-  that also has to go on the Mac. The actual gap was docs: README never said the two
-  had to match. Fixed in the Access/Pairing sections.
+  compatible — claiming an invite just got the phone the same `profile_id`/`api_key`
+  that also had to go on the Mac. Superseded within the same day by self-serve
+  provisioning (below) — check current README/install.sh before trusting this as
+  present-tense.
+
+- **`install.sh`/`pair-phone.sh` are hand-maintained, but "no source to sync from" can
+  stop being true overnight.** expo-hermes shipped self-serve pairing
+  (`POST /api/pair/provision`, no `ADMIN_SECRET`) and a new `pair-phone.sh`, with a
+  matching `install.sh` rewrite — real logic this repo needed, not just docs. Its
+  `install.sh` had independently diverged too (this repo added `curl \| bash` +
+  non-interactive env-var support the monorepo's copy never had), so this wasn't a
+  pure-copy: had to merge monorepo's self-serve provisioning logic into this repo's
+  curl\|bash-capable installer by hand, and add `pair-phone.sh` (a new bucket-1
+  candidate — self-contained bash, only touches `$HERMES_HOME`/the relay, no
+  monorepo-only paths). `scripts/sync-from-expo-hermes.sh` still only handles the
+  Python package + its tests — it does not know about `install.sh`/`pair-phone.sh`.
+  If they diverge again, that's a manual reconciliation, not a script run.
