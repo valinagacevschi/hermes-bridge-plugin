@@ -41,7 +41,9 @@ class TestSendExpectEdits(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result.success)
         self.assertIsNotNone(result.message_id)
-        mock_enqueue.assert_called_once()
+        mock_enqueue.assert_called_once_with(
+            result.message_id, sent_frames[0], category="turn_complete"
+        )
         payload = _open(sent_frames[0])
         self.assertEqual(payload["content"], "hello")
         self.assertNotIn("edit", payload)
@@ -73,7 +75,7 @@ class TestSendExpectEdits(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(result.success)
-        mock_enqueue.assert_called_once()
+        mock_enqueue.assert_called_once_with(result.message_id, sent_frames[0], category=None)
         payload = _open(sent_frames[0])
         self.assertTrue(payload["unsolicited"])
 
@@ -106,7 +108,9 @@ class TestEditMessage(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(result.success)
-        mock_enqueue.assert_called_once_with("msg-abc", sent_frames[0])
+        mock_enqueue.assert_called_once_with(
+            "msg-abc", sent_frames[0], category="turn_complete"
+        )
         payload = _open(sent_frames[0])
         self.assertTrue(payload["edit"])
         self.assertTrue(payload["final"])

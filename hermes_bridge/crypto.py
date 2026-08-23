@@ -76,9 +76,26 @@ def open_frame(
     direction: str,
     frame: str,
     psk: bytes,
+    allow_stale: bool = False,
 ) -> Optional[dict]:
     """
     Decrypt a sealed frame received from the relay.
+
+    Args:
+        allow_stale: skip the replay-defense timestamp window. For the
+            durable-queue catch-up path (#41) — frames replayed from
+            `inbound_messages` can legitimately be older than 60s. The AEAD
+            tag still guarantees authenticity + confidentiality; only
+            freshness is relaxed, and nonce dedup stays mandatory either way.
+            NOT a direct mirror of lib/crypto.ts's OpenOptions.allowStale: the
+            TS side is set by the CLIENT's own code on a path it knows it's
+            on (a REST catch-up call it made itself). This caller derives it
+            from a relay-supplied, unauthenticated wire field (`seq` on a
+            frame's plaintext envelope — the relay holds no PSK, so anything
+            in that envelope is relay/MITM-controllable) — see adapter.py's
+            _INBOUND_REPLAY_GRACE_S for how that's bounded rather than
+            trusted unconditionally. Never set for the live phone->gateway
+            path (there is no equivalent envelope field on that direction).
 
     Returns:
         Decrypted payload dict ({"role": ..., "content": ...}),
@@ -118,7 +135,7 @@ def open_frame(
     if not isinstance(ts, (int, float)):
         return None
     age_s = abs(time.time() - ts / 1000.0)
-    if age_s > REPLAY_WINDOW_S:
+    if not allow_stale and age_s > REPLAY_WINDOW_S:
         return None
 
     # Replay defense: nonce dedup
