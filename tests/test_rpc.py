@@ -67,6 +67,14 @@ class TestCronWriteMethods(unittest.IsolatedAsyncioTestCase):
         mock_post.assert_called_once_with("/api/cron/jobs/job-123/trigger")
         assert len(frames) == 1
 
+    async def test_cron_delete_calls_correct_path_and_method(self):
+        """DELETE on the bare job resource (#46) — not a pause/resume/trigger-
+        style POST to an action sub-path, since upstream's real route is
+        `DELETE /api/cron/jobs/{id}` (hermes_cli/web_routers/cron.py)."""
+        frames, mock_post = await self._run("cron.delete", {"id": "job-999"})
+        mock_post.assert_called_once_with("/api/cron/jobs/job-999", method="DELETE")
+        assert len(frames) == 1
+
     async def test_missing_job_id_returns_error(self):
         sent_frames = []
 
@@ -539,7 +547,7 @@ class TestPollPendingWrites(unittest.IsolatedAsyncioTestCase):
 
         self.adapter._should_run = True
         with patch("tools.write_approval.list_pending", side_effect=fake_list_pending), patch.object(
-            self.adapter, "_send_push_notification", AsyncMock()
+            self.adapter, "_send_lifecycle_event", AsyncMock()
         ) as mock_push, patch("asyncio.sleep", side_effect=fake_sleep):
             await self.adapter._poll_pending_writes()
         return mock_push
@@ -560,7 +568,15 @@ class TestPollPendingWrites(unittest.IsolatedAsyncioTestCase):
         # rec1 was already pending on the very first tick — must never fire.
         # rec2 only appears on the second tick — must fire exactly once.
         assert mock_push.call_count == 1
-        assert "brand new" in mock_push.call_args.kwargs["body"]
+        # (#44) the summary must NOT ride along in the lifecycle event — the
+        # relay renders a generic template, so this call carries only
+        # structural routing metadata (event_type + screen/tab/subsystem),
+        # never message content. Do not "fix" this back to asserting the
+        # summary is present — that was the plaintext leak #44 closed.
+        assert mock_push.call_args.args[0] == "write.staged"
+        data = mock_push.call_args.kwargs["data"]
+        assert "brand new" not in json.dumps(data)
+        assert data == {"screen": "agent", "tab": "approvals", "subsystem": "memory"}
 
     async def test_seed_failure_does_not_cause_burst_on_recovery(self):
         """A transient error on the very first list_pending call must not

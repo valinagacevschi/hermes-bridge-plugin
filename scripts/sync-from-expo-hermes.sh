@@ -45,7 +45,7 @@ echo
 # `plugins.platforms.hermes_bridge...` (e.g. a relative import turned
 # absolute), pure-copy would silently ship a broken file — so check, don't
 # assume.
-PURE_COPY_FILES=(adapter.py crypto.py __init__.py plugin.yaml requirements.txt)
+PURE_COPY_FILES=(adapter.py crypto.py capability.py __init__.py plugin.yaml requirements.txt)
 
 for f in "${PURE_COPY_FILES[@]}"; do
   if grep -q "plugins\.platforms\.hermes_bridge" "$SRC_PLUGIN/$f" 2>/dev/null; then
@@ -59,6 +59,7 @@ done
 echo "Copying pure-copy files..."
 cp "$SRC_PLUGIN/adapter.py" "$DST_REPO/hermes_bridge/adapter.py"
 cp "$SRC_PLUGIN/crypto.py" "$DST_REPO/hermes_bridge/crypto.py"
+cp "$SRC_PLUGIN/capability.py" "$DST_REPO/hermes_bridge/capability.py"
 cp "$SRC_PLUGIN/__init__.py" "$DST_REPO/hermes_bridge/__init__.py"
 cp "$SRC_PLUGIN/plugin.yaml" "$DST_REPO/hermes_bridge/plugin.yaml"
 cp "$SRC_PLUGIN/requirements.txt" "$DST_REPO/requirements.txt"

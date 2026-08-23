@@ -13,8 +13,10 @@ only patches individual names).
 """
 
 import dataclasses
+import enum
 import os
 import sys
+import time
 import types as _types
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -78,12 +80,23 @@ if "gateway.platforms.base" not in sys.modules:
         media_urls: Optional[list] = None
         media_types: Optional[list] = None
         message_type: Any = None
+        message_id: Optional[str] = None
 
     _gw_base.BasePlatformAdapter = _StubBasePlatformAdapter
     _gw_base.SendResult = RealSendResult
     _gw_base.MessageEvent = _RealMessageEvent
+    class _StubProcessingOutcome(enum.Enum):
+        """Real enum, not a MagicMock — on_processing_complete compares the
+        outcome by identity (`outcome == ProcessingOutcome.SUCCESS`), which a
+        MagicMock's auto-attributes would satisfy for every branch at once."""
+
+        SUCCESS = "success"
+        FAILURE = "failure"
+        CANCELLED = "cancelled"
+
     _gw_base.MessageType = MagicMock()
     _gw_base.Platform = MagicMock()
+    _gw_base.ProcessingOutcome = _StubProcessingOutcome
     sys.modules["gateway.platforms.base"] = _gw_base
 
 # `tools.write_approval`/`tools.memory_tool`/`tools.skill_manager_tool` are
@@ -167,4 +180,11 @@ def make_adapter(psk: bytes = PSK, profile_id: str = PROFILE):
         adapter._profile_id = profile_id
         adapter._psk = psk
         adapter._seen_rpc_ids = {}
+        # No hello on this fake connection — _supports() fails open to
+        # CapabilityDescriptor.LEGACY_OPS, same as a fresh real connection.
+        adapter._descriptor = None
+        adapter._inbound_cursor = 0
+        adapter._inbound_seen_seq = 0
+        adapter._ws_connected_at = time.time()
+        adapter._pending_prompts = {}
     return adapter
