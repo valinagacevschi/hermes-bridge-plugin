@@ -135,6 +135,22 @@ class TestCronWriteMethods(unittest.IsolatedAsyncioTestCase):
         assert len(sent_frames) == 2
 
 
+def _json_response(payload: dict):
+    """Minimal stand-in for urlopen's context manager: .read() returns JSON bytes."""
+    import io
+    from contextlib import contextmanager
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            self.close()
+            return False
+
+    return _Resp(json.dumps(payload).encode())
+
+
 def _http_error(status: int, detail: str):
     """Build a real urllib.error.HTTPError whose body is FastAPI's
     {"detail": "..."} shape, for testing _http_error_detail passthrough."""
@@ -259,7 +275,7 @@ class TestHermesRequestHttpError(unittest.IsolatedAsyncioTestCase):
         import urllib.error
 
         adapter = _make_adapter()
-        adapter._hermes_session_token = "cached-token"
+        adapter._hermes_session_tokens = {9119: "cached-token"}
         adapter._hermes_api_port = None
 
         attempted_urls = []
@@ -278,6 +294,111 @@ class TestHermesRequestHttpError(unittest.IsolatedAsyncioTestCase):
         assert ctx.exception.code == 400
         # The answering port is the working port — cache it.
         assert adapter._hermes_api_port == 9119
+
+
+class TestHermesRequestPortSelection(unittest.IsolatedAsyncioTestCase):
+    """(#64) Port selection must not mistake the wrong service for the right one.
+
+    The adapter probes candidate ports for the Hermes DASHBOARD REST API. A 404
+    means something is listening that does not serve these routes -- the wrong
+    service -- so probing must continue. Treating 404 as "a live Hermes
+    answered" is what pinned the adapter to the api_server platform on 8642 and
+    made every Agent-tab RPC fail with a 404 that looked like a real answer.
+    """
+
+    async def test_404_keeps_probing_and_does_not_pin_the_port(self):
+        adapter = _make_adapter()
+        adapter._hermes_session_tokens = {}
+        adapter._hermes_api_port = None
+        attempted = []
+
+        def fake_urlopen(req, timeout=None):
+            attempted.append(req.full_url)
+            if ":9119" in req.full_url:
+                raise _http_error(404, "Not Found")
+            return _json_response({"ok": True, "port": 9120})
+
+        with patch.object(adapter, "_ports_to_probe", return_value=[9119, 9120]), patch.object(
+            adapter, "_ensure_hermes_token", AsyncMock(return_value="tok")
+        ), patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            result = await adapter._hermes_request("/api/sessions")
+
+        assert len(attempted) == 2, f"404 should not stop the probe: {attempted}"
+        assert result["port"] == 9120
+        assert adapter._hermes_api_port == 9120, "must pin the port that actually answered"
+
+    async def test_404_on_a_cached_port_clears_the_cache(self):
+        adapter = _make_adapter()
+        adapter._hermes_session_tokens = {}
+        adapter._hermes_api_port = 9119  # stale pin at the wrong service
+
+        def fake_urlopen(req, timeout=None):
+            raise _http_error(404, "Not Found")
+
+        with patch.object(adapter, "_ports_to_probe", return_value=[9119]), patch.object(
+            adapter, "_ensure_hermes_token", AsyncMock(return_value="tok")
+        ), patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with self.assertRaises(Exception):
+                await adapter._hermes_request("/api/sessions")
+
+        assert adapter._hermes_api_port is None, "a 404 must not leave the wrong port pinned"
+
+    async def test_both_local_services_stay_in_the_probe_list(self):
+        """The adapter talks to two local services through one probe loop: the
+        dashboard (/api/* routes, default 9119) and the api_server platform
+        (/v1/approvals and the /v1/runs SSE, default 8642). Neither serves the
+        other's routes, so both must stay probeable -- dropping 8642 would break
+        approvals and runs. What must NOT happen is a 404 from one being read as
+        "this is the working port", which is the bug this class covers."""
+        from hermes_bridge.adapter import _HERMES_API_PORTS
+
+        assert _HERMES_API_PORTS[0] == 9119, "the dashboard default is tried first"
+        assert 8642 in _HERMES_API_PORTS, "api_server's port serves the /v1/* routes"
+
+
+class TestHermesSessionTokenIsPerPort(unittest.IsolatedAsyncioTestCase):
+    """(#64) The dashboard mints its session token per process
+    (secrets.token_urlsafe(32) in hermes_cli/web_server.py), so a token scraped
+    from one dashboard is invalid on another. The cache must be keyed by port --
+    _discover_dashboard_ports() deliberately returns several (main + per-profile).
+    """
+
+    async def test_token_cached_for_one_port_is_not_reused_for_another(self):
+        adapter = _make_adapter()
+        adapter._hermes_session_tokens = {9119: "token-for-9119"}
+        scraped = []
+
+        def fake_fetch(port):
+            scraped.append(port)
+            return f"token-for-{port}"
+
+        with patch.object(adapter, "_fetch_session_token", side_effect=fake_fetch):
+            same = await adapter._ensure_hermes_token(9119)
+            other = await adapter._ensure_hermes_token(9120)
+
+        assert same == "token-for-9119", "cached port must not re-scrape"
+        assert scraped == [9120], f"only the uncached port should be scraped: {scraped}"
+        assert other == "token-for-9120", "each port gets its own token"
+
+    async def test_401_clears_only_the_failing_port_token(self):
+        adapter = _make_adapter()
+        adapter._hermes_session_tokens = {9119: "stale", 9120: "still-good"}
+        adapter._hermes_api_port = None
+
+        def fake_urlopen(req, timeout=None):
+            if ":9119" in req.full_url:
+                raise _http_error(401, "Unauthorized")
+            return _json_response({"ok": True})
+
+        with patch.object(adapter, "_ports_to_probe", return_value=[9119, 9120]), patch.object(
+            adapter, "_fetch_session_token", side_effect=lambda port: None
+        ), patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            await adapter._hermes_request("/api/sessions")
+
+        assert 9119 not in adapter._hermes_session_tokens, "failing port's token must be cleared"
+        assert adapter._hermes_session_tokens.get(9120) == "still-good", (
+            "a 401 on one port must not invalidate another port's token"
+        )
 
 
 class TestChatStop(unittest.IsolatedAsyncioTestCase):

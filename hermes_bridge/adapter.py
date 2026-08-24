@@ -60,10 +60,29 @@ _RECONNECT_MAX = 30.0
 # JSON frames over a live WS.
 _INBOUND_REPLAY_GRACE_S = 30.0
 
-# Hermes local REST API — well-known fallback ports.
-# 9119 is the declared default; 9120/8642 are legacy guesses.
-# In practice the dashboard uses --port 0 (OS-assigned) so these are often wrong.
-# _discover_dashboard_ports() finds the real port via psutil before falling back here.
+# Hermes local REST fallback ports. This adapter talks to TWO different local
+# services and reaches both through _hermes_request's probe loop:
+#
+#   * the dashboard (`hermes dashboard`, default 9119) serves the `/api/*`
+#     routes — sessions, skills, status, cron, model options, system stats
+#   * the api_server platform (default 8642) serves the `/v1/*` routes —
+#     `/v1/approvals` and the `/v1/runs` SSE stream
+#
+# Neither serves the other's routes, so whichever port is tried first answers
+# 404 for half of them. That is fine and expected: _hermes_request treats a 404
+# as "wrong service, keep probing" (issue 64). It must NOT treat it as "this is
+# the working port" — doing so pinned every RPC to whichever service was probed
+# first and made the whole Agent tab fail with 404s that looked like real
+# answers.
+#
+# In practice the dashboard often uses --port 0 (OS-assigned), so
+# _discover_dashboard_ports() finds its real port via psutil first and these are
+# only the fallback.
+#
+# Note 8642 cannot currently be relied on: enabling the api_server platform is
+# what silently breaks reply delivery (issue 62), so a working chat setup has it
+# off and the `/v1/*` routes are unreachable. That trade-off is issue 62's to
+# resolve, not something the port list can fix.
 _HERMES_API_PORTS = [9119, 9120, 8642]
 # Dedup window: retried RPC requests (same rpc.id) within this window are no-ops.
 _RPC_DEDUP_WINDOW_S = 30.0
@@ -276,7 +295,13 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         self._active_run_tasks: Dict[str, asyncio.Task] = {}
         # Hermes dashboard session token — extracted from the SPA HTML on first
         # API call. Per-process ephemeral; refreshed when a request 401s.
-        self._hermes_session_token: Optional[str] = None
+        # Keyed BY PORT: the dashboard mints _SESSION_TOKEN per process
+        # (secrets.token_urlsafe(32) in hermes_cli/web_server.py), so a token
+        # scraped from one dashboard is invalid on another. A single shared
+        # cache sent the wrong token whenever more than one candidate port
+        # served a dashboard -- and _discover_dashboard_ports() deliberately
+        # returns several (main + per-profile).
+        self._hermes_session_tokens: Dict[int, str] = {}
         # Cached working port — avoids re-probing all 3 ports on every RPC call.
         self._hermes_api_port: Optional[int] = None
         # Background poll for newly staged memory/skill writes (PRD_Features.md
@@ -1520,16 +1545,17 @@ class HermesBridgeAdapter(BasePlatformAdapter):
              extraction fails on a Hermes version that changed the token format)
           3. Scrape from Hermes dashboard HTML
         """
-        if self._hermes_session_token:
-            return self._hermes_session_token
+        cached = self._hermes_session_tokens.get(port)
+        if cached:
+            return cached
         env_token = os.getenv("HERMES_SESSION_TOKEN")
         if env_token:
-            self._hermes_session_token = env_token
+            self._hermes_session_tokens[port] = env_token
             return env_token
         loop = asyncio.get_event_loop()
         token = await loop.run_in_executor(None, self._fetch_session_token, port)
         if token:
-            self._hermes_session_token = token
+            self._hermes_session_tokens[port] = token
         return token
 
     def _ports_to_probe(self) -> List[int]:
@@ -1589,17 +1615,29 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 self._hermes_api_port = port
                 return result
             except urllib.error.HTTPError as exc:
-                if exc.code != 401:
-                    # A live Hermes answered — this IS the working port; the
-                    # request itself was rejected (validation 4xx / server
-                    # 5xx). Do NOT keep probing: other ports would just refuse
-                    # the connection and bury this error (losing e.g. a cron
-                    # schedule-parse 400 detail), and re-sending a POST to
+                if exc.code not in (401, 404):
+                    # A live Hermes dashboard answered — this IS the working
+                    # port; the request itself was rejected (validation 4xx /
+                    # server 5xx). Do NOT keep probing: other ports would just
+                    # refuse the connection and bury this error (losing e.g. a
+                    # cron schedule-parse 400 detail), and re-sending a POST to
                     # them would replay a non-idempotent request.
                     self._hermes_api_port = port
                     raise
-                # 401: token stale — clear and retry once with a freshly extracted token.
-                self._hermes_session_token = None
+                if exc.code == 404:
+                    # 404 means SOMETHING is listening but it does not serve
+                    # this route -- i.e. the wrong service, not a bad request.
+                    # Treating it as proof of the working port is what pinned
+                    # this adapter to the api_server platform on 8642 and made
+                    # every Agent-tab RPC fail with a 404 that looked like a
+                    # real answer (issue 64). Keep probing instead.
+                    last_exc = exc
+                    if port == self._hermes_api_port:
+                        self._hermes_api_port = None
+                    continue
+                # 401: token stale — clear THIS port's token and retry once
+                # with a freshly extracted one.
+                self._hermes_session_tokens.pop(port, None)
                 fresh = await self._ensure_hermes_token(port)
                 if fresh and fresh != token:
                     try:
