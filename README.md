@@ -68,9 +68,16 @@ Useful afterwards:
 
 ```bash
 hermes plugins list                 # is it installed and enabled?
-hermes plugins update hermes_bridge # pull the latest
 hermes plugins doctor hermes_bridge # validate against the real runtime contracts
+# upgrade — note --force, not `hermes plugins update`:
+hermes plugins install valinagacevschi/hermes-bridge-plugin/hermes_bridge --force
 ```
+
+`hermes plugins update` does not work for this plugin. Installing from a
+subdirectory moves the package directory into place without the clone's `.git`,
+and update refuses a plugin directory that has none. Reinstalling with `--force`
+is the upgrade path; your `~/.hermes/.env` credentials and `~/.hermes/psk` are
+outside the plugin directory, so nothing re-pairs.
 
 ### Upgrading from the old `curl | bash` installer
 
@@ -180,7 +187,11 @@ were delivered to the wrong adapter and silently dropped. It now registers as
   old installer registers under a different key. See *Upgrading*, above.
 - **No QR printed, just a payload line** — `qrcode` is missing from the Hermes venv:
   `~/.hermes/hermes-agent/venv/bin/pip install "qrcode>=7.4,<8"`, then re-run `pair.py`
-  (it mints a fresh invite and reprints, so an expired one costs nothing).
+  (it mints a fresh invite and reprints, so an expired one costs nothing). If you installed
+  `qrcode` and still get the payload, your copy of `pair.py` predates the fix that re-execs
+  it under the Hermes venv's interpreter — reinstall with `--force` (above).
+- **`Plugin 'hermes_bridge' already exists`** — that's the installer refusing to overwrite,
+  so nothing was updated. Re-run it with `--force`.
 - **Start command** — `hermes gateway run` (foreground). If running as a service,
   restart atomically with `launchctl kickstart -k gui/$(id -u)/ai.hermes.gateway`.
 

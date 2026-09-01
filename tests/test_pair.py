@@ -89,6 +89,24 @@ class PairScriptTest(unittest.TestCase):
         self.assertEqual(psk.stat().st_mode & 0o777, 0o600)
         self.assertIn("EXISTING=1", (self.home / ".env").read_text())
 
+    def test_hands_itself_to_the_hermes_venv_interpreter(self):
+        """qrcode lives in the Hermes venv, so a system python3 must not be the
+        interpreter that reaches print_qr — see reexec_under_hermes_python."""
+        venv_bin = self.home / "hermes-agent" / "venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        venv_python = venv_bin / "python"
+        venv_python.write_text("#!/bin/sh\n")
+        venv_python.chmod(0o755)
+
+        with patch.object(pair.os, "execv") as execv:
+            self._run()
+        self.assertEqual(execv.call_args[0][0], str(venv_python))
+
+        # The guard flag it sets stops the re-exec'd process looping forever.
+        with patch.object(pair.os, "execv") as execv:
+            self._run()
+        execv.assert_not_called()
+
     def test_second_run_repairs_without_reprovisioning(self):
         self._run()
         psk_before = (self.home / "psk").read_bytes()

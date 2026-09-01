@@ -20,4 +20,10 @@ scan. Answer *yes* to the enable prompt above, restart the gateway
 Re-run `pair.py` any time to pair another phone or replace an expired invite —
 it reuses the same profile.
 
+To upgrade later, reinstall with `--force`. `hermes plugins update` cannot
+work here: this plugin installs from a subdirectory, so its directory holds no
+`.git` for update to pull.
+
+    hermes plugins install valinagacevschi/hermes-bridge-plugin/hermes_bridge --force
+
 Requires Hermes 0.21.0 or newer.

@@ -15,8 +15,9 @@ The PSK never leaves this machine except through the QR you scan; the relay
 never sees it.
 
 Standard library only, plus ``qrcode`` for the terminal QR — declared in
-plugin.yaml and installed per after-install.md. Without it the raw payload is
-printed instead, which is readable but not scannable.
+plugin.yaml and installed per after-install.md. That lives in the Hermes venv,
+so this script re-execs itself with the venv's interpreter: running it with any
+python3 works.
 """
 
 import binascii
@@ -29,6 +30,7 @@ from pathlib import Path
 
 DEFAULT_RELAY = "https://herelay.appcenter.ro"
 ENV_KEYS = ("HERMES_BRIDGE_RELAY_URL", "HERMES_BRIDGE_PROFILE_ID", "HERMES_BRIDGE_API_KEY")
+_REEXEC_FLAG = "HERMES_BRIDGE_PAIR_REEXEC"
 
 
 def die(msg: str) -> None:
@@ -90,6 +92,33 @@ def load_or_create_psk(psk_file: Path) -> str:
     return binascii.hexlify(psk).decode()
 
 
+def reexec_under_hermes_python(hermes_home: Path) -> None:
+    """Re-run this script with the Hermes venv's interpreter.
+
+    ``qrcode`` is installed into ``~/.hermes/hermes-agent/venv`` — the only
+    environment the plugin's dependencies live in. A plain ``python3 pair.py``
+    uses the system interpreter, imports none of them, and degrades to an
+    unscannable payload string *after* the user has correctly installed
+    everything. Rather than make them remember a 50-character interpreter
+    path, hand the script to the right python ourselves.
+
+    Guarded by an env flag so a venv genuinely missing ``qrcode`` prints the
+    install hint instead of exec-looping.
+    """
+    if os.environ.get(_REEXEC_FLAG):
+        return
+    venv_python = hermes_home / "hermes-agent" / "venv" / "bin" / "python"
+    if not venv_python.exists():
+        return
+    try:
+        if Path(sys.executable).resolve() == venv_python.resolve():
+            return
+    except OSError:
+        return
+    os.environ[_REEXEC_FLAG] = "1"
+    os.execv(str(venv_python), [str(venv_python), os.path.abspath(__file__), *sys.argv[1:]])
+
+
 def print_qr(payload: str) -> None:
     try:
         import qrcode  # noqa: PLC0415 — optional, absent on a bare Hermes install
@@ -109,6 +138,7 @@ def main() -> None:
     hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
     if not hermes_home.is_dir():
         die(f"{hermes_home} not found — is Hermes installed?")
+    reexec_under_hermes_python(hermes_home)
     env_file = hermes_home / ".env"
     env = read_env(env_file)
 
