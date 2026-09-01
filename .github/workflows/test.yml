@@ -21,6 +21,8 @@ jobs:
       # crypto interop suite is a standalone script (exits non-zero on failure)
       - name: Crypto interop tests
         run: python tests/test_crypto.py
-      # adapter RPC suite is unittest-style — pytest-collectable
-      - name: Adapter RPC tests
-        run: python -m pytest tests/test_rpc.py -q
+      # the rest are unittest-style — pytest-collectable. Collect the whole
+      # directory rather than naming files: streaming, attachments, and pair
+      # were all landing unrun.
+      - name: Adapter tests
+        run: python -m pytest tests -q --ignore=tests/test_crypto.py
