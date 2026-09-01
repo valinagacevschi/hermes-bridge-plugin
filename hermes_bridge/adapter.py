@@ -3072,4 +3072,10 @@ def register(ctx) -> None:
         emoji="📱",
         allowed_users_env="HERMES_BRIDGE_ALLOWED_USERS",
         allow_all_env="HERMES_BRIDGE_ALLOW_ALL",
+        # Makes `deliver=hermes_bridge` a valid cron target and feeds
+        # `deliver=origin`'s fallback (cron/scheduler.py resolves the chat id
+        # from this env var). Without it Hermes also nags on the first message
+        # that no home channel is set. pair.py writes it: the profile has
+        # exactly one chat, and its id is the profile id.
+        cron_deliver_env_var="HERMES_BRIDGE_HOME_CHANNEL",
     )

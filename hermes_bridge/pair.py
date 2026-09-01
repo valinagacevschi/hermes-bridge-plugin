@@ -35,6 +35,7 @@ ENV_KEYS = (
     "HERMES_BRIDGE_PROFILE_ID",
     "HERMES_BRIDGE_API_KEY",
     "HERMES_BRIDGE_ALLOWED_USERS",
+    "HERMES_BRIDGE_HOME_CHANNEL",
 )
 # Every inbound frame reports this one synthetic user id (adapter.py's two
 # build_source calls) — one phone or five, they are all "mobile".
@@ -157,6 +158,23 @@ def authorize_adapter_user(env_file: Path, env: dict) -> None:
     print(f"Authorized the bridge's sender in {env_file} (HERMES_BRIDGE_ALLOWED_USERS)")
 
 
+def set_home_channel(env_file: Path, env: dict, profile_id: str) -> None:
+    """Point Hermes' cron/notification delivery at this phone.
+
+    A home channel is where Hermes sends cron results and cross-platform
+    messages. Unset, it nags on the first message ("Type /sethome...") and
+    `deliver=hermes_bridge` cron jobs have nowhere to go. There is nothing to
+    choose here — a profile has exactly one chat and its id is the profile id
+    — so set it rather than making the user answer a question with one
+    possible answer. `/sethome` in the app still overrides it.
+    """
+    if env.get("HERMES_BRIDGE_HOME_CHANNEL"):
+        return
+    with env_file.open("a", encoding="utf-8") as handle:
+        handle.write(f"HERMES_BRIDGE_HOME_CHANNEL={profile_id}\n")
+    print(f"Set this chat as the home channel for cron results and notifications")
+
+
 def readiness_report(hermes_home: Path, env: dict) -> list:
     """Check the things that only fail at first use, and say how to fix them.
 
@@ -188,6 +206,15 @@ def readiness_report(hermes_home: Path, env: dict) -> list:
             False,
             "qrcode missing — pairing falls back to an unscannable payload",
             '~/.hermes/hermes-agent/venv/bin/pip install "qrcode>=7.4,<8"',
+        ))
+
+    if env.get("HERMES_BRIDGE_HOME_CHANNEL"):
+        checks.append((True, "home channel set — cron results reach the phone", ""))
+    else:
+        checks.append((
+            False,
+            "no home channel — cron results have nowhere to go, and Hermes will ask",
+            "re-run this script, or send /sethome from the app",
         ))
 
     allowed = [u.strip() for u in env.get("HERMES_BRIDGE_ALLOWED_USERS", "").split(",")]
@@ -332,6 +359,7 @@ def main() -> None:
         die(f"no invite token in response: {response}")
 
     authorize_adapter_user(env_file, env)
+    set_home_channel(env_file, env, profile_id)
     psk_hex = load_or_create_psk(hermes_home / "psk")
     payload = json.dumps({"token": token, "psk": psk_hex}, separators=(",", ":"))
 

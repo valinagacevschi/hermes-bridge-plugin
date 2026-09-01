@@ -120,6 +120,7 @@ Written by `pair.py` into `~/.hermes/.env`; listed in `hermes config` for inspec
 | `HERMES_BRIDGE_PROFILE_ID` | minted by `pair.py` |
 | `HERMES_BRIDGE_API_KEY` | minted by `pair.py` |
 | `HERMES_BRIDGE_ALLOWED_USERS` | `mobile` — written by `pair.py`, see below |
+| `HERMES_BRIDGE_HOME_CHANNEL` | your `profile_id` — where cron results are delivered |
 
 Hermes authorizes senders per platform and **default-denies when no allowlist is
 configured**, answering the first message with "I don't recognize you yet" and a pairing
@@ -128,6 +129,11 @@ so `pair.py` allowlists exactly that. Equivalent manual routes if you prefer:
 `hermes pairing approve hermes_bridge <code>`, or `HERMES_BRIDGE_ALLOW_ALL=1`. Your phone's
 real authentication is the invite, the `hb_` api_key and the PSK — this gate just needs to
 be told.
+
+`HERMES_BRIDGE_HOME_CHANNEL` is the other half: a home channel is where Hermes delivers
+cron results and cross-platform messages, and declaring it is what makes
+`deliver=hermes_bridge` a valid cron target at all. `pair.py` sets it to your profile id
+(a profile has exactly one chat); `/sethome` from the app overrides it.
 
 ## Pairing your phone
 

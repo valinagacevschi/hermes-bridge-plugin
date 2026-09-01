@@ -14,7 +14,8 @@ end-to-end key, prints the QR:
     python3 ~/.hermes/plugins/hermes_bridge/pair.py
 
 Then install **Hermes Bridge** from the App Store, tap *Pair new device*, and
-scan. `pair.py` also allowlists the bridge's sender
+scan. `pair.py` also points cron delivery at this chat
+(`HERMES_BRIDGE_HOME_CHANNEL`) and allowlists the bridge's sender
 (`HERMES_BRIDGE_ALLOWED_USERS=mobile`) — without it Hermes answers your first
 message with "I don't recognize you yet" and a pairing code, because it
 default-denies any sender with no allowlist configured. Answer *yes* to the enable prompt above, restart the gateway

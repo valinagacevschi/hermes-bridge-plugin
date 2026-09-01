@@ -103,6 +103,26 @@ class PairScriptTest(unittest.TestCase):
             (self.home / ".env").read_text().count("HERMES_BRIDGE_ALLOWED_USERS"), 1
         )
 
+    def test_sets_the_home_channel_to_the_profile_chat(self):
+        """Unset, Hermes nags on the first message and cron has no target."""
+        self._run()
+
+        env = pair.read_env(self.home / ".env")
+        self.assertEqual(env["HERMES_BRIDGE_HOME_CHANNEL"], "profile_ss_abc123")
+
+        self._run()
+        self.assertEqual(
+            (self.home / ".env").read_text().count("HERMES_BRIDGE_HOME_CHANNEL"), 1
+        )
+
+    def test_leaves_an_operator_set_home_channel_alone(self):
+        (self.home / ".env").write_text("HERMES_BRIDGE_HOME_CHANNEL=somewhere-else\n")
+
+        self._run()
+
+        env = pair.read_env(self.home / ".env")
+        self.assertEqual(env["HERMES_BRIDGE_HOME_CHANNEL"], "somewhere-else")
+
     def test_leaves_an_operator_set_allowlist_alone(self):
         (self.home / ".env").write_text("HERMES_BRIDGE_ALLOWED_USERS=mobile,someone\n")
 
