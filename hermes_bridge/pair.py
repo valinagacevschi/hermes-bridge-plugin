@@ -225,24 +225,49 @@ def _plugin_enabled(hermes_home: Path) -> Optional[bool]:
     """Is this plugin in config.yaml's plugins.enabled? None = cannot tell.
 
     A user plugin that is installed but not listed there is skipped without a
-    word at gateway startup — the single most confusing way this can be
-    broken.
+    word at gateway startup — the quietest way this can be broken.
+
+    Parsed by hand rather than with PyYAML: this script is stdlib-only so it
+    runs under any interpreter, and the shape being read is a list of plain
+    strings.
+    # ponytail: handles the block and inline-list forms of plugins.enabled,
+    # not anchors/multi-doc YAML; returns None (unknown, reported as
+    # "not checked") rather than guessing if it cannot find the key.
     """
     config = hermes_home / "config.yaml"
-    if not config.exists():
-        return None
     try:
-        import yaml  # noqa: PLC0415 — present in the Hermes venv we re-exec into
-    except ImportError:
+        lines = config.read_text(encoding="utf-8").splitlines()
+    except OSError:
         return None
-    try:
-        data = yaml.safe_load(config.read_text(encoding="utf-8")) or {}
-    except Exception:
-        return None
-    enabled = ((data.get("plugins") or {}).get("enabled")) or []
-    if not isinstance(enabled, list):
-        return None
-    return any(str(e).rsplit("/", 1)[-1] == "hermes_bridge" for e in enabled)
+
+    in_plugins = False
+    for i, raw in enumerate(lines):
+        line = raw.rstrip()
+        if not line or line.lstrip().startswith("#"):
+            continue
+        if not line[0].isspace():
+            in_plugins = line.split(":", 1)[0].strip() == "plugins"
+            continue
+        if not in_plugins or line.strip().split(":", 1)[0].strip() != "enabled":
+            continue
+
+        _, _, inline = line.partition(":")
+        inline = inline.strip()
+        if inline.startswith("["):
+            entries = inline.strip("[]").split(",")
+        else:
+            entries = []
+            for follow in lines[i + 1:]:
+                stripped = follow.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if not stripped.startswith("- "):
+                    break
+                entries.append(stripped[2:])
+        return any(
+            e.strip().strip("\"'").rsplit("/", 1)[-1] == "hermes_bridge" for e in entries
+        )
+    return None
 
 
 def print_qr(payload: str) -> None:

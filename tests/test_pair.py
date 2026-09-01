@@ -137,6 +137,18 @@ class PairScriptTest(unittest.TestCase):
         (self.home / "config.yaml").write_text("plugins:\n  enabled:\n    - hermes_bridge\n")
         self.assertIs(enablement_check(), True)
 
+        # The inline-list form, and a legacy nested key, both count.
+        (self.home / "config.yaml").write_text("plugins:\n  enabled: [other, hermes_bridge]\n")
+        self.assertIs(enablement_check(), True)
+        (self.home / "config.yaml").write_text(
+            "plugins:\n  enabled:\n    - platforms/hermes_bridge\n"
+        )
+        self.assertIs(enablement_check(), True)
+
+        # No config at all is "unknown", never a false alarm.
+        (self.home / "config.yaml").unlink()
+        self.assertIsNone(pair._plugin_enabled(self.home))
+
     def test_hands_itself_to_the_hermes_venv_interpreter(self):
         """qrcode lives in the Hermes venv, so a system python3 must not be the
         interpreter that reaches print_qr — see reexec_under_hermes_python."""
