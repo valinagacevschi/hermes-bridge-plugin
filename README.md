@@ -130,6 +130,35 @@ The tests run **without** a Hermes install: `test_crypto.py` imports `crypto.py`
 (PyNaCl only), and the other three stub `gateway.platforms.base`/`tools.*` via
 `tests/testutil.py`.
 
+## Reading the code comments
+
+`hermes_bridge/` is transformed, not rewritten, from a private monorepo, so its comments
+cite that repo's issue tracker and specs. The code is meant to stand on its own — this is
+the legend for the references you'll hit, so a `(#41)` is context rather than a dead end.
+
+| Ref | What it was |
+|-----|-------------|
+| `#38` | voice messages + TTS playback, end to end |
+| `#40` | `supported_ops` capability handshake on the gateway WS |
+| `#41` | buffered delivery, ordered replay, wake-poke for offline peers |
+| `#42` | interactive controls — native buttons for approvals & clarify |
+| `#44` | signed lifecycle webhooks → push notifications |
+| `#45` | reaction ack lifecycle (received / processing / done) |
+| `#46` | scheduled-task (cron) management screen |
+| `#49` | `/rollback` + read-only memory/journey view |
+| `#50` | turn-complete push dedup + category deep-links |
+| `#62` | the `Platform('api_server')` collision — fixed, see below |
+| `#64` | Agent-tab RPC auth against the dashboard REST (port + token caching) |
+
+`PRD_Features.md` / `PRD_Bots.md` are that repo's private specs. `gateway/...` paths are
+**Hermes core's** source, readable in any Hermes install — those are worth following.
+
+`#62` is the one to know about historically: the adapter used to declare
+`Platform('api_server')`, colliding with Hermes core's own api_server platform so replies
+were delivered to the wrong adapter and silently dropped. It now registers as
+`Platform("hermes_bridge")` (Hermes 0.21.0+), so the collision cannot happen and the old
+"disable api_server first" workaround is gone.
+
 ## Troubleshooting
 
 - **libsodium base64 variant** — the mobile side uses libsodium's `ORIGINAL` (standard)

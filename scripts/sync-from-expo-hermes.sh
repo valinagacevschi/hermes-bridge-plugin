@@ -158,8 +158,10 @@ echo "(bucket 3) — never synced. See script header / their own docstrings for 
 echo "they diverge from the monorepo on purpose."
 echo
 echo "NOTE: this script does NOT scrub monorepo-internal doc references (issue"
-echo "numbers, PRD section anchors, gateway/run.py paths) from copied comments."
-echo "Skim the diff for anything a public reader can't follow."
+echo "numbers, PRD section anchors) from copied comments — scrubbing would fork"
+echo "the mirror's comments from their source. README.md's \"Reading the code"
+echo "comments\" table is the legend instead; add any NEW issue number this sync"
+echo "introduced to it."
 
 # ---------------------------------------------------------------------------
 # Correctness gate: refuse to leave a synced-but-broken repo. Never publish
