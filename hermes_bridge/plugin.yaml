@@ -27,6 +27,10 @@ tags:
 # dependencies — after-install.md carries the pip line.
 python_dependencies:
   - PyNaCl>=1.6,<1.7
+  # pair.py renders the pairing QR with it; without it pairing degrades to a
+  # payload string nobody can scan. Hermes core pins qrcode==7.4.2 in its
+  # messaging/dingtalk/feishu extras, so the range stays compatible with those.
+  - qrcode>=7.4,<8
 # All three are written by pair.py, not typed by the user, so none belong in
 # `requires_env` (which prompts at install time for values the relay has not
 # minted yet). Declaring them optional surfaces them in the `hermes config` UI

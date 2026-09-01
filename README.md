@@ -35,8 +35,10 @@ sent to the relay**. The relay stores and forwards opaque ciphertext.
 - [Hermes agent](https://github.com/NousResearch/hermes) **0.21.0 or newer** — the plugin
   registers itself as a platform named `hermes_bridge`, which needs the runtime plugin
   platform registry.
-- **PyNaCl** in the Hermes venv. `websockets` already ships with Hermes; PyNaCl does not,
-  and Hermes never auto-installs plugin dependencies.
+- **PyNaCl** and **qrcode** in the Hermes venv. `websockets` already ships with Hermes;
+  these two do not, and Hermes never auto-installs plugin dependencies. PyNaCl does the
+  encryption; `qrcode` draws the pairing QR (without it `pair.py` prints an unscannable
+  payload string).
 
 ## Access
 
@@ -52,7 +54,7 @@ fresh invite for your *existing* profile — same script, no re-provisioning.
 
 ```bash
 hermes plugins install valinagacevschi/hermes-bridge-plugin/hermes_bridge
-~/.hermes/hermes-agent/venv/bin/pip install "PyNaCl>=1.6,<1.7"
+~/.hermes/hermes-agent/venv/bin/pip install "PyNaCl>=1.6,<1.7" "qrcode>=7.4,<8"
 python3 ~/.hermes/plugins/hermes_bridge/pair.py
 hermes gateway restart
 ```
@@ -88,7 +90,7 @@ same phone stays paired.
 ### Manual install
 
 1. Copy `hermes_bridge/` → `~/.hermes/plugins/hermes_bridge/`.
-2. `~/.hermes/hermes-agent/venv/bin/pip install "PyNaCl>=1.6,<1.7"`.
+2. `~/.hermes/hermes-agent/venv/bin/pip install "PyNaCl>=1.6,<1.7" "qrcode>=7.4,<8"`.
 3. `hermes plugins enable hermes_bridge` (non-bundled plugins are opt-in).
 4. `python3 ~/.hermes/plugins/hermes_bridge/pair.py`.
 5. `hermes gateway restart`.
@@ -176,9 +178,9 @@ were delivered to the wrong adapter and silently dropped. It now registers as
   Hermes venv's pip (`~/.hermes/hermes-agent/venv/bin/pip`), not system pip.
 - **Two copies loaded** — a leftover `~/.hermes/plugins/platforms/hermes_bridge` from the
   old installer registers under a different key. See *Upgrading*, above.
-- **No QR printed, just a payload line** — `pair.py` renders the QR with the optional
-  `qrcode` package (`~/.hermes/hermes-agent/venv/bin/pip install qrcode`); without it the
-  raw payload is printed for manual entry.
+- **No QR printed, just a payload line** — `qrcode` is missing from the Hermes venv:
+  `~/.hermes/hermes-agent/venv/bin/pip install "qrcode>=7.4,<8"`, then re-run `pair.py`
+  (it mints a fresh invite and reprints, so an expired one costs nothing).
 - **Start command** — `hermes gateway run` (foreground). If running as a service,
   restart atomically with `launchctl kickstart -k gui/$(id -u)/ai.hermes.gateway`.
 

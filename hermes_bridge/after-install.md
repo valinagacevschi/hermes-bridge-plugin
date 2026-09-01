@@ -1,9 +1,12 @@
 # Hermes Bridge — two steps left
 
-**1. Install PyNaCl** (Hermes ships `websockets` but not PyNaCl, and never
-installs plugin dependencies for you):
+**1. Install the two dependencies** (Hermes ships `websockets`, but neither of
+these, and it never installs plugin dependencies for you):
 
-    ~/.hermes/hermes-agent/venv/bin/pip install "PyNaCl>=1.6,<1.7"
+    ~/.hermes/hermes-agent/venv/bin/pip install "PyNaCl>=1.6,<1.7" "qrcode>=7.4,<8"
+
+PyNaCl does the end-to-end encryption; `qrcode` draws the pairing QR in your
+terminal. Skip `qrcode` and step 2 prints a payload string you cannot scan.
 
 **2. Pair a phone** — provisions your own profile on the relay, generates the
 end-to-end key, prints the QR:

@@ -14,8 +14,9 @@ needs pairing.
 The PSK never leaves this machine except through the QR you scan; the relay
 never sees it.
 
-Standard library only, plus optional ``qrcode`` for the terminal QR (the raw
-payload is printed either way).
+Standard library only, plus ``qrcode`` for the terminal QR — declared in
+plugin.yaml and installed per after-install.md. Without it the raw payload is
+printed instead, which is readable but not scannable.
 """
 
 import binascii
@@ -93,8 +94,10 @@ def print_qr(payload: str) -> None:
     try:
         import qrcode  # noqa: PLC0415 — optional, absent on a bare Hermes install
     except ImportError:
-        print("  (install `qrcode` in the Hermes venv for a scannable QR here)")
-        print(f"  payload: {payload}")
+        print("  No QR: the `qrcode` package is missing from the Hermes venv.")
+        print("  Install it, then re-run this script for a scannable code:")
+        print('    ~/.hermes/hermes-agent/venv/bin/pip install "qrcode>=7.4,<8"')
+        print(f"  payload (manual entry): {payload}")
         return
     qr = qrcode.QRCode(border=1)
     qr.add_data(payload)
