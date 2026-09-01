@@ -30,15 +30,25 @@
   provisioning (below) — check current README/install.sh before trusting this as
   present-tense.
 
-- **`install.sh`/`pair-phone.sh` are hand-maintained, but "no source to sync from" can
-  stop being true overnight.** expo-hermes shipped self-serve pairing
-  (`POST /api/pair/provision`, no `ADMIN_SECRET`) and a new `pair-phone.sh`, with a
-  matching `install.sh` rewrite — real logic this repo needed, not just docs. Its
-  `install.sh` had independently diverged too (this repo added `curl \| bash` +
-  non-interactive env-var support the monorepo's copy never had), so this wasn't a
-  pure-copy: had to merge monorepo's self-serve provisioning logic into this repo's
-  curl\|bash-capable installer by hand, and add `pair-phone.sh` (a new bucket-1
-  candidate — self-contained bash, only touches `$HERMES_HOME`/the relay, no
-  monorepo-only paths). `scripts/sync-from-expo-hermes.sh` still only handles the
-  Python package + its tests — it does not know about `install.sh`/`pair-phone.sh`.
-  If they diverge again, that's a manual reconciliation, not a script run.
+- **Installation is Hermes' job now — the hand-maintained installers are gone.** This repo
+  used to ship `install.sh` (`curl | bash`: copy files, pip into the Hermes venv, append
+  `plugins.enabled`, provision, print the QR) and `pair-phone.sh`. Hermes core already does
+  all of the packaging half: `hermes plugins install <owner/repo[/subdir]>` clones,
+  security-scans, prompts `requires_env`, prints `python_dependencies`, renders the plugin's
+  `after-install.md`, writes `plugins.enabled` on a prompt, and takes capability consent.
+  What was actually ours — provisioning + PSK + QR — became `hermes_bridge/pair.py` (stdlib
+  only, synced from the monorepo like every other module).
+
+- **Install by subdir: `valinagacevschi/hermes-bridge-plugin/hermes_bridge`.**
+  `hermes plugins install` runs `tools/plugin_guard.py` on exactly the tree it installs, and
+  the *repo root* scans CAUTION (this README documents a `curl` command) — blocked without
+  `--force`. `hermes_bridge/` alone scans SAFE. Keep prose, fixtures, and anything with a
+  `curl | sh` or `rm -rf` shaped string out of the package directory; the monorepo's test
+  files scan DANGEROUS, which `--force` cannot override.
+
+- **The sync script gates on Hermes' own validators.** After the tests, it runs
+  `plugin_guard.scan_plugin` + `hermes_cli.plugin_dev.doctor_plugin` against `hermes_bridge/`
+  and fails the sync if the tree would not install cleanly (skipped with a warning when no
+  Hermes is installed locally). It also fails when the monorepo's `make_adapter` sets an
+  adapter field this repo's `tests/testutil.py` doesn't — that drift used to surface as a
+  bare `AttributeError` inside an unrelated handler.

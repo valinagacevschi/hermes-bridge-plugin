@@ -1,8 +1,40 @@
+manifest_version: 2
 kind: platform
 name: hermes_bridge
 label: Hermes Bridge
-description: Connects Hermes to the Hermes Bridge mobile relay via outbound WebSocket.
-version: 0.1.0
-required_env:
-  - HERMES_BRIDGE_RELAY_URL
-  - HERMES_BRIDGE_PROFILE_ID
+version: 0.2.0
+description: >
+  Connects Hermes to the Hermes Bridge mobile app over an end-to-end-encrypted
+  cloud relay. The gateway dials out over WebSocket, so no inbound port and no
+  tunnel is needed; the relay only ever sees XChaCha20-Poly1305 ciphertext.
+author: Valentin Nagacevschi
+license: MIT
+homepage: https://github.com/valinagacevschi/hermes-bridge-plugin
+tags:
+  - platform
+  - mobile
+  - ios
+  - relay
+  - e2ee
+# websockets ships with Hermes core; PyNaCl does not (it only arrives as a
+# transitive of the `messaging` extra). Hermes never auto-installs plugin
+# dependencies — after-install.md carries the pip line.
+python_dependencies:
+  - PyNaCl>=1.6,<1.7
+# All three are written by pair.py, not typed by the user, so none belong in
+# `requires_env` (which prompts at install time for values the relay has not
+# minted yet). Declaring them optional surfaces them in the `hermes config` UI
+# for inspection and re-pairing.
+optional_env:
+  - name: HERMES_BRIDGE_RELAY_URL
+    description: "Relay WebSocket URL (default wss://herelay.appcenter.ro)"
+    prompt: "Hermes Bridge relay URL"
+    password: false
+  - name: HERMES_BRIDGE_PROFILE_ID
+    description: "Profile minted by pair.py — identifies this laptop to the relay"
+    prompt: "Hermes Bridge profile id"
+    password: false
+  - name: HERMES_BRIDGE_API_KEY
+    description: "Laptop API key minted by pair.py (hb_...)"
+    prompt: "Hermes Bridge API key"
+    password: true

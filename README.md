@@ -32,92 +32,87 @@ sent to the relay**. The relay stores and forwards opaque ciphertext.
 
 ## Requirements
 
-- A working [Hermes agent](https://github.com/NousResearch/hermes) install (this plugin
-  loads into it and imports its `gateway.platforms.base`).
-- Python 3.9+ with `websockets` and `PyNaCl` (installed into the Hermes venv by the
-  installer).
-- `curl`, `jq`, `qrencode`, `xxd` — used by `install.sh`/`pair-phone.sh` to self-serve a
-  pairing from the relay and print the QR (`brew install jq qrencode`; curl/xxd ship with
-  macOS).
+- [Hermes agent](https://github.com/NousResearch/hermes) **0.21.0 or newer** — the plugin
+  registers itself as a platform named `hermes_bridge`, which needs the runtime plugin
+  platform registry.
+- **PyNaCl** in the Hermes venv. `websockets` already ships with Hermes; PyNaCl does not,
+  and Hermes never auto-installs plugin dependencies.
 
 ## Access
 
-**Self-serve — no maintainer, no invite request, no admin secret.** `install.sh` calls the
-relay's public `POST /api/pair/provision` itself, which mints your own isolated
-`profile_id` + `hb_…` API key (`tenant_selfserve`, rate-limited per IP) and a one-time
-phone-pairing invite in the same response. There's nothing to request access to — running
-the installer *is* signup.
+**Self-serve — no maintainer, no invite request, no admin secret.** `pair.py` calls the
+relay's public `POST /api/pair/provision`, which mints your own isolated `profile_id` +
+`hb_…` API key (rate-limited per IP) and a one-time phone-pairing invite in the same
+response. There is nothing to request access to — pairing *is* signup.
 
-The invite token is single-use and expires in 1 hour. If it lapses before you scan it (or
-you want to pair a second phone later), re-run the `pair-phone.sh` the installer drops next
-to the plugin — it mints a fresh invite for your *existing* profile, no re-provisioning.
+The invite token is single-use and expires in 1 hour. Re-run `pair.py` any time to mint a
+fresh invite for your *existing* profile — same script, no re-provisioning.
 
 ## Install
 
-One-liner (downloads + installs; prompts on the terminal):
-
 ```bash
-curl -fsSL https://raw.githubusercontent.com/valinagacevschi/hermes-bridge-plugin/main/install.sh | bash
+hermes plugins install valinagacevschi/hermes-bridge-plugin/hermes_bridge
+~/.hermes/hermes-agent/venv/bin/pip install "PyNaCl>=1.6,<1.7"
+python3 ~/.hermes/plugins/hermes_bridge/pair.py
+hermes gateway restart
 ```
 
-Non-interactive — pre-set your own already-claimed credentials to skip self-serve
-provisioning entirely (e.g. restoring a previous install):
+Answer **yes** to the installer's "Enable now?" prompt (that writes `plugins.enabled` for
+you). The trailing `/hermes_bridge` is the plugin package inside this repo — install it
+without the subdir and Hermes clones the whole repo, README included, which its plugin
+security scanner flags.
+
+Useful afterwards:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/valinagacevschi/hermes-bridge-plugin/main/install.sh \
-  | HERMES_BRIDGE_PROFILE_ID=profile_ss_xxxx HERMES_BRIDGE_API_KEY=hb_… bash
+hermes plugins list                 # is it installed and enabled?
+hermes plugins update hermes_bridge # pull the latest
+hermes plugins doctor hermes_bridge # validate against the real runtime contracts
 ```
 
-Or from a checkout:
+### Upgrading from the old `curl | bash` installer
+
+Earlier versions shipped an `install.sh` that copied the plugin to
+`~/.hermes/plugins/platforms/hermes_bridge`. Hermes derives the plugin key from that path,
+so the old copy loads as `platforms/hermes_bridge` — a *different* plugin from the one
+installed above. Once:
 
 ```bash
-git clone https://github.com/valinagacevschi/hermes-bridge-plugin.git
-cd hermes-bridge-plugin
-./install.sh
+rm -rf ~/.hermes/plugins/platforms/hermes_bridge
+# then drop the `platforms/hermes_bridge` entry from plugins.enabled in ~/.hermes/config.yaml
 ```
 
-`install.sh` copies the `hermes_bridge/` package + `pair-phone.sh` into
-`~/.hermes/plugins/platforms/hermes_bridge/` (downloading a release tarball first when run
-via `curl`), installs the Python deps into the Hermes venv, enables the plugin in
-`~/.hermes/config.yaml`, self-serve provisions a profile/API key (see Access, above),
-generates a PSK, and prints one combined QR (invite token + PSK) to scan on the phone.
+Your `~/.hermes/.env` credentials and `~/.hermes/psk` are untouched by any of this — the
+same phone stays paired.
 
 ### Manual install
 
-1. Copy `hermes_bridge/` → `~/.hermes/plugins/platforms/hermes_bridge/`.
-2. `~/.hermes/hermes-agent/venv/bin/pip install -r requirements.txt`.
-3. Add to `~/.hermes/config.yaml` (non-bundled plugins require explicit opt-in):
-   ```yaml
-   plugins:
-     enabled:
-       - platforms/hermes_bridge
-   ```
-4. `curl -sf -X POST https://herelay.appcenter.ro/api/pair/provision -d '{}'` and write the
-   returned `profile_id`/`api_key` (below) into `~/.hermes/.env`, alongside
-   `HERMES_BRIDGE_RELAY_URL=wss://herelay.appcenter.ro`.
-5. Generate a 32-byte PSK at `~/.hermes/psk` (`chmod 600`).
-6. Combine the response's `token` + the PSK hex into `{"token":"...","psk":"..."}` and scan
-   that on the phone (or run `pair-phone.sh` once step 4/5 are done, to do this for you).
+1. Copy `hermes_bridge/` → `~/.hermes/plugins/hermes_bridge/`.
+2. `~/.hermes/hermes-agent/venv/bin/pip install "PyNaCl>=1.6,<1.7"`.
+3. `hermes plugins enable hermes_bridge` (non-bundled plugins are opt-in).
+4. `python3 ~/.hermes/plugins/hermes_bridge/pair.py`.
+5. `hermes gateway restart`.
 
 ## Environment variables
+
+Written by `pair.py` into `~/.hermes/.env`; listed in `hermes config` for inspection.
 
 | Var | Value |
 |-----|-------|
 | `HERMES_BRIDGE_RELAY_URL` | `wss://herelay.appcenter.ro` (the hosted relay) |
-| `HERMES_BRIDGE_PROFILE_ID` | from self-serve provisioning (see Access, above) |
-| `HERMES_BRIDGE_API_KEY` | from self-serve provisioning (see Access, above) |
+| `HERMES_BRIDGE_PROFILE_ID` | minted by `pair.py` |
+| `HERMES_BRIDGE_API_KEY` | minted by `pair.py` |
 
 ## Pairing your phone
 
-1. Run `install.sh` on the Mac — it self-serve provisions and prints a combined QR
-   (invite token + PSK).
+1. Run `python3 ~/.hermes/plugins/hermes_bridge/pair.py` on the Mac — it provisions on
+   first run and prints a QR holding the invite token + the encryption key.
 2. Install the **Hermes Bridge** app from the App Store.
 3. In the app: **Pair new device** → scan the QR.
-4. Start the gateway: `hermes gateway run`.
+4. `hermes gateway restart`.
 
-Invite expired, or pairing a second phone to the same laptop? Run
-`~/.hermes/plugins/platforms/hermes_bridge/pair-phone.sh` — it mints a fresh invite for
-your existing profile and reprints the QR, no re-provisioning.
+Invite expired, or pairing a second phone to the same laptop? Run `pair.py` again — it
+reuses your profile and prints a fresh QR.
 
 Your agent's replies now reach the phone; scheduled/cron outputs arrive as push
 notifications with a durable inbox so nothing is lost while the app is closed.
@@ -143,12 +138,18 @@ The tests run **without** a Hermes install: `test_crypto.py` imports `crypto.py`
 - **`:in` is a JSON envelope, `:out` is a raw sealed frame** — the relay forwards
   phone→agent as `{"role","content"}` where `content` is the sealed frame (json-decode
   then `open_frame(content)`); agent→phone replies are the bare sealed-frame string.
-- **PSK QR is HEX, not base64** — the installer encodes the PSK as 64 lowercase hex chars
-  (`xxd -p`); the app expects hex (optionally wrapped as `{"psk":"<hex>"}`).
+- **PSK QR is HEX, not base64** — `pair.py` encodes the PSK as 64 lowercase hex chars;
+  the app expects hex (optionally wrapped as `{"psk":"<hex>"}`).
 - **Plugin silently not loading** — non-bundled plugins under `~/.hermes/plugins/` are
-  skipped unless listed in `config.yaml` under `plugins.enabled`.
-- **Install into the Hermes venv, not system pip** — use
-  `~/.hermes/hermes-agent/venv/bin/pip`, or the import fails at runtime.
+  skipped unless listed in `config.yaml` under `plugins.enabled`. `hermes plugins list`
+  shows the truth; `hermes plugins enable hermes_bridge` fixes it.
+- **`No module named 'nacl'` in the gateway log** — PyNaCl is missing. Install it with the
+  Hermes venv's pip (`~/.hermes/hermes-agent/venv/bin/pip`), not system pip.
+- **Two copies loaded** — a leftover `~/.hermes/plugins/platforms/hermes_bridge` from the
+  old installer registers under a different key. See *Upgrading*, above.
+- **No QR printed, just a payload line** — `pair.py` renders the QR with the optional
+  `qrcode` package (`~/.hermes/hermes-agent/venv/bin/pip install qrcode`); without it the
+  raw payload is printed for manual entry.
 - **Start command** — `hermes gateway run` (foreground). If running as a service,
   restart atomically with `launchctl kickstart -k gui/$(id -u)/ai.hermes.gateway`.
 

@@ -7,11 +7,13 @@ import mimetypes
 import os
 import random
 import re
+import secrets
 import threading
 import time
 import urllib.request
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote, urlencode
 
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -30,40 +32,70 @@ from .crypto import load_psk, open_blob, open_frame, seal, seal_blob
 
 logger = logging.getLogger(__name__)
 
-PLATFORM = Platform('api_server')
+PLATFORM_NAME = "hermes_bridge"
+
+# Resolved per-instance, never at module scope. `Platform` (gateway/config.py)
+# is a closed enum whose `_missing_` hook mints a member only for names the
+# platform registry already knows; the name below is registered when Hermes
+# discovers this plugin, which is not guaranteed to have happened when this
+# module is first imported (tests import it standalone). Resolving here would
+# raise ValueError.
+#
+# This replaced `Platform('api_server')`. That hijack collided with Hermes
+# core's own api_server platform — core keys its adapter registry by platform
+# value, so one silently overwrote the other and replies went to the wrong
+# adapter (the phone typed forever). Requires Hermes >= 0.21.0, which accepts
+# runtime-registered plugin platform names.
 
 # Reconnect backoff bounds (seconds). The relay rolls on every deploy and the
 # WS can drop on any network blip — the supervisor loop reconnects forever.
 _RECONNECT_INITIAL = 1.0
 _RECONNECT_MAX = 30.0
 
-# Durable-queue replay grace window (#41, seconds). `seq` in a live frame's
-# envelope is relay-supplied, plaintext, and unauthenticated — the relay
-# holds no PSK. Gating allow_stale purely on "seq is present" would let a
-# malicious/compromised relay resend an old captured frame with a fabricated
-# seq at ANY time, permanently bypassing the 60s replay-defense window (the
-# nonce cache is only 256 entries and resets on every gateway restart, so it
-# alone doesn't stop this). Bounding allow_stale to this window after the
-# ADAPTER's own connect timestamp — not relay-controlled — bounds the bypass
-# to shortly after each reconnect, when a real backlog replay is expected,
-# instead of forever. Residual risk, not fully closed: since the relay is
-# the WS server side, a malicious/compromised relay could force-close the
-# connection and let the supervisor reconnect (backoff starts at
-# _RECONNECT_INITIAL = 1.0s) to keep re-opening a fresh 30s window. That
-# requires active, repeated disruption of the connection — a much noisier
-# and more detectable capability than "replay a captured frame at any time,
-# no interaction needed" (silent forever-bypass, this fix's actual threat).
-# Closing the residual gap fully would need the relay to send an explicit
-# end-of-backlog marker so allow_stale is scoped to genuine replay, not
-# reconnect-count — left as a follow-up, not done here.
+# Fallback ceiling on the durable-queue replay window (#41, seconds).
+#
+# `seq` in a live frame's envelope is relay-supplied, plaintext and
+# unauthenticated — the relay holds no PSK. Gating allow_stale purely on "seq
+# is present" would let a malicious/compromised relay resend an old captured
+# frame with a fabricated seq at ANY time, permanently bypassing the 60s
+# replay-defense window (the nonce cache is only 256 entries and resets on
+# every gateway restart, so it alone doesn't stop this).
+#
+# The window is normally closed by the relay's explicit `backlog_done` marker
+# (server/ws.ts), which scopes allow_stale to a genuine replay rather than to
+# a guessed interval. This bound exists only for a relay old enough not to
+# send that marker: without it `_backlog_open` would stay open for the whole
+# life of the connection, which is worse than the timed window it replaces.
+#
 # Generous relative to one page (REPLAY_PAGE_LIMIT in server/ws.ts) of small
 # JSON frames over a live WS.
 _INBOUND_REPLAY_GRACE_S = 30.0
 
-# Hermes local REST API — well-known fallback ports.
-# 9119 is the declared default; 9120/8642 are legacy guesses.
-# In practice the dashboard uses --port 0 (OS-assigned) so these are often wrong.
-# _discover_dashboard_ports() finds the real port via psutil before falling back here.
+# Hermes local REST fallback ports. This adapter talks to TWO different local
+# services and reaches both through _hermes_request's probe loop:
+#
+#   * the dashboard (`hermes dashboard`, default 9119) serves the `/api/*`
+#     routes — sessions, skills, status, cron, model options, system stats
+#   * the api_server platform (default 8642) serves the `/v1/*` routes —
+#     `/v1/runs` (POST/GET/SSE) and `/v1/runs/{id}/approval`. There is no
+#     aggregate `/v1/approvals` list — run approvals are cached in-process
+#     from `approval.request` SSE frames (see `_pending_approvals`).
+#
+# Neither serves the other's routes, so whichever port is tried first answers
+# 404 for half of them. That is fine and expected: _hermes_request treats a 404
+# as "wrong service, keep probing" (issue 64). It must NOT treat it as "this is
+# the working port" — doing so pinned every RPC to whichever service was probed
+# first and made the whole Agent tab fail with 404s that looked like real
+# answers.
+#
+# In practice the dashboard often uses --port 0 (OS-assigned), so
+# _discover_dashboard_ports() finds its real port via psutil first and these are
+# only the fallback.
+#
+# Note 8642 cannot currently be relied on: enabling the api_server platform is
+# what silently breaks reply delivery (issue 62), so a working chat setup has it
+# off and the `/v1/*` routes are unreachable. That trade-off is issue 62's to
+# resolve, not something the port list can fix.
 _HERMES_API_PORTS = [9119, 9120, 8642]
 # Dedup window: retried RPC requests (same rpc.id) within this window are no-ops.
 _RPC_DEDUP_WINDOW_S = 30.0
@@ -103,12 +135,163 @@ class _RpcError(Exception):
     """Validation failure inside an RPC handler — str(exc) is the wire error code."""
 
 
+class _LocalRpcError(Exception):
+    """JSON-RPC error from the local /api/ws door. `code` is Hermes' numeric code."""
+
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code = int(code)
+        self.message = message
+
+
 def _require(params: Dict[str, Any], key: str, error: str) -> str:
     """Return params[key] as a stripped non-empty string, or raise _RpcError(error)."""
     value = str(params.get(key, "")).strip()
     if not value:
         raise _RpcError(error)
     return value
+
+
+# Recognisably truthy values for HERMES_BRIDGE_BOTS_ENABLED. Anything else
+# (including "", "0", "false", "no", "off", garbage) fails closed.
+# Read at local-ws connect time, not per call — a change takes effect on
+# the next connection. Plain os.getenv, not _get_scoped_secret: this is
+# correct specifically because multiplex_profiles is never enabled in this
+# design. A scoped lookup here would be the bug it looks like.
+_BOTS_ENABLED_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _bots_flag_enabled() -> bool:
+    raw = os.getenv("HERMES_BRIDGE_BOTS_ENABLED", "1")
+    return str(raw).strip().lower() in _BOTS_ENABLED_TRUTHY
+
+
+def _is_bot_managed_row(row: Dict[str, Any]) -> bool:
+    """Authorization/display predicate: bot-managed, non-default core-profile.
+
+    There is no is_bot field. The marker is ui_meta['hermes-bots'], written
+    by the desktop at bot creation. The default core-profile is excluded —
+    normal chat already talks to it.
+    """
+    if row.get("is_default"):
+        return False
+    ui_meta = row.get("ui_meta")
+    return isinstance(ui_meta, dict) and "hermes-bots" in ui_meta
+
+
+def _project_bot_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Phone-facing roster row. Shape/color ride along from ui_meta; photos do not."""
+    ui_meta = row.get("ui_meta") if isinstance(row.get("ui_meta"), dict) else {}
+    bots_meta = ui_meta.get("hermes-bots") if isinstance(ui_meta, dict) else None
+    if not isinstance(bots_meta, dict):
+        bots_meta = {}
+    canon = row.get("canonical_session")
+    if not isinstance(canon, dict):
+        canon = None
+    display = row.get("display_name") or bots_meta.get("title") or row.get("name") or ""
+    description = row.get("description") or bots_meta.get("description") or None
+    return {
+        "name": row.get("name") or "",
+        "display_name": display,
+        "model": row.get("model") or None,
+        "description": description or None,
+        "has_avatar": bool(row.get("has_avatar")),
+        "canonical_session": (
+            {
+                "preview": canon.get("preview") or None,
+                "last_active": canon.get("last_active"),
+            }
+            if canon
+            else None
+        ),
+        "shape": bots_meta.get("shape") or None,
+        "color": bots_meta.get("color") or None,
+    }
+
+
+# Canonical forever-chat identity. Title is exact; do not fuzzy-match.
+_BOT_CHAT_TITLE = "Bot Chat"
+_BOT_KICKOFF = "Hey, tell me about yourself!"
+_BOT_HISTORY_LIMIT = 50
+_BOT_POLL_FAST_S = 1.0
+_BOT_POLL_IDLE_S = 5.0
+_BOT_IDLE_TIMEOUT_S = 300.0
+# session.resume / prompt.submit: "session_id required" / "session not found".
+_STALE_SESSION_CODES = frozenset({4006, 4007})
+
+
+def _is_stale_session(exc: BaseException) -> bool:
+    return isinstance(exc, _LocalRpcError) and exc.code in _STALE_SESSION_CODES
+
+
+def _message_text(row: Dict[str, Any]) -> str:
+    display = row.get("display_content")
+    if isinstance(display, str) and display.strip():
+        return display.strip()
+    content = row.get("content")
+    if content is None:
+        content = row.get("text") or row.get("api_content") or ""
+    if isinstance(content, list):
+        parts: List[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str) and part.get("type") in (None, "text"):
+                    parts.append(text)
+        return "".join(parts).strip()
+    return str(content).strip()
+
+
+def _message_ts_ms(row: Dict[str, Any]) -> int:
+    raw = row.get("timestamp") or row.get("created_at") or 0
+    try:
+        n = float(raw)
+    except (TypeError, ValueError):
+        return 0
+    if n > 1e12:
+        return int(n)
+    return int(n * 1000)
+
+
+def _project_bot_messages(rows: Any, chat: str) -> List[Dict[str, Any]]:
+    """Project REST message rows down to what the phone renders.
+
+    The REST payload is much richer (tool_calls, reasoning_details, …).
+    Shipping that over the relay would be a large multiple of the text.
+    """
+    if not isinstance(rows, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        role = str(row.get("role") or "").strip()
+        if role not in ("user", "assistant"):
+            continue
+        if row.get("display_kind") == "hidden":
+            continue
+        text = _message_text(row)
+        row_id = row.get("id") if row.get("id") is not None else row.get("row_id")
+        if row_id is None or row_id == "":
+            continue
+        out.append(
+            {
+                "id": str(row_id),
+                "session_id": chat,
+                "role": role,
+                "content": text,
+                "sealed_frame": None,
+                "ts": _message_ts_ms(row),
+                "is_error": 1 if row.get("error") else 0,
+                "attachments": None,
+                "is_gap": 0,
+                "controls": None,
+                "ack_state": None,
+            }
+        )
+    return out
 
 
 # Hermes memory files — entries separated by "\n§\n"; ids are content hashes.
@@ -189,6 +372,45 @@ def _diff_new_pending(
     return new_records
 
 
+# Hermes `/v1/runs/{id}/events` writes `_sse_frame(event)` with no SSE
+# `event:` field — the type lives inside the JSON body as `{"event": "..."}`.
+# The adapter's SSE parser still accepts a named `event:` line if one appears.
+_RUN_TERMINAL_EVENTS = frozenset({"run.completed", "run.error", "run.stopped", "run.failed"})
+_APPROVAL_RESOLVED_EVENTS = frozenset({"approval.responded", "approval.resolved"})
+
+
+def _run_sse_event_type(parsed: Dict[str, Any]) -> str:
+    """Return the run-event type from one parsed SSE frame (`current` dict)."""
+    named = parsed.get("event")
+    if named:
+        return str(named)
+    event_data = parsed.get("data")
+    if isinstance(event_data, dict) and event_data.get("event"):
+        return str(event_data["event"])
+    return "unknown"
+
+
+def _approval_id_from_event(run_id: str, event_data: Dict[str, Any]) -> str:
+    """Stable id for a pending approval. Hermes' notify payload has
+    `request_id` (minted on `_ApprovalEntry`); `approval_id`/`id` if a
+    future core version adds them; otherwise the owning run_id."""
+    return str(
+        event_data.get("approval_id")
+        or event_data.get("id")
+        or event_data.get("request_id")
+        or run_id
+    ).strip() or run_id
+
+
+def _approval_timestamp_ms(event_data: Dict[str, Any]) -> int:
+    raw = event_data.get("timestamp", event_data.get("ts", time.time()))
+    try:
+        ts = float(raw)
+    except (TypeError, ValueError):
+        ts = time.time()
+    return int(ts * 1000) if ts < 1e12 else int(ts)
+
+
 def _pending_summary(rec: Dict[str, Any]) -> Dict[str, Any]:
     """Shape a tools.write_approval pending record for the mobile Approvals tab.
 
@@ -262,7 +484,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
     """
 
     def __init__(self, config):
-        super().__init__(config, PLATFORM)
+        super().__init__(config, Platform(PLATFORM_NAME))
         self._ws = None
         self._run_task: Optional[asyncio.Task] = None
         self._should_run = False
@@ -274,9 +496,20 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         self._seen_rpc_ids: Dict[str, float] = {}
         # run_id → asyncio.Task; cancelled on disconnect or runs.stop.
         self._active_run_tasks: Dict[str, asyncio.Task] = {}
+        # approval_id → {id, run_id, message, timestamp, command, choices}.
+        # Populated from approval.request SSE frames on runs this adapter
+        # started; evicted on resolve or run completion. Backs approvals.list
+        # — Hermes has no aggregate GET /v1/approvals.
+        self._pending_approvals: Dict[str, Dict[str, Any]] = {}
         # Hermes dashboard session token — extracted from the SPA HTML on first
         # API call. Per-process ephemeral; refreshed when a request 401s.
-        self._hermes_session_token: Optional[str] = None
+        # Keyed BY PORT: the dashboard mints _SESSION_TOKEN per process
+        # (secrets.token_urlsafe(32) in hermes_cli/web_server.py), so a token
+        # scraped from one dashboard is invalid on another. A single shared
+        # cache sent the wrong token whenever more than one candidate port
+        # served a dashboard -- and _discover_dashboard_ports() deliberately
+        # returns several (main + per-profile).
+        self._hermes_session_tokens: Dict[int, str] = {}
         # Cached working port — avoids re-probing all 3 ports on every RPC call.
         self._hermes_api_port: Optional[int] = None
         # Background poll for newly staged memory/skill writes (PRD_Features.md
@@ -294,8 +527,13 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         # can produce, cheaply, without a persisted seen-id set.
         self._inbound_cursor: int = _read_inbound_cursor(self._profile_id)
         self._inbound_seen_seq: int = 0
+        # Whether a backlog replay is still in progress on this connection —
+        # gates allow_stale, see _replay_window_open. Closed by the relay's
+        # `backlog_done` marker, or by _INBOUND_REPLAY_GRACE_S for a relay too
+        # old to send one.
+        self._backlog_open: bool = False
         # Wall-clock timestamp of the current connection (set in _connect_ws)
-        # — bounds how long allow_stale can be honored, see _receive_loop.
+        # — the fallback ceiling for the above.
         self._ws_connected_at: float = 0.0
         # Interactive controls (#42): prompt_id (our own, minted in
         # _mint_prompt) -> {"kind": "approval"|"slash_confirm"|"clarify", ...
@@ -307,6 +545,27 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         # (tools.approval._gateway_queues, tools.slash_confirm, etc. are
         # themselves in-memory too).
         self._pending_prompts: Dict[str, Dict[str, Any]] = {}
+        # msg_ids of streamed replies whose preview went out but whose
+        # terminal edit_message(finalize=True) has not landed yet. A streaming
+        # preview is deliberately not persisted, so if the stream dies before
+        # finalize nothing else ever will — see edit_message's flush.
+        self._stream_pending: set = set()
+        # Local JSON-RPC door to Hermes' /api/ws (PRD_Bots.md). Isolated from
+        # the relay socket and from REST-backed RPCs. Connect lazily on the
+        # first bots.* op so a laptop that never opens the Bots tab never
+        # opens this socket. _bots_enabled is the connect-time read of
+        # HERMES_BRIDGE_BOTS_ENABLED (None = not yet read).
+        self._local_ws = None
+        self._local_ws_lock: Optional[asyncio.Lock] = None
+        self._local_ws_next_id: int = 1
+        self._bots_enabled: Optional[bool] = None
+        # Opaque chat token → {name, stored_id, runtime_handle, run_id, …}.
+        # Phone never sees either Hermes session id.
+        self._bot_chats: Dict[str, Dict[str, Any]] = {}
+        self._bot_poll_tasks: Dict[str, asyncio.Task] = {}
+        self._bot_idle_timeout_s: float = _BOT_IDLE_TIMEOUT_S
+        self._bot_poll_fast_s: float = _BOT_POLL_FAST_S
+        self._bot_poll_idle_s: float = _BOT_POLL_IDLE_S
 
     # ------------------------------------------------------------------
     # Abstract methods required by BasePlatformAdapter
@@ -344,9 +603,9 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             # surfaces a dead peer quickly so the supervisor can reconnect.
             self._ws = await websockets.connect(url, ping_interval=20, ping_timeout=20)
             self._running = True
-            # Durable-queue replay grace window (#41) — see _receive_loop's
-            # allow_stale gating for why this is timed by the ADAPTER's own
-            # clock, not just "a `seq` field was present".
+            # Durable-queue replay (#41): a replay is expected from here until
+            # the relay's `backlog_done` marker — see _replay_window_open.
+            self._backlog_open = True
             self._ws_connected_at = time.time()
             redacted = url.split("?")[0]  # strip query — don't leak api_key
             logger.info("[hermes_bridge] connected to relay: %s", redacted)
@@ -379,6 +638,9 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             # so a seq the relay legitimately resends must not be rejected as
             # already-seen from the PREVIOUS connection's state.
             self._inbound_seen_seq = 0
+            # Any stream still awaiting its finalize died with the socket. The
+            # flush in edit_message already ran for whichever edit failed.
+            self._stream_pending.clear()
             if self._should_run:
                 logger.info("[hermes_bridge] reconnecting to relay…")
                 await asyncio.sleep(backoff * (0.8 + 0.4 * random.random()))
@@ -421,7 +683,70 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         if self._ws:
             await self._ws.close()
             self._ws = None
+        for task in list(getattr(self, "_bot_poll_tasks", {}).values()):
+            task.cancel()
+        if hasattr(self, "_bot_poll_tasks"):
+            self._bot_poll_tasks.clear()
+        if hasattr(self, "_bot_chats"):
+            self._bot_chats.clear()
+        await self._close_local_ws()
         logger.info("[hermes_bridge] disconnected")
+
+    async def _deliver(
+        self,
+        msg_id: str,
+        payload: Dict[str, Any],
+        *,
+        category: Optional[str] = None,
+        durable: bool = True,
+    ) -> SendResult:
+        """Seal one outbound payload, push it live if a socket is up, and
+        persist it to the relay's durable buffer.
+
+        The single path for send(), edit_message() and _send_prompt(), which
+        each carried their own copy of this ladder and disagreed about the
+        failure arms. Every disagreement was a loss hole: all three refused
+        outright when ``_ws`` was None, so a message minted while the
+        connection was down was dropped without ever being persisted. seal()
+        needs no socket, so the frame can always be built and always enqueued.
+
+        ``success`` means "the phone will get this", not "the live send
+        worked": a durably-enqueued message is recoverable through GET
+        /api/relay/pending. ``retryable`` follows the same rule — SendResult's
+        contract is that the base class retries on it, which would duplicate a
+        message that is already in the durable queue.
+        """
+        try:
+            frame = seal(self._profile_id, "out", payload, self._psk)
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
+
+        live_ok = False
+        live_error: Optional[str] = "not_connected"
+        if self._ws is not None:
+            try:
+                await self._ws.send(frame)
+                live_ok = True
+                live_error = None
+            except ConnectionClosed as exc:
+                # Supervisor will reconnect; the durable enqueue below is what
+                # keeps this particular message from being lost meanwhile.
+                live_error = str(exc)
+            except Exception as exc:
+                # Not a transport drop — persisting would not help.
+                return SendResult(success=False, error=str(exc))
+
+        durable_ok = False
+        if durable:
+            durable_ok = await self._enqueue_durable(msg_id, frame, category=category)
+
+        delivered = live_ok or durable_ok
+        return SendResult(
+            success=delivered,
+            message_id=msg_id,
+            error=None if delivered else (live_error or "enqueue_failed"),
+            retryable=not delivered,
+        )
 
     async def send(
         self,
@@ -431,8 +756,6 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> SendResult:
-        if not self._ws:
-            return SendResult(success=False, error="not_connected", retryable=True)
         # Stable id shared by the live frame and the durable-inbox row — lets the
         # phone dedup the same message arriving via both paths (see
         # /api/relay/enqueue+api.ts, lib/pending-sync.ts).
@@ -462,46 +785,39 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         # was requested, or a later edit_message() call would silently no-op
         # against a message the phone already rendered as final.
         expect_edits = edit_requested and self._supports("edit")
-        try:
-            payload: Dict[str, Any] = {"role": "assistant", "content": content, "msg_id": msg_id}
-            if is_unsolicited:
-                payload["unsolicited"] = True
-            if attachments:
-                payload["attachments"] = attachments
-            frame = seal(self._profile_id, "out", payload, self._psk)
-            await self._ws.send(frame)
-            # message_id=None — ONLY when editing was requested but this relay
-            # can't do it — is the signal GatewayStreamConsumer reads as
-            # "edit-incapable"; it then sends the complete answer as a fresh
-            # message instead of calling edit_message() later. A normal
-            # (non-streaming) send is unaffected: edit_requested is False, so
-            # message_id is always msg_id.
-            result = SendResult(
-                success=True,
-                message_id=msg_id if (not edit_requested or expect_edits) else None,
-            )
-        except ConnectionClosed as exc:
-            # Connection dropped — the supervisor loop will reconnect. Still
-            # attempt durable enqueue below so the message isn't lost.
-            result = SendResult(success=False, error=str(exc), retryable=True)
-        except Exception as exc:
-            return SendResult(success=False, error=str(exc))
 
-        if expect_edits:
-            return result
+        payload: Dict[str, Any] = {"role": "assistant", "content": content, "msg_id": msg_id}
+        if is_unsolicited:
+            payload["unsolicited"] = True
+        if attachments:
+            payload["attachments"] = attachments
 
-        # Durable enqueue + push, best-effort: the live frame (if it sent) already
-        # reached a connected phone; this just makes the message recoverable for
-        # an offline/closed one. Never called for `_send_run_event` streaming
-        # frames — this is what makes send() the semantic authority on "a real
-        # message worth persisting + notifying".
-        #
-        # Unsolicited sends carry no category (#50) — the phone files those in
-        # a per-profile inbox session, not the open chat.
-        await self._enqueue_durable(
-            msg_id, frame, category=None if is_unsolicited else "turn_complete"
+        # `durable` is the semantic authority on "a real message worth
+        # persisting + notifying" — `_send_run_event` streaming frames never
+        # come through here at all, and a streaming preview is not a complete
+        # message: it gets rewritten by edit_message() and is persisted by the
+        # terminal finalize instead. Unsolicited sends carry no category
+        # (#50) — the phone files those in a per-profile inbox session.
+        result = await self._deliver(
+            msg_id,
+            payload,
+            category=None if is_unsolicited else "turn_complete",
+            durable=not expect_edits,
         )
-        return result
+        if not result.success:
+            return result
+        if expect_edits:
+            self._stream_pending.add(msg_id)
+        # message_id=None — ONLY when editing was requested but this relay
+        # can't do it — is the signal GatewayStreamConsumer reads as
+        # "edit-incapable"; it then sends the complete answer as a fresh
+        # message instead of calling edit_message() later. A normal
+        # (non-streaming) send is unaffected: edit_requested is False, so
+        # message_id is always msg_id.
+        return SendResult(
+            success=True,
+            message_id=msg_id if (not edit_requested or expect_edits) else None,
+        )
 
     async def edit_message(
         self,
@@ -524,36 +840,54 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         into the existing streaming-preview bubble instead of inserting a new
         message; `final` commits it like a normal reply once the stream ends.
         """
-        if not self._ws:
-            return SendResult(success=False, error="not_connected", retryable=True)
         if not self._supports("edit"):
             # send() already refused to advertise edit-capability for this
             # relay (message_id=None), so GatewayStreamConsumer shouldn't be
             # calling this — but guard it directly rather than silently
             # sending a frame the relay/phone pairing may not expect.
             return SendResult(success=False, error="edit_unsupported")
-        try:
-            payload: Dict[str, Any] = {
-                "role": "assistant",
-                "content": content,
-                "msg_id": message_id,
-                "edit": True,
-            }
-            if finalize:
-                payload["final"] = True
-            frame = seal(self._profile_id, "out", payload, self._psk)
-            await self._ws.send(frame)
-        except ConnectionClosed as exc:
-            return SendResult(success=False, error=str(exc), retryable=True)
-        except Exception as exc:
-            return SendResult(success=False, error=str(exc))
 
+        payload: Dict[str, Any] = {
+            "role": "assistant",
+            "content": content,
+            "msg_id": message_id,
+            "edit": True,
+        }
         if finalize:
-            # Terminal edit — this is the real content worth persisting/
-            # recovering offline, same contract as send()'s non-streamed path.
-            await self._enqueue_durable(message_id, frame, category="turn_complete")
+            payload["final"] = True
 
-        return SendResult(success=True, message_id=message_id)
+        # Only the terminal edit is durable — an intermediate tick is a live
+        # preview that the next one replaces.
+        result = await self._deliver(
+            message_id, payload, category="turn_complete", durable=finalize
+        )
+        if finalize:
+            self._stream_pending.discard(message_id)
+            return result
+        if result.success:
+            return result
+
+        # The live edit failed, so GatewayStreamConsumer will not call finalize
+        # on this message again: its non-flood failure branch
+        # (gateway/stream_consumer.py, `Edit failed ... entering fallback
+        # mode`) sets _edit_supported=False and switches to a tail-only
+        # adapter.send(). Nothing else would ever persist what has streamed so
+        # far, so do it here, exactly once. Edits carry the full replacement
+        # text rather than a delta, so `content` IS the complete answer to this
+        # point — and it must be enqueued once, not per tick, because
+        # /api/relay/enqueue returns the existing row for a known msg_id
+        # without updating sealed_frame (a partial would stick permanently).
+        if message_id in self._stream_pending:
+            self._stream_pending.discard(message_id)
+            logger.warning(
+                "[hermes_bridge] stream %s died before finalize — persisting "
+                "the %d chars delivered so far",
+                message_id[:8],
+                len(content),
+            )
+            payload["final"] = True
+            await self._deliver(message_id, payload, category="turn_complete", durable=True)
+        return result
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {
@@ -739,8 +1073,6 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         an old client degrades to a readable text bubble instead of an
         unparseable blob, with no new handshake machinery needed.
         """
-        if not self._ws:
-            return SendResult(success=False, error="not_connected", retryable=True)
         msg_id = str(uuid.uuid4())
         payload: Dict[str, Any] = {
             "role": "prompt",
@@ -752,17 +1084,11 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             # Absolute epoch ms — see _PROMPT_TIMEOUT_S doc comment.
             "expires_at": int((time.time() + _PROMPT_TIMEOUT_S) * 1000),
         }
-        try:
-            frame = seal(self._profile_id, "out", payload, self._psk)
-            await self._ws.send(frame)
-        except ConnectionClosed as exc:
-            return SendResult(success=False, error=str(exc), retryable=True)
-        except Exception as exc:
-            return SendResult(success=False, error=str(exc))
-        # Durable enqueue (#41) — a prompt is a real message worth surviving
-        # an offline phone, same contract as send()'s non-streamed path.
-        await self._enqueue_durable(msg_id, frame)
-        return SendResult(success=True, message_id=msg_id)
+        # Durable (#41) — a prompt is a real message worth surviving an offline
+        # phone, same contract as send()'s non-streamed path. `expires_at` is
+        # absolute, so one that outlives its window while queued correctly
+        # renders as expired on arrival rather than looking fresh.
+        return await self._deliver(msg_id, payload)
 
     async def send_exec_approval(
         self,
@@ -938,180 +1264,271 @@ class HermesBridgeAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _receive_loop(self) -> None:
-        """Forward messages arriving from mobile to Hermes via handle_message()."""
+        """Read frames from the relay and hand chat work to the dispatch worker.
+
+        Reader only — it must never await agent work. ``handle_message`` can
+        run for minutes, and every ``rpc.request`` arrives on this same
+        socket, so an inline await here starves every RPC the phone makes
+        during a turn (RPC_REPLY_TIMEOUT_MS in app/api/relay/message+api.ts is
+        12s, well under a normal turn). Chat frames go on a queue consumed
+        serially by ``_dispatch_worker``, which is also the only writer of the
+        durable cursor.
+
+        Reconnect is still gated on the in-flight turn finishing (the worker is
+        awaited below before this returns to the supervisor). That is unchanged
+        from the single-loop version, where the ``async for`` was equally
+        blocked by ``handle_message`` — the split buys RPC liveness, not faster
+        reconnects.
+        """
+        queue: "asyncio.Queue" = asyncio.Queue()
+        worker = asyncio.ensure_future(self._dispatch_worker(queue))
         try:
             async for raw in self._ws:
                 try:
-                    text = raw if isinstance(raw, str) else raw.decode()
-                    # The relay forwards JSON.stringify({role, content}) where content
-                    # is the sealed base64 frame.  Fall back to treating the raw text
-                    # as the bare frame for forward-compat.
-                    try:
-                        parsed_msg = json.loads(text)
-                    except (json.JSONDecodeError, TypeError):
-                        parsed_msg = None
-                    if isinstance(parsed_msg, dict) and parsed_msg.get("type") == "hello":
-                        # Capability handshake (#40) — plaintext control frame,
-                        # never passed to open_frame/decrypt. One per connection;
-                        # see capability.py for the wire contract.
-                        try:
-                            self._descriptor = CapabilityDescriptor.from_json(text)
-                            logger.info(
-                                "[hermes_bridge] relay capability handshake: supported_ops=%s",
-                                self._descriptor.supported_ops or "(legacy)",
-                            )
-                        except Exception as exc:
-                            logger.warning("[hermes_bridge] malformed hello frame: %s", exc)
-                        continue
-                    # Durable-queue replay (#41): a `seq` present means this frame
-                    # came from the phone->gateway backlog (server/ws.ts replays
-                    # inbound_messages on reconnect) or the live subscribe path
-                    # right after it. Dedup on seq is safe to apply regardless
-                    # (it only ever narrows dispatch). Absent `seq` (rpc.request
-                    # frames, or a relay predating #41) always dispatches —
-                    # fail-open, same rule as #40's op discovery.
-                    seq = parsed_msg.get("seq") if isinstance(parsed_msg, dict) else None
-                    if seq is not None:
-                        if seq <= self._inbound_seen_seq:
-                            logger.info("[hermes_bridge] skipping already-seen inbound seq=%s", seq)
-                            continue
-                        # Gap detection (#41): inbound_messages has no cap or
-                        # floor-tracking (only age-based pruning, unlike the
-                        # gateway->phone table — see server/push.ts
-                        # pruneInboundMessages) — there is no chat UI here to
-                        # render a notice in, so a discontinuity in seq is
-                        # surfaced as a log warning only, per this issue's AC.
-                        # `self._inbound_cursor` (not `_inbound_seen_seq`,
-                        # which resets every reconnect) is the right
-                        # reference: the last seq this adapter durably
-                        # finished processing, across connections. Guard on
-                        # cursor > 0 — a fresh adapter (cursor still 0, never
-                        # dispatched anything) seeing its first message at
-                        # seq > 1 is not a gap, just a phone that sent
-                        # messages before this gateway ever connected (mirrors
-                        # lib/relay-gap.ts computeGap's `since > 0` guard).
-                        expected_next = self._inbound_cursor + 1
-                        if self._inbound_cursor > 0 and seq > expected_next:
-                            logger.warning(
-                                "[hermes_bridge] inbound seq gap: expected %s, got %s — "
-                                "%d message(s) may have been pruned before delivery",
-                                expected_next,
-                                seq,
-                                seq - expected_next,
-                            )
-                        self._inbound_seen_seq = seq
-                    # allow_stale bypasses the 60s freshness check — deliberately
-                    # NOT gated on `seq` alone, since that field is relay-supplied
-                    # and unauthenticated (see _INBOUND_REPLAY_GRACE_S doc
-                    # comment: trusting it unconditionally would let a malicious
-                    # relay replay old captured frames indefinitely). Bounded by
-                    # this adapter's own connect timestamp instead.
-                    within_replay_grace = (
-                        time.time() - self._ws_connected_at
-                    ) < _INBOUND_REPLAY_GRACE_S
-                    frame = parsed_msg.get("content", text) if isinstance(parsed_msg, dict) else text
-                    payload = open_frame(
-                        self._profile_id,
-                        "in",
-                        frame,
-                        self._psk,
-                        allow_stale=(seq is not None and within_replay_grace),
-                    )
-                    if payload is None:
-                        logger.warning("[hermes_bridge] dropped frame: decrypt/replay/timestamp check failed")
-                        continue
-                    if payload.get("role") == "rpc.request":
-                        rpc = payload.get("rpc") or {}
-                        logger.info("[hermes_bridge] rpc dispatch method=%s id=%s", rpc.get("method"), str(rpc.get("id", ""))[:8])
-                        asyncio.ensure_future(self._handle_rpc(payload))
-                        continue
-                    if payload.get("role") == "prompt_response":
-                        asyncio.ensure_future(self._consume_prompt_response(payload))
-                        # Advance the durable cursor here too (#42) — unlike
-                        # rpc.request (never durably queued, no seq), a
-                        # prompt_response DOES get a seq minted
-                        # (message+api.ts inserts every role != "rpc.request"
-                        # frame into inbound_messages). Without this, a
-                        # prompt_response landing as the LAST inbound message
-                        # would stall the cursor below it, and every future
-                        # reconnect would replay + re-attempt it — harmless
-                        # (_pop_prompt already made re-resolution a no-op)
-                        # but a wasted warning log on every reconnect.
-                        if seq is not None:
-                            self._inbound_cursor = seq
-                            _write_inbound_cursor(self._profile_id, seq)
-                        continue
-                    media_urls: List[str] = []
-                    media_types: List[str] = []
-                    attachments = payload.get("attachments") or []
-                    if attachments:
-                        media_urls, media_types = await self._download_attachments_to_media(
-                            attachments
-                        )
-                    # message_type: per-attachment media_types already drives
-                    # image/audio/video/document classification everywhere
-                    # else in Hermes core (_event_media_is_image/_is_audio/...
-                    # check the mime first, message_type only as a fallback)
-                    # — EXCEPT auto-TTS's voice_only mode, which keys directly
-                    # off message_type == MessageType.VOICE
-                    # (gateway/run.py _should_auto_voice_reply). Priority
-                    # mirrors signal.py's real inbound classification: audio >
-                    # image > video > else document.
-                    message_type = MessageType.TEXT
-                    if media_types:
-                        if any(mt.startswith("audio/") for mt in media_types):
-                            message_type = MessageType.VOICE
-                        elif any(mt.startswith("image/") for mt in media_types):
-                            message_type = MessageType.PHOTO
-                        elif any(mt.startswith("video/") for mt in media_types):
-                            message_type = MessageType.VIDEO
-                        else:
-                            message_type = MessageType.DOCUMENT
-                    event = MessageEvent(
-                        text=payload["content"],
-                        source=self.build_source(
-                            chat_id=self._profile_id,
-                            user_id="mobile",
-                        ),
-                        media_urls=media_urls,
-                        media_types=media_types,
-                        message_type=message_type,
-                        # Phone's own msg_id, carried INSIDE the sealed
-                        # payload (#45, lib/crypto.ts MessagePayload.msg_id)
-                        # — distinct from the top-level POST field of the
-                        # same name, which never reaches here (see
-                        # [profile_id].tsx's handleSend doc comment). Lets
-                        # on_processing_start/on_processing_complete address
-                        # a `react` ack frame back at this exact message.
-                        message_id=payload.get("msg_id"),
-                    )
-                    await self.handle_message(event)
-                    # Advance the durable cursor only after dispatch succeeds —
-                    # mirrors lib/pending-sync.ts's "advance the cursor only
-                    # after the batch is durably persisted". A crash between
-                    # dispatch and this write can re-dispatch at most one
-                    # message on restart (accepted, documented risk — same
-                    # at-least-once profile as every other durable path here).
-                    if seq is not None:
-                        self._inbound_cursor = seq
-                        _write_inbound_cursor(self._profile_id, seq)
+                    self._read_frame(raw, queue)
                 except Exception as exc:
-                    logger.warning("[hermes_bridge] message dispatch error: %s", exc)
-                    # (#41) If handle_message raised, _inbound_seen_seq was
-                    # already advanced above but the disk cursor was not (only
-                    # advanced after successful dispatch) — this seq is not
-                    # retried for the rest of THIS connection (the relay
-                    # won't resend it unless the gateway reconnects with an
-                    # older `since`), though a later reconnect will replay it
-                    # correctly since the disk cursor stayed behind. A narrow,
-                    # bounded gap on a genuinely failed dispatch, not a
-                    # systemic loss — same at-least-once profile as everywhere
-                    # else durable delivery is implemented here.
+                    logger.warning("[hermes_bridge] inbound frame read error: %s", exc)
         except ConnectionClosed:
             logger.info("[hermes_bridge] relay connection closed")
         except Exception as exc:
             logger.error("[hermes_bridge] receive loop error: %s", exc)
+        finally:
+            # The sentinel goes on the TAIL of a FIFO queue, so the worker
+            # drains everything already read before it stops. That is
+            # load-bearing, not incidental: _read_frame decrypts before
+            # queueing, so a queued frame's nonce is already in crypto.py's
+            # module-level _nonce_cache. Dropping the backlog here would leave
+            # the cursor behind it, the relay would replay those rows on
+            # reconnect, and open_frame would reject every one as a nonce
+            # replay — dedup is mandatory even under allow_stale — losing them
+            # permanently and silently. Before the reader/worker split the
+            # exposure was one frame; the reader running ahead makes it N.
+            #
+            # Only disconnect() cancels mid-drain, and that is safe: the
+            # process is going away, and a restart gets a fresh nonce cache, so
+            # the replay decrypts.
+            queue.put_nowait(None)
+            try:
+                await worker
+            finally:
+                if not worker.done():
+                    worker.cancel()
         # Return to the supervisor (_run_loop), which reconnects with backoff.
+
+    def _replay_window_open(self) -> bool:
+        """Whether a deliberately-stale (backlog) frame is currently expected.
+
+        Closed by the relay's explicit `backlog_done` marker, which server/ws.ts
+        sends once the backlog AND any live frames buffered behind it have been
+        flushed — that scopes allow_stale to a genuine replay rather than to a
+        guessed interval. The time check is only the fallback ceiling for a
+        relay too old to send the marker; see _INBOUND_REPLAY_GRACE_S.
+        """
+        if not self._backlog_open:
+            return False
+        if (time.time() - self._ws_connected_at) >= _INBOUND_REPLAY_GRACE_S:
+            self._backlog_open = False
+            return False
+        return True
+
+    def _read_frame(self, raw, queue: "asyncio.Queue") -> None:
+        """Classify one inbound wire frame.
+
+        Synchronous and non-blocking by design (see ``_receive_loop``):
+        control frames are handled here, ``rpc.request`` is detached, and
+        everything else is queued for serial dispatch.
+        """
+        text = raw if isinstance(raw, str) else raw.decode()
+        # The relay forwards JSON.stringify({role, content}) where content
+        # is the sealed base64 frame.  Fall back to treating the raw text
+        # as the bare frame for forward-compat.
+        try:
+            parsed_msg = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            parsed_msg = None
+        if not isinstance(parsed_msg, dict):
+            parsed_msg = None
+
+        if parsed_msg is not None and parsed_msg.get("type") == "hello":
+            # Capability handshake (#40) — plaintext control frame, never
+            # passed to open_frame/decrypt. One per connection; see
+            # capability.py for the wire contract.
+            try:
+                self._descriptor = CapabilityDescriptor.from_json(text)
+                logger.info(
+                    "[hermes_bridge] relay capability handshake: supported_ops=%s",
+                    self._descriptor.supported_ops or "(legacy)",
+                )
+            except Exception as exc:
+                logger.warning("[hermes_bridge] malformed hello frame: %s", exc)
+            return
+
+        if parsed_msg is not None and parsed_msg.get("type") == "backlog_done":
+            # End-of-backlog marker (#41) — plaintext control frame. Closes the
+            # allow_stale window immediately instead of leaving it open for the
+            # whole fallback interval. See _replay_window_open.
+            self._backlog_open = False
+            return
+
+        # Durable-queue replay (#41): a `seq` present means this frame came
+        # from the phone->gateway backlog (server/ws.ts replays
+        # inbound_messages on reconnect) or the live subscribe path right
+        # after it. Dedup on seq is safe to apply regardless (it only ever
+        # narrows dispatch). Absent `seq` (rpc.request frames, or a relay
+        # predating #41) always dispatches — fail-open, same rule as #40's
+        # op discovery.
+        seq = parsed_msg.get("seq") if parsed_msg is not None else None
+        if seq is not None:
+            if seq <= self._inbound_seen_seq:
+                logger.info("[hermes_bridge] skipping already-seen inbound seq=%s", seq)
+                return
+            # Gap detection (#41): inbound_messages has no cap or
+            # floor-tracking (only age-based pruning, unlike the
+            # gateway->phone table — see server/push.ts
+            # pruneInboundMessages) — there is no chat UI here to render a
+            # notice in, so a discontinuity in seq is surfaced as a log
+            # warning only, per this issue's AC.
+            #
+            # Reference is the previous seq READ on this connection, falling
+            # back to the durable cursor for the first one (`_inbound_seen_seq`
+            # resets every reconnect). It cannot be `_inbound_cursor` alone:
+            # the reader now runs ahead of the worker, so a perfectly
+            # contiguous 5,6,7 would compare 6 and 7 against a cursor still
+            # sitting at 4 and warn about a gap that does not exist.
+            #
+            # Guard on reference > 0 — a fresh adapter (nothing dispatched
+            # yet) seeing its first message at seq > 1 is not a gap, just a
+            # phone that sent messages before this gateway ever connected
+            # (mirrors lib/relay-queue.ts computeGap's `since > 0` guard).
+            reference = self._inbound_seen_seq or self._inbound_cursor
+            expected_next = reference + 1
+            if reference > 0 and seq > expected_next:
+                logger.warning(
+                    "[hermes_bridge] inbound seq gap: expected %s, got %s — "
+                    "%d message(s) may have been pruned before delivery",
+                    expected_next,
+                    seq,
+                    seq - expected_next,
+                )
+            self._inbound_seen_seq = seq
+
+        # allow_stale bypasses the 60s freshness check — deliberately NOT
+        # gated on `seq` alone, since that field is relay-supplied and
+        # unauthenticated (see _INBOUND_REPLAY_GRACE_S: trusting it
+        # unconditionally would let a malicious relay replay old captured
+        # frames indefinitely).
+        frame = parsed_msg.get("content", text) if parsed_msg is not None else text
+        payload = open_frame(
+            self._profile_id,
+            "in",
+            frame,
+            self._psk,
+            allow_stale=(seq is not None and self._replay_window_open()),
+        )
+        if payload is None:
+            logger.warning("[hermes_bridge] dropped frame: decrypt/replay/timestamp check failed")
+            return
+
+        if payload.get("role") == "rpc.request":
+            # Never durably queued (message+api.ts excludes it), so it carries
+            # no seq and takes no part in the cursor. Detached so a long turn
+            # already running in the worker can't delay the reply past the
+            # relay's 12s RPC timeout.
+            rpc = payload.get("rpc") or {}
+            logger.info(
+                "[hermes_bridge] rpc dispatch method=%s id=%s",
+                rpc.get("method"),
+                str(rpc.get("id", ""))[:8],
+            )
+            asyncio.ensure_future(self._handle_rpc(payload))
+            return
+
+        queue.put_nowait((seq, payload))
+
+    async def _dispatch_worker(self, queue: "asyncio.Queue") -> None:
+        """Serially dispatch queued inbound frames and own the durable cursor.
+
+        The cursor advances only in queue order and never past a failure: a
+        raising dispatch drops the connection so the supervisor's reconnect
+        replays from the last seq that actually succeeded. Advancing a plain
+        high-water mark here instead — as this code did before — skipped the
+        failed seq permanently the moment any later one succeeded, and the gap
+        check in ``_read_frame``, keyed off that same cursor, could not see it.
+        """
+        while True:
+            item = await queue.get()
+            if item is None:
+                return
+            seq, payload = item
+            try:
+                if payload.get("role") == "prompt_response":
+                    # Detached deliberately (#42): a turn blocked awaiting this
+                    # approval would deadlock behind its own answer if it were
+                    # resolved inline. Firing the task is instant, so the
+                    # cursor below still advances strictly in order.
+                    asyncio.ensure_future(self._consume_prompt_response(payload))
+                else:
+                    await self.handle_message(await self._build_event(payload))
+            except Exception as exc:
+                logger.error(
+                    "[hermes_bridge] dispatch failed at seq=%s: %s — dropping the "
+                    "connection to replay from cursor %s",
+                    seq,
+                    exc,
+                    self._inbound_cursor,
+                )
+                # _run_loop may already have cleared _ws while this task drained.
+                ws = self._ws
+                if ws is not None:
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+                return
+            if seq is not None:
+                self._inbound_cursor = seq
+                _write_inbound_cursor(self._profile_id, seq)
+
+    async def _build_event(self, payload: Dict[str, Any]) -> MessageEvent:
+        """Turn a decrypted inbound payload into a MessageEvent, fetching any
+        sealed attachments into the local media cache first."""
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        attachments = payload.get("attachments") or []
+        if attachments:
+            media_urls, media_types = await self._download_attachments_to_media(attachments)
+        # message_type: per-attachment media_types already drives
+        # image/audio/video/document classification everywhere else in Hermes
+        # core (_event_media_is_image/_is_audio/... check the mime first,
+        # message_type only as a fallback) — EXCEPT auto-TTS's voice_only
+        # mode, which keys directly off message_type == MessageType.VOICE
+        # (gateway/run.py _should_auto_voice_reply). Priority mirrors
+        # signal.py's real inbound classification: audio > image > video >
+        # else document.
+        message_type = MessageType.TEXT
+        if media_types:
+            if any(mt.startswith("audio/") for mt in media_types):
+                message_type = MessageType.VOICE
+            elif any(mt.startswith("image/") for mt in media_types):
+                message_type = MessageType.PHOTO
+            elif any(mt.startswith("video/") for mt in media_types):
+                message_type = MessageType.VIDEO
+            else:
+                message_type = MessageType.DOCUMENT
+        return MessageEvent(
+            text=payload["content"],
+            source=self.build_source(chat_id=self._profile_id, user_id="mobile"),
+            media_urls=media_urls,
+            media_types=media_types,
+            message_type=message_type,
+            # Phone's own msg_id, carried INSIDE the sealed payload (#45,
+            # lib/crypto.ts MessagePayload.msg_id) — distinct from the
+            # top-level POST field of the same name, which never reaches here
+            # (see [profile_id].tsx's handleSend doc comment). Lets
+            # on_processing_start/on_processing_complete address a `react` ack
+            # frame back at this exact message.
+            message_id=payload.get("msg_id"),
+        )
 
     async def _handle_rpc(self, payload: Dict[str, Any]) -> None:
         """Dispatch an rpc.request frame via _RPC_HANDLERS and respond over WS."""
@@ -1304,7 +1721,15 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         if not run_id or not approval_id:
             raise _RpcError("missing_run_id_or_approval_id")
         decision = str(p.get("decision", "approve")).strip()
-        return await self._hermes_post(f"/v1/runs/{run_id}/approval/{approval_id}/{decision}")
+        result = await self._hermes_post(f"/v1/runs/{run_id}/approval/{approval_id}/{decision}")
+        self._evict_approval(approval_id)
+        return result
+
+    async def _rpc_approvals_list(self, p: Dict[str, Any]) -> Any:
+        """Return the in-process approval cache. No HTTP — /v1/approvals
+        does not exist on Hermes; entries arrive via approval.request SSE
+        on runs this adapter started (see `_cache_approval_request`)."""
+        return list(self._approvals_cache().values())
 
     async def _rpc_memory_list(self, p: Dict[str, Any]) -> Any:
         """(#49) Merges MEMORY.md (general declarative memory) and USER.md
@@ -1442,6 +1867,483 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         await self.handle_message(event)
         return {"stopped": True}
 
+    def _get_local_ws_lock(self) -> asyncio.Lock:
+        lock = getattr(self, "_local_ws_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._local_ws_lock = lock
+        return lock
+
+    async def _close_local_ws(self) -> None:
+        ws = getattr(self, "_local_ws", None)
+        self._local_ws = None
+        if ws is None:
+            return
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+    async def _ensure_local_ws(self) -> None:
+        """Open the dashboard JSON-RPC door. Isolated from the relay socket.
+
+        Flag is read here (connect time), not per call. Failures raise
+        _RpcError so _handle_rpc forwards the exact wire kind:
+        bots_disabled / offline / bots_unavailable.
+        """
+        if getattr(self, "_local_ws", None) is not None:
+            return
+        # Connect-time read. Not _get_scoped_secret — multiplex_profiles is
+        # never enabled in this design.
+        self._bots_enabled = _bots_flag_enabled()
+        if not self._bots_enabled:
+            raise _RpcError("bots_disabled")
+
+        last_exc: Optional[Exception] = None
+        saw_dashboard = False
+        for port in self._ports_to_probe():
+            token = await self._ensure_hermes_token(port)
+            if not token:
+                continue
+            saw_dashboard = True
+            url = f"ws://localhost:{port}/api/ws?token={token}"
+            try:
+                self._local_ws = await asyncio.wait_for(
+                    websockets.connect(
+                        url,
+                        max_size=32 * 1024 * 1024,
+                        ping_interval=20,
+                        ping_timeout=20,
+                    ),
+                    timeout=10,
+                )
+                logger.info("[hermes_bridge] local ws door connected on :%d", port)
+                return
+            except Exception as exc:
+                last_exc = exc
+                logger.debug("[hermes_bridge] local ws connect :%d failed: %s", port, exc)
+                continue
+        if not saw_dashboard:
+            raise _RpcError("offline")
+        raise _RpcError("bots_unavailable") from last_exc
+
+    async def _local_rpc(self, method: str, params: Dict[str, Any]) -> Any:
+        """One JSON-RPC call on the local door. Correlates by id; skips events."""
+        async with self._get_local_ws_lock():
+            await self._ensure_local_ws()
+            rid = getattr(self, "_local_ws_next_id", 1)
+            self._local_ws_next_id = rid + 1
+            req = json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}) + "\n"
+            try:
+                await self._local_ws.send(req)
+                while True:
+                    raw = await asyncio.wait_for(self._local_ws.recv(), timeout=30)
+                    msg = json.loads(raw)
+                    if msg.get("id") != rid:
+                        continue
+                    if "error" in msg:
+                        err = msg.get("error")
+                        if isinstance(err, dict):
+                            raise _LocalRpcError(
+                                int(err.get("code") or 0),
+                                str(err.get("message") or "error"),
+                            )
+                        raise _RpcError("bots_unavailable")
+                    return msg.get("result")
+            except (_RpcError, _LocalRpcError):
+                raise
+            except Exception as exc:
+                await self._close_local_ws()
+                raise _RpcError("bots_unavailable") from exc
+
+    async def _rpc_bots_list(self, p: Dict[str, Any]) -> Any:
+        """Roster of bot-managed core-profiles on this laptop."""
+        try:
+            result = await self._local_rpc("profiles.list", {"include_sessions": True})
+        except _LocalRpcError as exc:
+            raise _RpcError("bots_unavailable") from exc
+        if not isinstance(result, dict) or not result.get("bot_mode_protocol"):
+            raise _RpcError("bots_unavailable")
+        rows = result.get("profiles") or []
+        if not isinstance(rows, list):
+            rows = []
+        return [_project_bot_row(r) for r in rows if isinstance(r, dict) and _is_bot_managed_row(r)]
+
+    async def _require_bot_profile(self, name: str) -> Dict[str, Any]:
+        """Re-validate the name. Authorization boundary, not a display filter.
+
+        Unknown name ⇒ bot_gone, never a fallback to the default core-profile.
+        Core's own adapter-set source.laptop path *does* fall back — a missing
+        laptop directory logs a warning and silently uses the default
+        (gateway/run.py). We deliberately do not copy that.
+        """
+        try:
+            result = await self._local_rpc("profiles.list", {"include_sessions": True})
+        except _LocalRpcError as exc:
+            raise _RpcError("bots_unavailable") from exc
+        if not isinstance(result, dict) or not result.get("bot_mode_protocol"):
+            raise _RpcError("bots_unavailable")
+        rows = result.get("profiles") or []
+        if not isinstance(rows, list):
+            rows = []
+        for row in rows:
+            if isinstance(row, dict) and row.get("name") == name:
+                if not _is_bot_managed_row(row):
+                    raise _RpcError("bot_gone")
+                return row
+        raise _RpcError("bot_gone")
+
+    async def _lookup_bot_chat(self, name: str) -> Optional[str]:
+        """Registry lookup by exact title. Returns the stored id, or None."""
+        try:
+            listed = await self._local_rpc(
+                "session.list",
+                {
+                    "profile": name,
+                    "title": _BOT_CHAT_TITLE,
+                    "include_hidden": True,
+                },
+            )
+        except _LocalRpcError as exc:
+            raise _RpcError("bots_unavailable") from exc
+        sessions = listed.get("sessions") if isinstance(listed, dict) else None
+        if not isinstance(sessions, list) or not sessions:
+            return None
+        first = sessions[0] if isinstance(sessions[0], dict) else {}
+        stored = first.get("id") or first.get("resolved_id")
+        return str(stored) if stored else None
+
+    async def _resume_bot_chat(self, name: str, stored_id: str) -> Dict[str, Any]:
+        """session.resume request uses the STORED id; response session_id is runtime."""
+        try:
+            snap = await self._local_rpc(
+                "session.resume",
+                {
+                    "session_id": stored_id,
+                    "profile": name,
+                    "omit_messages": True,
+                },
+            )
+        except _LocalRpcError as exc:
+            if _is_stale_session(exc):
+                raise _RpcError("chat_expired") from exc
+            raise _RpcError("bots_unavailable") from exc
+        if not isinstance(snap, dict):
+            raise _RpcError("bots_unavailable")
+        return snap
+
+    async def _fetch_bot_history(
+        self, stored_id: str, name: str, chat: str, offset: int, limit: int
+    ) -> Dict[str, Any]:
+        # Omitting profile returns 404, not the default laptop's rows.
+        # Do not "fix" this by defaulting the param.
+        qs = urlencode(
+            {
+                "profile": name,
+                "limit": str(limit),
+                "offset": str(offset),
+                "order": "latest",
+                "include_compacted": "true",
+            }
+        )
+        path = f"/api/sessions/{quote(stored_id, safe='')}/messages?{qs}"
+        try:
+            raw = await self._hermes_get(path)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise _RpcError("chat_expired") from exc
+            raise
+        rows = raw.get("messages") if isinstance(raw, dict) else []
+        pagination = raw.get("pagination") if isinstance(raw, dict) else {}
+        if not isinstance(pagination, dict):
+            pagination = {}
+        messages = _project_bot_messages(rows, chat)
+        returned = int(pagination.get("returned") or len(messages))
+        return {
+            "messages": messages,
+            "pagination": {
+                "limit": int(pagination.get("limit") or limit),
+                "offset": int(pagination.get("offset") or offset),
+                "returned": returned,
+                "has_more": returned >= limit,
+            },
+        }
+
+    def _mint_bot_token(self) -> str:
+        return secrets.token_urlsafe(18)
+
+    def _touch_bot_chat(self, chat: Dict[str, Any]) -> None:
+        chat["last_activity"] = time.monotonic()
+
+    def _start_bot_poll(self, token: str) -> None:
+        tasks = getattr(self, "_bot_poll_tasks", None)
+        if tasks is None:
+            self._bot_poll_tasks = {}
+            tasks = self._bot_poll_tasks
+        existing = tasks.get(token)
+        if existing is not None and not existing.done():
+            return
+        tasks[token] = asyncio.ensure_future(self._bot_poll_loop(token))
+
+    async def _stop_bot_poll(self, token: str) -> None:
+        task = getattr(self, "_bot_poll_tasks", {}).pop(token, None)
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    async def _expire_bot_chat(self, token: str) -> None:
+        getattr(self, "_bot_chats", {}).pop(token, None)
+        await self._stop_bot_poll(token)
+
+    async def _reresolve_bot_chat(self, chat: Dict[str, Any]) -> None:
+        """Silent re-resolve: registry lookup → resume. At most once per op."""
+        stored = await self._lookup_bot_chat(str(chat["name"]))
+        if not stored:
+            raise _RpcError("chat_expired")
+        chat["stored_id"] = stored
+        snap = await self._resume_bot_chat(str(chat["name"]), stored)
+        runtime = str(snap.get("session_id") or "").strip()
+        if not runtime:
+            raise _RpcError("chat_expired")
+        chat["runtime_handle"] = runtime
+
+    async def _prompt_bot_chat(self, chat: Dict[str, Any], text: str) -> None:
+        """prompt.submit uses the RUNTIME handle. One silent re-resolve on stale."""
+        try:
+            await self._local_rpc(
+                "prompt.submit",
+                {"session_id": chat["runtime_handle"], "text": text},
+            )
+            return
+        except _LocalRpcError as exc:
+            if not _is_stale_session(exc):
+                raise _RpcError("bots_unavailable") from exc
+        await self._reresolve_bot_chat(chat)
+        try:
+            await self._local_rpc(
+                "prompt.submit",
+                {"session_id": chat["runtime_handle"], "text": text},
+            )
+        except _LocalRpcError as exc:
+            raise _RpcError("chat_expired") from exc
+
+    def _adopt_inflight_run(self, chat: Dict[str, Any], snap: Dict[str, Any]) -> Optional[str]:
+        running = bool(snap.get("running"))
+        inflight = snap.get("inflight") if isinstance(snap.get("inflight"), dict) else {}
+        streaming = bool(inflight.get("streaming")) if inflight else False
+        if running or streaming:
+            if not chat.get("run_id"):
+                chat["run_id"] = str(uuid.uuid4())
+            chat["was_running"] = True
+            chat["last_text"] = str((inflight or {}).get("assistant") or "")
+            return str(chat["run_id"])
+        return chat.get("run_id") if chat.get("was_running") else None
+
+    async def _bot_poll_loop(self, token: str) -> None:
+        """Poll session.resume. Fast while in flight; slow when idle; stop after idle timeout."""
+        try:
+            while True:
+                chat = getattr(self, "_bot_chats", {}).get(token)
+                if chat is None:
+                    return
+                idle_s = getattr(self, "_bot_idle_timeout_s", _BOT_IDLE_TIMEOUT_S)
+                if time.monotonic() - float(chat.get("last_activity") or 0) > idle_s:
+                    await self._expire_bot_chat(token)
+                    return
+                try:
+                    snap = await self._resume_bot_chat(str(chat["name"]), str(chat["stored_id"]))
+                except _RpcError:
+                    await asyncio.sleep(getattr(self, "_bot_poll_idle_s", _BOT_POLL_IDLE_S))
+                    continue
+                runtime = str(snap.get("session_id") or "").strip()
+                if runtime:
+                    chat["runtime_handle"] = runtime
+                inflight = snap.get("inflight") if isinstance(snap.get("inflight"), dict) else {}
+                text = str((inflight or {}).get("assistant") or "")
+                running = bool(snap.get("running") or (inflight or {}).get("streaming"))
+                run_id = str(chat.get("run_id") or "")
+                if running:
+                    if not run_id:
+                        run_id = str(uuid.uuid4())
+                        chat["run_id"] = run_id
+                    if text != chat.get("last_text"):
+                        chat["last_text"] = text
+                        await self._send_run_event(run_id, "message.delta", {"text": text}, done=False)
+                    chat["was_running"] = True
+                    delay = getattr(self, "_bot_poll_fast_s", _BOT_POLL_FAST_S)
+                else:
+                    if run_id and chat.get("was_running"):
+                        await self._send_run_event(
+                            run_id, "message.complete", {"text": text}, done=True
+                        )
+                        chat["was_running"] = False
+                        chat["last_text"] = text
+                    delay = getattr(self, "_bot_poll_idle_s", _BOT_POLL_IDLE_S)
+                await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+
+    async def _rpc_bots_open(self, p: Dict[str, Any]) -> Any:
+        name = str(p.get("name") or "").strip()
+        if not name:
+            raise _RpcError("bot_gone")
+        row = await self._require_bot_profile(name)
+        logger.info("[hermes_bridge] bots.open name=%s", name)
+
+        stored_id = await self._lookup_bot_chat(name)
+        minted = False
+        snap: Dict[str, Any] = {}
+        runtime_handle = ""
+        if stored_id:
+            snap = await self._resume_bot_chat(name, stored_id)
+            runtime_handle = str(snap.get("session_id") or "").strip()
+        else:
+            # Adopt-before-mint already ran (lookup empty). Create-then-prompt
+            # is one uninterrupted sequence — a live-but-unprompted session
+            # is invisible to session.resume (§4.4).
+            try:
+                created = await self._local_rpc(
+                    "session.create",
+                    {
+                        "profile": name,
+                        "title": _BOT_CHAT_TITLE,
+                        "hidden": True,
+                    },
+                )
+            except _LocalRpcError as exc:
+                raise _RpcError("bots_unavailable") from exc
+            if not isinstance(created, dict):
+                raise _RpcError("bots_unavailable")
+            # create response: session_id = runtime, stored_session_id = stored.
+            runtime_handle = str(created.get("session_id") or "").strip()
+            stored_id = str(created.get("stored_session_id") or "").strip()
+            if not runtime_handle or not stored_id:
+                raise _RpcError("bots_unavailable")
+            minted = True
+            try:
+                await self._local_rpc(
+                    "prompt.submit",
+                    {"session_id": runtime_handle, "text": _BOT_KICKOFF},
+                )
+            except _LocalRpcError as exc:
+                raise _RpcError("bots_unavailable") from exc
+            snap = {
+                "session_id": runtime_handle,
+                "running": True,
+                "inflight": {"user": _BOT_KICKOFF, "assistant": "", "streaming": True},
+            }
+
+        if not runtime_handle or not stored_id:
+            raise _RpcError("bots_unavailable")
+
+        token = self._mint_bot_token()
+        chats = getattr(self, "_bot_chats", None)
+        if chats is None:
+            self._bot_chats = {}
+            chats = self._bot_chats
+        record: Dict[str, Any] = {
+            "name": name,
+            "stored_id": stored_id,
+            "runtime_handle": runtime_handle,
+            "run_id": None,
+            "last_activity": time.monotonic(),
+            "last_text": "",
+            "was_running": False,
+        }
+        run_id = self._adopt_inflight_run(record, snap)
+        chats[token] = record
+        self._start_bot_poll(token)
+
+        try:
+            history = await self._fetch_bot_history(
+                stored_id, name, token, 0, _BOT_HISTORY_LIMIT
+            )
+        except _RpcError:
+            if minted:
+                history = {
+                    "messages": _project_bot_messages(
+                        [
+                            {
+                                "id": "kickoff",
+                                "role": "user",
+                                "content": _BOT_KICKOFF,
+                                "timestamp": time.time(),
+                            }
+                        ],
+                        token,
+                    ),
+                    "pagination": {
+                        "limit": _BOT_HISTORY_LIMIT,
+                        "offset": 0,
+                        "returned": 1,
+                        "has_more": False,
+                    },
+                }
+            else:
+                raise
+
+        display = (row.get("display_name") or name) if isinstance(row, dict) else name
+        return {
+            "chat": token,
+            "name": name,
+            "display_name": display,
+            "messages": history["messages"],
+            "pagination": history["pagination"],
+            "run_id": run_id,
+            "running": bool(record.get("was_running")),
+        }
+
+    async def _rpc_bots_send(self, p: Dict[str, Any]) -> Any:
+        token = str(p.get("chat") or "").strip()
+        text = str(p.get("text") or "").strip()
+        if not token:
+            raise _RpcError("chat_expired")
+        if not text:
+            raise _RpcError("empty_text")
+        chat = getattr(self, "_bot_chats", {}).get(token)
+        if chat is None:
+            raise _RpcError("chat_expired")
+        logger.info("[hermes_bridge] bots.send name=%s", chat.get("name"))
+        self._touch_bot_chat(chat)
+        await self._prompt_bot_chat(chat, text)
+        run_id = str(uuid.uuid4())
+        chat["run_id"] = run_id
+        chat["was_running"] = True
+        chat["last_text"] = ""
+        self._start_bot_poll(token)
+        return {"run_id": run_id}
+
+    async def _rpc_bots_close(self, p: Dict[str, Any]) -> Any:
+        token = str(p.get("chat") or "").strip()
+        if token:
+            await self._expire_bot_chat(token)
+        return {"closed": True}
+
+    async def _rpc_bots_history(self, p: Dict[str, Any]) -> Any:
+        token = str(p.get("chat") or "").strip()
+        if not token:
+            raise _RpcError("chat_expired")
+        chat = getattr(self, "_bot_chats", {}).get(token)
+        if chat is None:
+            raise _RpcError("chat_expired")
+        self._touch_bot_chat(chat)
+        try:
+            offset = max(0, int(p.get("offset") or 0))
+        except (TypeError, ValueError):
+            offset = 0
+        try:
+            limit = int(p.get("limit") or _BOT_HISTORY_LIMIT)
+        except (TypeError, ValueError):
+            limit = _BOT_HISTORY_LIMIT
+        limit = max(1, min(limit, 500))
+        return await self._fetch_bot_history(
+            str(chat["stored_id"]), str(chat["name"]), token, offset, limit
+        )
+
     # method name → handler(self, params). Plain functions (dict values don't
     # bind), so _handle_rpc calls handler(self, params) explicitly.
     _RPC_HANDLERS: Dict[str, Any] = {
@@ -1473,7 +2375,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         "runs.start": _rpc_runs_start,
         "runs.stop": _rpc_runs_stop,
         "approval.resolve": _rpc_approval_resolve,
-        "approvals.list": lambda self, p: self._hermes_get("/v1/approvals"),
+        "approvals.list": _rpc_approvals_list,
         "memory.list": _rpc_memory_list,
         "memory.delete": _rpc_memory_delete,
         "memory.pending": _rpc_memory_pending,
@@ -1484,6 +2386,11 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         "skills.reject": _rpc_skills_pending_reject,
         "skills.diff": _rpc_skills_pending_diff,
         "chat.stop": _rpc_chat_stop,
+        "bots.list": _rpc_bots_list,
+        "bots.open": _rpc_bots_open,
+        "bots.send": _rpc_bots_send,
+        "bots.close": _rpc_bots_close,
+        "bots.history": _rpc_bots_history,
     }
 
     def _fetch_session_token(self, port: int) -> Optional[str]:
@@ -1520,16 +2427,17 @@ class HermesBridgeAdapter(BasePlatformAdapter):
              extraction fails on a Hermes version that changed the token format)
           3. Scrape from Hermes dashboard HTML
         """
-        if self._hermes_session_token:
-            return self._hermes_session_token
+        cached = self._hermes_session_tokens.get(port)
+        if cached:
+            return cached
         env_token = os.getenv("HERMES_SESSION_TOKEN")
         if env_token:
-            self._hermes_session_token = env_token
+            self._hermes_session_tokens[port] = env_token
             return env_token
         loop = asyncio.get_event_loop()
         token = await loop.run_in_executor(None, self._fetch_session_token, port)
         if token:
-            self._hermes_session_token = token
+            self._hermes_session_tokens[port] = token
         return token
 
     def _ports_to_probe(self) -> List[int]:
@@ -1589,17 +2497,29 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 self._hermes_api_port = port
                 return result
             except urllib.error.HTTPError as exc:
-                if exc.code != 401:
-                    # A live Hermes answered — this IS the working port; the
-                    # request itself was rejected (validation 4xx / server
-                    # 5xx). Do NOT keep probing: other ports would just refuse
-                    # the connection and bury this error (losing e.g. a cron
-                    # schedule-parse 400 detail), and re-sending a POST to
+                if exc.code not in (401, 404):
+                    # A live Hermes dashboard answered — this IS the working
+                    # port; the request itself was rejected (validation 4xx /
+                    # server 5xx). Do NOT keep probing: other ports would just
+                    # refuse the connection and bury this error (losing e.g. a
+                    # cron schedule-parse 400 detail), and re-sending a POST to
                     # them would replay a non-idempotent request.
                     self._hermes_api_port = port
                     raise
-                # 401: token stale — clear and retry once with a freshly extracted token.
-                self._hermes_session_token = None
+                if exc.code == 404:
+                    # 404 means SOMETHING is listening but it does not serve
+                    # this route -- i.e. the wrong service, not a bad request.
+                    # Treating it as proof of the working port is what pinned
+                    # this adapter to the api_server platform on 8642 and made
+                    # every Agent-tab RPC fail with a 404 that looked like a
+                    # real answer (issue 64). Keep probing instead.
+                    last_exc = exc
+                    if port == self._hermes_api_port:
+                        self._hermes_api_port = None
+                    continue
+                # 401: token stale — clear THIS port's token and retry once
+                # with a freshly extracted one.
+                self._hermes_session_tokens.pop(port, None)
                 fresh = await self._ensure_hermes_token(port)
                 if fresh and fresh != token:
                     try:
@@ -1893,12 +2813,15 @@ class HermesBridgeAdapter(BasePlatformAdapter):
 
     async def _enqueue_durable(
         self, msg_id: str, sealed_frame: str, category: Optional[str] = None
-    ) -> None:
+    ) -> bool:
         """POST to relay /api/relay/enqueue — persists the sealed frame so it
         survives the phone being offline/closed, and triggers a push.
-        Mirrors _send_lifecycle_event's urllib+executor pattern. Best-effort:
-        the live WS send already reached a connected phone, so a failure here
-        just means a closed phone won't catch up — log and move on.
+        Mirrors _send_lifecycle_event's urllib+executor pattern.
+
+        Returns whether the row landed. _deliver needs to tell the two cases
+        apart: when the live WS send also failed, this is the only thing
+        standing between the message and being lost, so it can no longer be
+        swallowed as unconditionally best-effort.
 
         `category` (#50) rides this push instead of a second
         /api/relay/events POST; only "turn_complete" is honored relay-side."""
@@ -1924,8 +2847,10 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     resp.read()
             await loop.run_in_executor(None, _post)
+            return True
         except Exception as exc:
             logger.warning("[hermes_bridge] durable enqueue failed: %s", exc)
+            return False
 
     async def _send_run_event(self, run_id: str, event_type: str, data: Any, done: bool) -> None:
         if not self._ws:
@@ -1941,6 +2866,77 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             await self._ws.send(frame)
         except ConnectionClosed as exc:
             logger.warning("[hermes_bridge] run event send failed: %s", exc)
+
+    def _approvals_cache(self) -> Dict[str, Dict[str, Any]]:
+        """Lazy so tests constructed via __new__ (skipping __init__) still work."""
+        cache = getattr(self, "_pending_approvals", None)
+        if cache is None:
+            self._pending_approvals = {}
+            cache = self._pending_approvals
+        return cache
+
+    def _evict_approval(self, approval_id: str) -> None:
+        self._approvals_cache().pop(approval_id, None)
+
+    def _evict_approvals_for_run(self, run_id: str) -> None:
+        cache = self._approvals_cache()
+        for aid in [k for k, rec in cache.items() if rec.get("run_id") == run_id]:
+            cache.pop(aid, None)
+
+    def _cache_approval_request(self, run_id: str, event_data: Dict[str, Any]) -> str:
+        """Insert a pending run-approval. Fires `approval.pending` exactly
+        once per approval_id — a repeated SSE frame (or a later poll) is a no-op."""
+        cache = self._approvals_cache()
+        approval_id = _approval_id_from_event(run_id, event_data)
+        if approval_id in cache:
+            return approval_id
+        message = (
+            event_data.get("message")
+            or event_data.get("description")
+            or event_data.get("command")
+            or "Approval required"
+        )
+        cache[approval_id] = {
+            "id": approval_id,
+            "run_id": run_id,
+            "message": str(message),
+            "timestamp": _approval_timestamp_ms(event_data),
+            "command": event_data.get("command"),
+            "choices": event_data.get("choices"),
+        }
+        asyncio.ensure_future(
+            self._send_lifecycle_event(
+                "approval.pending",
+                data={
+                    "screen": "agent",
+                    "tab": "approvals",
+                    "run_id": run_id,
+                    "approval_id": approval_id,
+                },
+            )
+        )
+        return approval_id
+
+    def _handle_run_sse_event(self, run_id: str, event_type: str, event_data: Any) -> None:
+        """Watch one relayed run-SSE event for approval cache insert/evict.
+
+        Called from `_stream_run_events` — the same subscription that
+        already streams the run to the phone, so we do not open a second
+        SSE connection per run.
+        """
+        payload = event_data if isinstance(event_data, dict) else {}
+        if event_type == "approval.request":
+            self._cache_approval_request(run_id, payload)
+        elif event_type in _APPROVAL_RESOLVED_EVENTS:
+            evict_id = str(
+                payload.get("approval_id") or payload.get("id") or payload.get("request_id") or ""
+            ).strip()
+            if evict_id:
+                self._evict_approval(evict_id)
+            else:
+                self._evict_approvals_for_run(run_id)
+        elif event_type in _RUN_TERMINAL_EVENTS:
+            self._evict_approvals_for_run(run_id)
 
     async def _stream_run_events(self, run_id: str) -> None:
         """Subscribe to Hermes SSE stream for run_id, relay events to mobile via :out."""
@@ -1988,8 +2984,6 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             self._active_run_tasks.pop(run_id, None)
             return
 
-        _TERMINAL_EVENTS = {"run.completed", "run.error", "run.stopped", "run.failed"}
-
         try:
             while True:
                 kind, data = await q.get()
@@ -2012,23 +3006,17 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                     )
                     break
                 elif kind == "event":
-                    event_type = data.get("event", "unknown")
                     event_data = data.get("data", {})
-                    is_terminal = event_type in _TERMINAL_EVENTS
-                    # approval.request — notify immediately so user can act.
-                    if event_type == "approval.request":
-                        asyncio.ensure_future(
-                            self._send_lifecycle_event(
-                                "approval.request",
-                                data={"screen": "agent", "tab": "approvals", "run_id": run_id},
-                            )
-                        )
+                    event_type = _run_sse_event_type(data)
+                    is_terminal = event_type in _RUN_TERMINAL_EVENTS
+                    self._handle_run_sse_event(run_id, event_type, event_data)
                     await self._send_run_event(run_id, event_type, event_data, done=is_terminal)
                     if is_terminal:
                         break
         except asyncio.CancelledError:
             await self._send_run_event(run_id, "run.stopped", {}, done=True)
         finally:
+            self._evict_approvals_for_run(run_id)
             self._active_run_tasks.pop(run_id, None)
 
     async def _send_rpc_response(
@@ -2075,12 +3063,12 @@ def _check_requirements() -> bool:
 
 def register(ctx) -> None:
     ctx.register_platform(
-        name="hermes_bridge",
+        name=PLATFORM_NAME,
         label="Hermes Bridge",
         adapter_factory=lambda config: HermesBridgeAdapter(config),
         check_fn=_check_requirements,
         required_env=["HERMES_BRIDGE_RELAY_URL", "HERMES_BRIDGE_PROFILE_ID"],
-        install_hint="pip install websockets pynacl",
+        install_hint="Not paired yet — run pair.py (see after-install.md)",
         emoji="📱",
         allowed_users_env="HERMES_BRIDGE_ALLOWED_USERS",
         allow_all_env="HERMES_BRIDGE_ALLOW_ALL",

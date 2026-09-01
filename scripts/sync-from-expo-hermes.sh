@@ -4,7 +4,7 @@
 #
 # expo-hermes/plugins/platforms/hermes_bridge/ is where active development
 # happens (adapter.py, crypto.py, tests). This repo is a public read-only
-# mirror people `curl | bash` install.sh from. Left un-synced, it silently
+# mirror people `hermes plugins install` from. Left un-synced, it silently
 # drifts (see: the "protocol mismatch" bug report that started this script —
 # public plugin was months behind, missing attachments/voice/streaming/cron).
 #
@@ -45,7 +45,14 @@ echo
 # `plugins.platforms.hermes_bridge...` (e.g. a relative import turned
 # absolute), pure-copy would silently ship a broken file — so check, don't
 # assume.
-PURE_COPY_FILES=(adapter.py crypto.py capability.py __init__.py plugin.yaml requirements.txt)
+# Globbed, never hand-listed: adapter.py imports sibling modules, and a list
+# goes stale silently — a new module (capability.py did exactly this) is simply
+# never published and the plugin dies on import at the user's gateway.
+PURE_COPY_FILES=(plugin.yaml after-install.md)
+while IFS= read -r py; do
+  PURE_COPY_FILES+=("$(basename "$py")")
+done < <(find "$SRC_PLUGIN" -maxdepth 1 -name '*.py' \
+  ! -name 'test_*' ! -name 'spike_*' ! -name 'testutil.py' | sort)
 
 for f in "${PURE_COPY_FILES[@]}"; do
   if grep -q "plugins\.platforms\.hermes_bridge" "$SRC_PLUGIN/$f" 2>/dev/null; then
@@ -57,11 +64,10 @@ for f in "${PURE_COPY_FILES[@]}"; do
 done
 
 echo "Copying pure-copy files..."
-cp "$SRC_PLUGIN/adapter.py" "$DST_REPO/hermes_bridge/adapter.py"
-cp "$SRC_PLUGIN/crypto.py" "$DST_REPO/hermes_bridge/crypto.py"
-cp "$SRC_PLUGIN/capability.py" "$DST_REPO/hermes_bridge/capability.py"
-cp "$SRC_PLUGIN/__init__.py" "$DST_REPO/hermes_bridge/__init__.py"
-cp "$SRC_PLUGIN/plugin.yaml" "$DST_REPO/hermes_bridge/plugin.yaml"
+for f in "${PURE_COPY_FILES[@]}"; do
+  cp "$SRC_PLUGIN/$f" "$DST_REPO/hermes_bridge/$f"
+  echo "  $f"
+done
 cp "$SRC_PLUGIN/requirements.txt" "$DST_REPO/requirements.txt"
 
 # ---------------------------------------------------------------------------
@@ -72,7 +78,7 @@ cp "$SRC_PLUGIN/requirements.txt" "$DST_REPO/requirements.txt"
 # adapter/crypto rule, or `plugins.platforms.hermes_bridge.testutil` collapses
 # to `hermes_bridge.testutil` (wrong — testutil.py is public-owned, bucket 3,
 # a bare sibling-module import, not a hermes_bridge submodule).
-TRANSFORM_FILES=(test_rpc.py test_streaming.py test_attachments.py)
+TRANSFORM_FILES=(test_rpc.py test_streaming.py test_attachments.py test_pair.py)
 
 transform() {
   local src="$1" dst="$2"
@@ -125,6 +131,20 @@ if (
 PYEOF
 }
 
+# Drift guard for the public-owned fixture: tests/testutil.py builds the
+# adapter with __new__ and hand-sets its state, so a field added to the
+# monorepo's make_adapter and missed here fails as an AttributeError inside
+# whichever handler touches it first — long after the sync looked clean.
+missing_fields="$(comm -23 \
+  <(grep -oE '^\s+adapter\._[a-z_]+' "$SRC_PLUGIN/testutil.py" | tr -d ' ' | sort -u) \
+  <(grep -oE '^\s+adapter\._[a-z_]+' "$DST_REPO/tests/testutil.py" | tr -d ' ' | sort -u))"
+if [[ -n "$missing_fields" ]]; then
+  echo "ERROR: tests/testutil.py's make_adapter is missing fields the monorepo sets:"
+  echo "$missing_fields" | sed 's/^/  /'
+  echo "  Add them to make_adapter in $DST_REPO/tests/testutil.py, then re-run."
+  exit 1
+fi
+
 echo "Copying + transforming test files..."
 for f in "${TRANSFORM_FILES[@]}"; do
   transform "$SRC_PLUGIN/$f" "$DST_REPO/tests/$f"
@@ -133,9 +153,9 @@ for f in "${TRANSFORM_FILES[@]}"; do
 done
 
 echo
-echo "NOTE: testutil.py, conftest.py, test_crypto.py, README.md, install.sh are"
-echo "public-owned (bucket 3) — never synced. See script header / their own"
-echo "docstrings for why they diverge from the monorepo on purpose."
+echo "NOTE: testutil.py, conftest.py, test_crypto.py, README.md are public-owned"
+echo "(bucket 3) — never synced. See script header / their own docstrings for why"
+echo "they diverge from the monorepo on purpose."
 echo
 echo "NOTE: this script does NOT scrub monorepo-internal doc references (issue"
 echo "numbers, PRD section anchors, gateway/run.py paths) from copied comments."
@@ -152,8 +172,48 @@ VENV="$DST_REPO/.sync-venv"
 python3 -m venv "$VENV" >/dev/null
 "$VENV/bin/pip" install -q -r requirements.txt pytest
 "$VENV/bin/python" tests/test_crypto.py
-"$VENV/bin/python" -m pytest tests/test_rpc.py tests/test_streaming.py tests/test_attachments.py -q
+"$VENV/bin/python" -m pytest tests/test_rpc.py tests/test_streaming.py tests/test_attachments.py tests/test_pair.py -q
 rm -rf "$VENV"
+
+# ---------------------------------------------------------------------------
+# Install gate: `hermes plugins install` security-scans the tree it is about to
+# install and refuses a caution verdict without --force (a dangerous verdict
+# cannot be forced at all). It scans ONLY hermes_bridge/ (we publish with
+# `subdir: hermes_bridge`), which is why README/install prose and test fixtures
+# must stay out of that directory. Plugin doctor runs the real manifest +
+# registration contracts. Skipped when Hermes isn't installed here.
+# ---------------------------------------------------------------------------
+HERMES_AGENT="${HERMES_HOME:-$HOME/.hermes}/hermes-agent"
+if [[ -x "$HERMES_AGENT/venv/bin/python" ]]; then
+  echo
+  echo "Running the Hermes install scan + plugin doctor on hermes_bridge/..."
+  (cd "$HERMES_AGENT" && ./venv/bin/python - "$DST_REPO/hermes_bridge" <<'PYEOF'
+import sys
+from pathlib import Path
+
+from hermes_cli.plugin_dev import doctor_plugin
+from tools.plugin_guard import format_scan_report, scan_plugin, should_allow_plugin_install
+
+target = Path(sys.argv[1])
+
+scan = scan_plugin(target, source="community")
+allowed, reason = should_allow_plugin_install(scan)
+print(format_scan_report(scan))
+print(f"  install decision: {reason}")
+
+report = doctor_plugin(target)
+print(report.format_text())
+
+if allowed is not True or not report.ok:
+    print("\nFAILED: this tree would not install cleanly. Fix before publishing.")
+    sys.exit(1)
+PYEOF
+  )
+else
+  echo
+  echo "WARNING: no Hermes install at $HERMES_AGENT — skipped the install scan and"
+  echo "plugin doctor. Run them before publishing."
+fi
 
 echo
 echo "Sync complete and verified. Review the diff, then commit:"

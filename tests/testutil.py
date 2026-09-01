@@ -13,10 +13,10 @@ only patches individual names).
 """
 
 import dataclasses
-import enum
+import enum as _enum
 import os
 import sys
-import time
+import time as _time
 import types as _types
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -67,20 +67,42 @@ if "gateway.platforms.base" not in sys.modules:
         async def handle_message(self, *a, **kw):
             return None
 
-    @dataclasses.dataclass
     class _RealMessageEvent:
-        """Real dataclass stand-in for gateway.platforms.base.MessageEvent —
+        """Real class stand-in for gateway.platforms.base.MessageEvent —
         same rationale as RealSendResult above: a MagicMock would return a
         fresh auto-mock from `.text`/`.message_type` etc. regardless of
         constructor kwargs, breaking test_attachments.py's _receive_loop
-        attribute assertions."""
+        attribute assertions.
 
-        text: str
-        source: Any = None
-        media_urls: Optional[list] = None
-        media_types: Optional[list] = None
-        message_type: Any = None
-        message_id: Optional[str] = None
+        Kwargs are absorbed rather than declared: core's MessageEvent grows
+        fields (message_id, ...), and a fixed dataclass signature turns each
+        addition into a TypeError swallowed by the adapter's dispatch
+        try/except, i.e. a test failure that names the wrong cause."""
+
+        _DEFAULTS = {
+            "text": "",
+            "source": None,
+            "media_urls": None,
+            "media_types": None,
+            "message_type": None,
+        }
+
+        def __init__(self, **kwargs):
+            self.__dict__.update(self._DEFAULTS)
+            self.__dict__.update(kwargs)
+
+        def __repr__(self):
+            fields = ", ".join(f"{k}={v!r}" for k, v in self.__dict__.items())
+            return f"MessageEvent({fields})"
+
+    class _ProcessingOutcome(_enum.Enum):
+        """Real enum, not a MagicMock: adapter.py compares outcomes by
+        identity (`outcome == ProcessingOutcome.SUCCESS`), and every attribute
+        of a MagicMock compares equal to nothing in particular."""
+
+        SUCCESS = "success"
+        FAILURE = "failure"
+        CANCELLED = "cancelled"
 
     _gw_base.BasePlatformAdapter = _StubBasePlatformAdapter
     _gw_base.SendResult = RealSendResult
@@ -96,7 +118,7 @@ if "gateway.platforms.base" not in sys.modules:
 
     _gw_base.MessageType = MagicMock()
     _gw_base.Platform = MagicMock()
-    _gw_base.ProcessingOutcome = _StubProcessingOutcome
+    _gw_base.ProcessingOutcome = _ProcessingOutcome
     sys.modules["gateway.platforms.base"] = _gw_base
 
 # `tools.write_approval`/`tools.memory_tool`/`tools.skill_manager_tool` are
@@ -175,16 +197,32 @@ def make_adapter(psk: bytes = PSK, profile_id: str = PROFILE):
         from hermes_bridge.adapter import HermesBridgeAdapter
 
         adapter = HermesBridgeAdapter.__new__(HermesBridgeAdapter)
+        # Every field below mirrors the monorepo's testutil.make_adapter. The
+        # adapter is built via __new__ (no __init__, no network, no env), so a
+        # field added there and missed here surfaces as a bare AttributeError
+        # deep inside a handler. scripts/sync-from-expo-hermes.sh fails the
+        # sync when the monorepo sets a field this file doesn't.
         adapter._ws = MagicMock()
         adapter._ws.send = AsyncMock()
         adapter._profile_id = profile_id
         adapter._psk = psk
         adapter._seen_rpc_ids = {}
-        # No hello on this fake connection — _supports() fails open to
-        # CapabilityDescriptor.LEGACY_OPS, same as a fresh real connection.
         adapter._descriptor = None
         adapter._inbound_cursor = 0
         adapter._inbound_seen_seq = 0
-        adapter._ws_connected_at = time.time()
+        adapter._backlog_open = True
+        adapter._ws_connected_at = _time.time()
         adapter._pending_prompts = {}
+        adapter._stream_pending = set()
+        adapter._hermes_session_tokens = {}
+        adapter._hermes_api_port = None
+        adapter._local_ws = None
+        adapter._local_ws_lock = None
+        adapter._local_ws_next_id = 1
+        adapter._bots_enabled = None
+        adapter._bot_chats = {}
+        adapter._bot_poll_tasks = {}
+        adapter._bot_idle_timeout_s = 300.0
+        adapter._bot_poll_fast_s = 1.0
+        adapter._bot_poll_idle_s = 5.0
     return adapter

@@ -28,6 +28,15 @@ def _open(frame: str):
     return payload
 
 
+class _Closed(Exception):
+    """Stand-in for websockets.exceptions.ConnectionClosed.
+
+    testutil stubs the whole websockets package with a MagicMock, so the real
+    name is not an exception class and cannot legally appear in an `except`
+    clause. Patch adapter.ConnectionClosed with this to exercise a socket that
+    drops mid-send."""
+
+
 class TestSendExpectEdits(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.adapter = _make_adapter()
@@ -130,10 +139,157 @@ class TestEditMessage(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(contents, ["Hi", "Hi there", "Hi there!"])
 
     async def test_edit_without_connection_fails(self):
+        """An intermediate edit is live-only, so with no socket there is
+        nothing to fall back on — and nothing was streamed through this
+        adapter instance, so no flush either."""
         self.adapter._ws = None
         result = await self.adapter.edit_message("chat-1", "msg-1", "text")
         self.assertFalse(result.success)
         self.assertEqual(result.error, "not_connected")
+
+    async def test_finalize_without_connection_still_enqueues(self):
+        """The terminal edit carries the real answer. Refusing outright on a
+        dead socket — as this did — lost it with no durable row and no push."""
+        self.adapter._ws = None
+        with patch.object(self.adapter, "_enqueue_durable", AsyncMock(return_value=True)) as enq:
+            result = await self.adapter.edit_message(
+                "chat-1", "msg-1", "the whole answer", finalize=True
+            )
+
+        self.assertTrue(result.success, "durably queued means the phone will get it")
+        self.assertFalse(result.retryable, "already queued — a retry would duplicate it")
+        enq.assert_called_once()
+        self.assertEqual(_open(enq.call_args[0][1])["content"], "the whole answer")
+
+
+class TestDeliveryWithoutALiveSocket(unittest.IsolatedAsyncioTestCase):
+    """seal() needs no socket, so a frame can always be built and always be
+    persisted. send()/edit_message()/_send_prompt() each used to refuse
+    outright when _ws was None, dropping the message without ever queueing
+    it."""
+
+    def setUp(self):
+        self.adapter = _make_adapter()
+
+    async def test_send_without_connection_still_enqueues(self):
+        self.adapter._ws = None
+        with patch.object(self.adapter, "_enqueue_durable", AsyncMock(return_value=True)) as enq:
+            result = await self.adapter.send("chat-1", "hello")
+
+        self.assertTrue(result.success)
+        self.assertFalse(result.retryable)
+        enq.assert_called_once()
+        self.assertEqual(_open(enq.call_args[0][1])["content"], "hello")
+
+    async def test_send_dropping_mid_flight_still_enqueues(self):
+        """The socket was up at the top of send() and died during the write —
+        the ConnectionClosed arm, not the no-socket arm."""
+        self.adapter._ws.send = AsyncMock(side_effect=_Closed("gone"))
+        with (
+            patch("hermes_bridge.adapter.ConnectionClosed", _Closed),
+            patch.object(self.adapter, "_enqueue_durable", AsyncMock(return_value=True)) as enq,
+        ):
+            result = await self.adapter.send("chat-1", "hello")
+
+        self.assertTrue(result.success)
+        enq.assert_called_once()
+
+    async def test_prompt_without_connection_still_enqueues(self):
+        self.adapter._ws = None
+        with patch.object(self.adapter, "_enqueue_durable", AsyncMock(return_value=True)) as enq:
+            result = await self.adapter._send_prompt(
+                "chat-1", "approval", "Approve?", [{"id": "yes", "label": "Yes"}], "p1"
+            )
+
+        self.assertTrue(result.success)
+        enq.assert_called_once()
+        payload = _open(enq.call_args[0][1])
+        self.assertEqual(payload["role"], "prompt")
+        self.assertEqual(payload["prompt_id"], "p1")
+
+    async def test_enqueue_failure_with_dead_socket_reports_failure(self):
+        """Neither path worked — this one really is undelivered, and the base
+        class SHOULD retry it."""
+        self.adapter._ws = None
+        with patch.object(self.adapter, "_enqueue_durable", AsyncMock(return_value=False)):
+            result = await self.adapter.send("chat-1", "hello")
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.retryable)
+        self.assertEqual(result.error, "not_connected")
+
+    async def test_live_send_ok_but_enqueue_failed_is_not_retryable(self):
+        """A connected phone already has it. Only offline catch-up is lost, and
+        a retry would show the message twice to everyone who is online."""
+        with patch.object(self.adapter, "_enqueue_durable", AsyncMock(return_value=False)):
+            result = await self.adapter.send("chat-1", "hello")
+
+        self.assertTrue(result.success)
+        self.assertFalse(result.retryable)
+
+
+class TestStreamDiesBeforeFinalize(unittest.IsolatedAsyncioTestCase):
+    """After ONE failed non-final edit, GatewayStreamConsumer never calls
+    finalize on that message again: its non-flood failure branch
+    (gateway/stream_consumer.py, "Edit failed ... entering fallback mode")
+    sets _edit_supported=False and switches to a tail-only adapter.send().
+    Making finalize durable therefore does not, on its own, save a stream that
+    dies mid-flight — nothing would ever persist what already streamed."""
+
+    def setUp(self):
+        self.adapter = _make_adapter()
+        self.enqueued = []
+
+        async def fake_enqueue(msg_id, frame, category=None):
+            self.enqueued.append((msg_id, frame, category))
+            return True
+
+        self.fake_enqueue = fake_enqueue
+
+    async def _start_stream(self):
+        preview = await self.adapter.send("chat-1", "Hel", metadata={"expect_edits": True})
+        self.assertEqual(self.enqueued, [], "a preview must never be persisted")
+        return preview.message_id
+
+    async def test_failed_edit_persists_what_streamed_so_far(self):
+        with patch.object(self.adapter, "_enqueue_durable", self.fake_enqueue):
+            msg_id = await self._start_stream()
+            self.adapter._ws = None  # socket dies mid-stream
+            result = await self.adapter.edit_message("chat-1", msg_id, "Hello world so far")
+
+        self.assertFalse(result.success, "the live edit genuinely failed")
+        self.assertEqual(len(self.enqueued), 1)
+        self.assertEqual(self.enqueued[0][0], msg_id)
+        payload = _open(self.enqueued[0][1])
+        # Edits carry the full replacement text, not a delta, so the content of
+        # the edit that failed IS the complete answer to this point.
+        self.assertEqual(payload["content"], "Hello world so far")
+        self.assertTrue(payload["final"], "recovered frame must read as complete")
+
+    async def test_flush_happens_exactly_once(self):
+        """/api/relay/enqueue returns the existing row for a known msg_id
+        without updating sealed_frame, so a second flush is a silent no-op that
+        would pin whichever partial landed first."""
+        with patch.object(self.adapter, "_enqueue_durable", self.fake_enqueue):
+            msg_id = await self._start_stream()
+            self.adapter._ws = None
+            await self.adapter.edit_message("chat-1", msg_id, "first failure")
+            await self.adapter.edit_message("chat-1", msg_id, "second failure")
+
+        self.assertEqual(len(self.enqueued), 1)
+        self.assertEqual(_open(self.enqueued[0][1])["content"], "first failure")
+
+    async def test_successful_finalize_leaves_nothing_to_flush(self):
+        """The normal path: finalize lands, so a later stray failed edit for
+        the same msg_id must not enqueue a second, older row."""
+        with patch.object(self.adapter, "_enqueue_durable", self.fake_enqueue):
+            msg_id = await self._start_stream()
+            await self.adapter.edit_message("chat-1", msg_id, "all done", finalize=True)
+            self.adapter._ws = None
+            await self.adapter.edit_message("chat-1", msg_id, "stray late tick")
+
+        self.assertEqual(len(self.enqueued), 1)
+        self.assertEqual(_open(self.enqueued[0][1])["content"], "all done")
 
 
 if __name__ == "__main__":
