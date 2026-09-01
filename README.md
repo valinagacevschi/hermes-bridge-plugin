@@ -64,6 +64,14 @@ you). The trailing `/hermes_bridge` is the plugin package inside this repo — i
 without the subdir and Hermes clones the whole repo, README included, which its plugin
 security scanner flags.
 
+`pair.py` finishes with a readiness report — dependencies importable, sender allowlisted,
+plugin actually enabled — and prints the fix for anything that fails. To re-run those
+checks later without minting an invite:
+
+```bash
+python3 ~/.hermes/plugins/hermes_bridge/pair.py --check
+```
+
 Useful afterwards:
 
 ```bash

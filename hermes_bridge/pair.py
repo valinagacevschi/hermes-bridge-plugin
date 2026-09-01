@@ -27,6 +27,7 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Optional
 
 DEFAULT_RELAY = "https://herelay.appcenter.ro"
 ENV_KEYS = (
@@ -156,6 +157,94 @@ def authorize_adapter_user(env_file: Path, env: dict) -> None:
     print(f"Authorized the bridge's sender in {env_file} (HERMES_BRIDGE_ALLOWED_USERS)")
 
 
+def readiness_report(hermes_home: Path, env: dict) -> list:
+    """Check the things that only fail at first use, and say how to fix them.
+
+    Every one of these was found by a user chatting to a freshly paired phone
+    and getting silence, an unscannable payload, or a pairing code — none are
+    visible to the plugin's tests, to `hermes plugins doctor`, or to the
+    install-time security scan. Checking them here costs milliseconds and moves
+    the discovery from "my agent is broken" to a line of terminal output.
+    """
+    checks: list[tuple[bool, str, str]] = []
+
+    try:
+        import nacl  # noqa: F401,PLC0415
+
+        checks.append((True, "PyNaCl — messages can be encrypted", ""))
+    except ImportError:
+        checks.append((
+            False,
+            "PyNaCl missing — the adapter will not load",
+            '~/.hermes/hermes-agent/venv/bin/pip install "PyNaCl>=1.6,<1.7"',
+        ))
+
+    try:
+        import qrcode  # noqa: F401,PLC0415
+
+        checks.append((True, "qrcode — pairing QR renders", ""))
+    except ImportError:
+        checks.append((
+            False,
+            "qrcode missing — pairing falls back to an unscannable payload",
+            '~/.hermes/hermes-agent/venv/bin/pip install "qrcode>=7.4,<8"',
+        ))
+
+    allowed = [u.strip() for u in env.get("HERMES_BRIDGE_ALLOWED_USERS", "").split(",")]
+    if ADAPTER_USER_ID in allowed:
+        checks.append((True, "sender allowlisted — Hermes will accept the phone", ""))
+    else:
+        checks.append((
+            False,
+            "sender not allowlisted — Hermes answers the first message with a pairing code",
+            f"echo HERMES_BRIDGE_ALLOWED_USERS={ADAPTER_USER_ID} >> {hermes_home}/.env",
+        ))
+
+    enabled = _plugin_enabled(hermes_home)
+    if enabled is None:
+        checks.append((True, "plugin enablement — not checked (no readable config.yaml)", ""))
+    elif enabled:
+        checks.append((True, "plugin enabled in config.yaml", ""))
+    else:
+        checks.append((
+            False,
+            "plugin not enabled — Hermes skips it silently at startup",
+            "hermes plugins enable hermes_bridge",
+        ))
+
+    print()
+    print("Readiness:")
+    for ok, label, fix in checks:
+        print(f"  {'OK  ' if ok else 'FAIL'} {label}")
+        if fix:
+            print(f"       fix: {fix}")
+    return checks
+
+
+def _plugin_enabled(hermes_home: Path) -> Optional[bool]:
+    """Is this plugin in config.yaml's plugins.enabled? None = cannot tell.
+
+    A user plugin that is installed but not listed there is skipped without a
+    word at gateway startup — the single most confusing way this can be
+    broken.
+    """
+    config = hermes_home / "config.yaml"
+    if not config.exists():
+        return None
+    try:
+        import yaml  # noqa: PLC0415 — present in the Hermes venv we re-exec into
+    except ImportError:
+        return None
+    try:
+        data = yaml.safe_load(config.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return None
+    enabled = ((data.get("plugins") or {}).get("enabled")) or []
+    if not isinstance(enabled, list):
+        return None
+    return any(str(e).rsplit("/", 1)[-1] == "hermes_bridge" for e in enabled)
+
+
 def print_qr(payload: str) -> None:
     try:
         import qrcode  # noqa: PLC0415 — optional, absent on a bare Hermes install
@@ -178,6 +267,12 @@ def main() -> None:
     reexec_under_hermes_python(hermes_home)
     env_file = hermes_home / ".env"
     env = read_env(env_file)
+
+    # `pair.py --check` diagnoses an existing install without minting an
+    # invite: same checks, no side effects, safe to tell a user to run.
+    if "--check" in sys.argv[1:]:
+        ready = all(ok for ok, _, _ in readiness_report(hermes_home, env))
+        sys.exit(0 if ready else 1)
 
     relay_http = to_http(env.get("HERMES_BRIDGE_RELAY_URL") or DEFAULT_RELAY)
     if not env.get("HERMES_BRIDGE_RELAY_URL") and sys.stdin.isatty():
@@ -222,7 +317,13 @@ def main() -> None:
     print_qr(payload)
     print()
     print("The QR carries the invite AND the encryption key — keep it on screen only until scanned.")
-    print("Then start the gateway:  hermes gateway restart")
+
+    if all(ok for ok, _, _ in readiness_report(hermes_home, read_env(env_file))):
+        print()
+        print("All set. Apply it:  hermes gateway restart")
+    else:
+        print()
+        print("Fix the FAIL lines above, then:  hermes gateway restart")
 
 
 if __name__ == "__main__":

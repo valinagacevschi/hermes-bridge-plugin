@@ -111,6 +111,32 @@ class PairScriptTest(unittest.TestCase):
         env = pair.read_env(self.home / ".env")
         self.assertEqual(env["HERMES_BRIDGE_ALLOWED_USERS"], "mobile,someone")
 
+    def test_check_flag_reports_without_minting_an_invite(self):
+        """`--check` is the diagnose-an-existing-install path: no relay call."""
+        with patch.object(sys, "argv", ["pair.py", "--check"]):
+            with self.assertRaises(SystemExit) as caught:
+                self._run()
+
+        self.assertEqual(caught.exception.code, 1, "no allowlist yet — should fail")
+        self.assertEqual(REQUESTS, [], "--check must not touch the relay")
+
+    def test_readiness_fails_when_the_plugin_is_not_enabled(self):
+        (self.home / "config.yaml").write_text("plugins:\n  enabled:\n    - something_else\n")
+        self._run()  # pairs, and writes the allowlist
+
+        def enablement_check():
+            env = pair.read_env(self.home / ".env")
+            return next(
+                (ok for ok, label, _ in pair.readiness_report(self.home, env)
+                 if "enabl" in label),
+                None,
+            )
+
+        self.assertIs(enablement_check(), False)
+
+        (self.home / "config.yaml").write_text("plugins:\n  enabled:\n    - hermes_bridge\n")
+        self.assertIs(enablement_check(), True)
+
     def test_hands_itself_to_the_hermes_venv_interpreter(self):
         """qrcode lives in the Hermes venv, so a system python3 must not be the
         interpreter that reaches print_qr — see reexec_under_hermes_python."""
