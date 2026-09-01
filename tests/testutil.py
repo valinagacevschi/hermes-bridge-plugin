@@ -107,15 +107,6 @@ if "gateway.platforms.base" not in sys.modules:
     _gw_base.BasePlatformAdapter = _StubBasePlatformAdapter
     _gw_base.SendResult = RealSendResult
     _gw_base.MessageEvent = _RealMessageEvent
-    class _StubProcessingOutcome(enum.Enum):
-        """Real enum, not a MagicMock — on_processing_complete compares the
-        outcome by identity (`outcome == ProcessingOutcome.SUCCESS`), which a
-        MagicMock's auto-attributes would satisfy for every branch at once."""
-
-        SUCCESS = "success"
-        FAILURE = "failure"
-        CANCELLED = "cancelled"
-
     _gw_base.MessageType = MagicMock()
     _gw_base.Platform = MagicMock()
     _gw_base.ProcessingOutcome = _ProcessingOutcome
