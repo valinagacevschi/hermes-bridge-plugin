@@ -6,8 +6,8 @@ Run it once after installing the plugin:
     python3 ~/.hermes/plugins/hermes_bridge/pair.py
 
 First run provisions a self-serve profile + laptop API key, writes them to
-``~/.hermes/.env``, generates the end-to-end PSK at ``~/.hermes/psk``, and
-prints a QR holding ``{token, psk}``. Later runs reuse that profile and mint a
+``~/.hermes/.env``, authorizes the adapter's sender with Hermes, generates the
+end-to-end PSK at ``~/.hermes/psk``, and prints a QR holding ``{token, psk}``. Later runs reuse that profile and mint a
 fresh phone invite — run it again whenever an invite expires or a second phone
 needs pairing.
 
@@ -29,7 +29,15 @@ import urllib.request
 from pathlib import Path
 
 DEFAULT_RELAY = "https://herelay.appcenter.ro"
-ENV_KEYS = ("HERMES_BRIDGE_RELAY_URL", "HERMES_BRIDGE_PROFILE_ID", "HERMES_BRIDGE_API_KEY")
+ENV_KEYS = (
+    "HERMES_BRIDGE_RELAY_URL",
+    "HERMES_BRIDGE_PROFILE_ID",
+    "HERMES_BRIDGE_API_KEY",
+    "HERMES_BRIDGE_ALLOWED_USERS",
+)
+# Every inbound frame reports this one synthetic user id (adapter.py's two
+# build_source calls) — one phone or five, they are all "mobile".
+ADAPTER_USER_ID = "mobile"
 _REEXEC_FLAG = "HERMES_BRIDGE_PAIR_REEXEC"
 
 
@@ -119,6 +127,35 @@ def reexec_under_hermes_python(hermes_home: Path) -> None:
     os.execv(str(venv_python), [str(venv_python), os.path.abspath(__file__), *sys.argv[1:]])
 
 
+def authorize_adapter_user(env_file: Path, env: dict) -> None:
+    """Allowlist the adapter's user id for Hermes' authorization gate.
+
+    Hermes default-denies a sender when no allowlist is configured for the
+    platform (gateway/authz_mixin.py — fail-open is forbidden by its
+    SECURITY.md), and answers the first message with "I don't recognize you
+    yet" plus a pairing code for the owner to approve. That gate is redundant
+    here and its failure mode is baffling: reaching this adapter at all means
+    holding the laptop's api_key AND the PSK, and the phone that just scanned
+    the QR was authorized by the person running this script.
+
+    So write the allowlist entry that says so. Scoped to this platform's own
+    env var, never GATEWAY_ALLOWED_USERS, and left alone if the operator has
+    set their own value.
+    """
+    configured = env.get("HERMES_BRIDGE_ALLOWED_USERS", "")
+    if configured:
+        if ADAPTER_USER_ID not in [u.strip() for u in configured.split(",")]:
+            print(
+                f"warning: HERMES_BRIDGE_ALLOWED_USERS={configured} does not include "
+                f"'{ADAPTER_USER_ID}' — Hermes will not recognize the phone. Add it, "
+                "or approve the pairing code Hermes offers on the first message."
+            )
+        return
+    with env_file.open("a", encoding="utf-8") as handle:
+        handle.write(f"HERMES_BRIDGE_ALLOWED_USERS={ADAPTER_USER_ID}\n")
+    print(f"Authorized the bridge's sender in {env_file} (HERMES_BRIDGE_ALLOWED_USERS)")
+
+
 def print_qr(payload: str) -> None:
     try:
         import qrcode  # noqa: PLC0415 — optional, absent on a bare Hermes install
@@ -174,6 +211,7 @@ def main() -> None:
     if not token:
         die(f"no invite token in response: {response}")
 
+    authorize_adapter_user(env_file, env)
     psk_hex = load_or_create_psk(hermes_home / "psk")
     payload = json.dumps({"token": token, "psk": psk_hex}, separators=(",", ":"))
 

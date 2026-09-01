@@ -89,6 +89,28 @@ class PairScriptTest(unittest.TestCase):
         self.assertEqual(psk.stat().st_mode & 0o777, 0o600)
         self.assertIn("EXISTING=1", (self.home / ".env").read_text())
 
+    def test_authorizes_the_adapter_sender_with_hermes(self):
+        """Without this, Hermes default-denies the phone's first message and
+        answers with a pairing code instead of a reply."""
+        self._run()
+
+        env = pair.read_env(self.home / ".env")
+        self.assertEqual(env["HERMES_BRIDGE_ALLOWED_USERS"], "mobile")
+
+        # Re-running must not duplicate or clobber the entry.
+        self._run()
+        self.assertEqual(
+            (self.home / ".env").read_text().count("HERMES_BRIDGE_ALLOWED_USERS"), 1
+        )
+
+    def test_leaves_an_operator_set_allowlist_alone(self):
+        (self.home / ".env").write_text("HERMES_BRIDGE_ALLOWED_USERS=mobile,someone\n")
+
+        self._run()
+
+        env = pair.read_env(self.home / ".env")
+        self.assertEqual(env["HERMES_BRIDGE_ALLOWED_USERS"], "mobile,someone")
+
     def test_hands_itself_to_the_hermes_venv_interpreter(self):
         """qrcode lives in the Hermes venv, so a system python3 must not be the
         interpreter that reaches print_qr — see reexec_under_hermes_python."""

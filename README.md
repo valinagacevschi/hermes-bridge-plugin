@@ -111,6 +111,15 @@ Written by `pair.py` into `~/.hermes/.env`; listed in `hermes config` for inspec
 | `HERMES_BRIDGE_RELAY_URL` | `wss://herelay.appcenter.ro` (the hosted relay) |
 | `HERMES_BRIDGE_PROFILE_ID` | minted by `pair.py` |
 | `HERMES_BRIDGE_API_KEY` | minted by `pair.py` |
+| `HERMES_BRIDGE_ALLOWED_USERS` | `mobile` — written by `pair.py`, see below |
+
+Hermes authorizes senders per platform and **default-denies when no allowlist is
+configured**, answering the first message with "I don't recognize you yet" and a pairing
+code. Every frame this adapter delivers reports the same synthetic `user_id` (`mobile`),
+so `pair.py` allowlists exactly that. Equivalent manual routes if you prefer:
+`hermes pairing approve hermes_bridge <code>`, or `HERMES_BRIDGE_ALLOW_ALL=1`. Your phone's
+real authentication is the invite, the `hb_` api_key and the PSK — this gate just needs to
+be told.
 
 ## Pairing your phone
 
@@ -190,6 +199,10 @@ were delivered to the wrong adapter and silently dropped. It now registers as
   (it mints a fresh invite and reprints, so an expired one costs nothing). If you installed
   `qrcode` and still get the payload, your copy of `pair.py` predates the fix that re-execs
   it under the Hermes venv's interpreter — reinstall with `--force` (above).
+- **"Hi, I don't recognize you yet" + a pairing code, after a successful pairing** — the
+  platform allowlist is missing. Re-run `pair.py` (it writes it and is safe to re-run), or
+  run the `hermes pairing approve hermes_bridge <code>` that the message gives you. An
+  env-var change needs `hermes gateway restart`; the approve command takes effect at once.
 - **`Plugin 'hermes_bridge' already exists`** — that's the installer refusing to overwrite,
   so nothing was updated. Re-run it with `--force`.
 - **Start command** — `hermes gateway run` (foreground). If running as a service,
