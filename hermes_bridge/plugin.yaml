@@ -1,4 +1,10 @@
-manifest_version: 2
+# Deliberately NO `manifest_version: 2`. The plugin *loader*
+# (hermes_cli/plugins.py) supports schema 2, but the *installer*
+# (hermes_cli/plugins_cmd.py, _SUPPORTED_MANIFEST_VERSION = 1 as of 0.21.0)
+# hard-fails any manifest that declares it: "requires manifest_version 2, but
+# this installer only supports up to 1". Omitting the key defaults to 1, and
+# the v2 fields below (license/homepage/tags/python_dependencies) are parsed
+# regardless — only their unknown-field warnings drop to debug level.
 kind: platform
 name: hermes_bridge
 label: Hermes Bridge
