@@ -27,6 +27,15 @@ SRC_REPO="${1:-$HOME/dev/react/expo-hermes}"
 SRC_PLUGIN="$SRC_REPO/plugins/platforms/hermes_bridge"
 DST_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Fail on a missing tool now, not 90 seconds in after a clone and a venv
+# build. CI runs this in python:3.12-slim, which is thinner than a dev box.
+for tool in git find comm sort python3; do
+  command -v "$tool" >/dev/null || {
+    echo "ERROR: $tool is not installed — this script needs it."
+    exit 1
+  }
+done
+
 if [[ ! -d "$SRC_PLUGIN" ]]; then
   echo "ERROR: source plugin dir not found: $SRC_PLUGIN"
   echo "  Pass the expo-hermes checkout path as \$1 if it's not at ~/dev/react/expo-hermes."
