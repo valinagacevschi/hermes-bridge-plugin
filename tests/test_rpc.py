@@ -20,7 +20,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from testutil import make_adapter as _make_adapter
 from hermes_bridge.adapter import _diff_new_pending
-from hermes_bridge.local_api import API_SERVER_PORT
+from hermes_bridge.local_api import (
+    API_SERVER_PORT,
+    discover_dashboard_ports,
+)
+
+
+class _NeverRaised(Exception):
+    """Stand-in for psutil's exception classes in a MagicMock'd psutil — the
+    real ones must be catchable types, and nothing in these tests raises them."""
 
 
 def _rpc_payload(method, params=None, rpc_id="test-id-001"):
@@ -411,6 +419,61 @@ class TestLocalApiAutostart(unittest.IsolatedAsyncioTestCase):
         # Hermes' own watchdog reaps the child when this gateway dies — that is
         # what makes a service file unnecessary.
         assert kwargs["env"]["HERMES_PARENT_PID"] == str(os.getpid())
+
+    async def test_start_leaves_a_supervisor_that_stop_cancels(self):
+        """The supervisor IS the fix for a crashed backend: _ensure used to run
+        once from connect(), while relay reconnects go through _connect_ws, so
+        nothing ever replaced a dead API for the gateway's lifetime."""
+        adapter = _make_adapter()
+
+        with patch.object(adapter._api, "listening", return_value=9119):
+            await adapter._api.start()
+            supervisor = adapter._api._supervisor
+            assert supervisor is not None and not supervisor.done(), "no supervisor task"
+
+            # Idempotent: a second start must not stack another task.
+            await adapter._api.start()
+            assert adapter._api._supervisor is supervisor
+
+        await adapter._api.stop()
+        assert supervisor.cancelled(), "stop must cancel the supervisor"
+        assert adapter._api._supervisor is None
+
+    async def test_supervisor_respawns_a_backend_that_died(self):
+        adapter = _make_adapter()
+        dead = MagicMock()
+        dead.poll.return_value = 1  # exited
+        adapter._api._proc = dead
+
+        with patch.object(adapter._api, "listening", return_value=None), patch(
+            "hermes_bridge.local_api.subprocess.Popen"
+        ) as popen:
+            popen.return_value.pid = 4243
+            await adapter._api._ensure()
+
+        popen.assert_called_once()
+        assert adapter._api._proc is not dead, "the dead handle must be replaced"
+
+    async def test_discovery_matches_the_subcommand_not_a_path_substring(self):
+        """"serve" appears in plenty of filesystem paths; a false positive puts
+        a wrong port ahead of the defaults in the probe order."""
+        def proc(cmdline, port):
+            p = MagicMock()
+            p.info = {"pid": 1, "cmdline": cmdline}
+            conn = MagicMock()
+            conn.status = "LISTEN"
+            conn.laddr.port = port
+            p.net_connections.return_value = [conn]
+            return p
+
+        real = proc(["/opt/hermes/venv/bin/python", "-m", "hermes_cli.main", "serve"], 9131)
+        decoy = proc(["/Users/x/servers/hermes-tools/bin/python", "worker.py"], 7777)
+        psutil = MagicMock()
+        psutil.process_iter.return_value = [decoy, real]
+        psutil.NoSuchProcess = psutil.AccessDenied = _NeverRaised
+
+        with patch.dict("sys.modules", {"psutil": psutil}):
+            assert discover_dashboard_ports() == [9131]
 
     async def test_does_not_start_a_second_api_over_a_live_one(self):
         adapter = _make_adapter()

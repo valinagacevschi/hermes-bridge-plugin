@@ -83,15 +83,19 @@ def discover_dashboard_ports() -> List[int]:
         for proc in psutil.process_iter(["pid", "cmdline"]):
             try:
                 cmd: List[str] = proc.info.get("cmdline") or []
-                cmd_str = " ".join(cmd)
+                if not any("hermes" in arg for arg in cmd):
+                    continue
                 # `serve` counts as well as `dashboard`: it is the same backend
-                # with the SPA switched off, it serves the same /api/* routes,
+                # with the SPA switched off, serving the same /api/* routes,
                 # and it is what the Desktop app (and _ensure below) spawns.
-                if "hermes" not in cmd_str:
+                #
+                # Matched as a whole argv token, not a substring of the joined
+                # command line: "serve" is common in filesystem paths
+                # (/Users/x/servers/...) and a false positive puts a wrong port
+                # AHEAD of the defaults in the probe order.
+                if not any(arg in ("dashboard", "serve") for arg in cmd):
                     continue
-                if "dashboard" not in cmd_str and "serve" not in cmd_str:
-                    continue
-                is_profile = "--profile" in cmd_str
+                is_profile = "--profile" in cmd
                 # `Process.connections` is a deprecated shim for
                 # `net_connections` in psutil 6+ (core pins 7.2.2) and is
                 # slated for removal — when it goes, the AttributeError would
