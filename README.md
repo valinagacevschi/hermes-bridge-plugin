@@ -57,7 +57,6 @@ hermes plugins install valinagacevschi/hermes-bridge-plugin/hermes_bridge
 ~/.hermes/hermes-agent/venv/bin/pip install "PyNaCl>=1.6,<1.7" "qrcode>=7.4,<8"
 python3 ~/.hermes/plugins/hermes_bridge/pair.py
 hermes gateway restart
-hermes dashboard --no-open   # only the Agent screen needs this — see below
 ```
 
 Answer **yes** to the installer's "Enable now?" prompt (that writes `plugins.enabled` for
@@ -66,7 +65,7 @@ without the subdir and Hermes clones the whole repo, README included, which its 
 security scanner flags.
 
 `pair.py` finishes with a readiness report — dependencies importable, sender allowlisted,
-home channel set, dashboard API answering, plugin actually enabled — and prints the fix for
+home channel set, local REST API answering, plugin actually enabled — and prints the fix for
 anything that fails. To re-run those checks later without minting an invite:
 
 ```bash
@@ -122,7 +121,8 @@ Written by `pair.py` into `~/.hermes/.env`; listed in `hermes config` for inspec
 | `HERMES_BRIDGE_API_KEY` | minted by `pair.py` |
 | `HERMES_BRIDGE_ALLOWED_USERS` | `mobile` — written by `pair.py`, see below |
 | `HERMES_BRIDGE_HOME_CHANNEL` | your `profile_id` — where cron results are delivered |
-| `HERMES_BRIDGE_API_PORT` | optional, by hand only — the dashboard's port when it is not 9119 |
+| `HERMES_BRIDGE_API_PORT` | optional, by hand only — Hermes' local REST API port when it is not 9119 |
+| `HERMES_BRIDGE_START_API` | optional — `0` stops the plugin starting that API itself |
 
 Hermes authorizes senders per platform and **default-denies when no allowlist is
 configured**, answering the first message with "I don't recognize you yet" and a pairing
@@ -217,18 +217,17 @@ were delivered to the wrong adapter and silently dropped. It now registers as
   it under the Hermes venv's interpreter — reinstall with `--force` (above).
 - **Chat works but the app's Agent screen says `hermes_offline` on every tab** — the two
   features talk to different processes. Chat needs only the gateway; the Agent screen reads
-  Hermes through its local dashboard REST API, which `hermes dashboard` serves and the
-  gateway does not start. Run `hermes dashboard --no-open` and pull to refresh. The
-  gateway log names this exactly: `rpc sessions.list failed: URLError — [Errno 61]
-  Connection refused`. **The dashboard is a foreground process, not a service** — a closed
-  terminal or a dropped SSH session SIGHUPs it and the Agent screen fails again, so run it
-  from a launchd agent (macOS) or a systemd unit, pinned to `--port 9119`. If a
-  dashboard is already running on a non-default port, add `HERMES_BRIDGE_API_PORT=<port>`
-  to `~/.hermes/.env` and restart the gateway. The Runs and Approvals tabs want one more
-  surface — `platforms.api_server.enabled: true` in `~/.hermes/config.yaml` — because they
-  post to Hermes' `/v1/runs` routes rather than the dashboard's. Send a chat message after
-  enabling it: that setting collided with an older version of this plugin, and the fix for
-  the collision has not been verified on a live gateway yet.
+  Hermes through its local REST API, which lives in `hermes dashboard`/`hermes serve`. The
+  plugin starts that API itself on gateway startup, so the fix is usually
+  `hermes gateway restart`. In the gateway log it reads `rpc sessions.list failed:
+  URLError — [Errno 61] Connection refused`; the plugin's own backend logs to
+  `~/.hermes/logs/hermes-bridge-api.log`. If you run your own dashboard on a non-default
+  port, add `HERMES_BRIDGE_API_PORT=<port>` to `~/.hermes/.env`; to manage the process
+  yourself entirely, set `HERMES_BRIDGE_START_API=0`. The Runs and Approvals tabs want one
+  more surface — `platforms.api_server.enabled: true` in `~/.hermes/config.yaml` — because
+  they post to Hermes' `/v1/runs` routes rather than the dashboard's. Send a chat message
+  after enabling it: that setting collided with an older version of this plugin, and the
+  fix for the collision has not been verified on a live gateway yet.
 - **"Hi, I don't recognize you yet" + a pairing code, after a successful pairing** — the
   platform allowlist is missing. Re-run `pair.py` (it writes it and is safe to re-run), or
   run the `hermes pairing approve hermes_bridge <code>` that the message gives you. An

@@ -8,10 +8,14 @@ import os
 import random
 import re
 import secrets
+import socket
+import subprocess
+import sys
 import threading
 import time
 import urllib.request
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode
 
@@ -105,7 +109,8 @@ _INBOUND_REPLAY_GRACE_S = 30.0
 # nothing at all serves these ports on a fresh install, which is what made the
 # whole Agent tab report `hermes_offline` while chat was healthy. See
 # pair.py's readiness report and HERMES_BRIDGE_API_PORT below.
-_HERMES_API_PORTS = [9119, 9120, 8642]
+_DASHBOARD_PORTS = [9119, 9120]
+_HERMES_API_PORTS = _DASHBOARD_PORTS + [8642]
 # Dedup window: retried RPC requests (same rpc.id) within this window are no-ops.
 _RPC_DEDUP_WINDOW_S = 30.0
 
@@ -526,6 +531,9 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         self._hermes_session_tokens: Dict[int, str] = {}
         # Cached working port — avoids re-probing all 3 ports on every RPC call.
         self._hermes_api_port: Optional[int] = None
+        # Hermes' local REST API when this adapter had to start it itself —
+        # see _ensure_local_api. None when an operator runs their own.
+        self._api_proc: Optional[subprocess.Popen] = None
         # Background poll for newly staged memory/skill writes (PRD_Features.md
         # §2.7) — see _poll_pending_writes for why this is polling, not a push.
         self._approval_poll_task: Optional[asyncio.Task] = None
@@ -594,11 +602,106 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         if is_reconnect and self._run_task is not None and not self._run_task.done():
             # Supervisor already owns reconnection — just report current state.
             return self._ws is not None
+        await self._ensure_local_api()
         ok = await self._connect_ws()
         self._run_task = asyncio.ensure_future(self._run_loop())
         if self._approval_poll_task is None or self._approval_poll_task.done():
             self._approval_poll_task = asyncio.ensure_future(self._poll_pending_writes())
         return ok
+
+    def _dashboard_listening(self) -> Optional[int]:
+        """First dashboard port that accepts a connection, or None. Blocking."""
+        seen = set()
+        for port in self._ports_to_probe():
+            # 8642 belongs to the api_server platform, which serves `/v1/*`
+            # only — something listening there is NOT the REST API the Agent
+            # tab needs, so it must not suppress the spawn below.
+            if port in seen or port == 8642:
+                continue
+            seen.add(port)
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                    return port
+            except OSError:
+                continue
+        return None
+
+    async def _ensure_local_api(self) -> None:
+        """Start Hermes' local REST API if nothing is serving it.
+
+        Every Agent-screen RPC is proxied to Hermes' local dashboard REST API,
+        which lives in `hermes dashboard` / `hermes serve` — a process the
+        gateway neither starts nor supervises, and for which Hermes has no
+        autostart config. Installing this plugin therefore used to yield a
+        working chat and an Agent screen where every tab reported
+        `hermes_offline`; telling operators to keep a second process alive by
+        hand puts the feature one closed terminal or dropped SSH session away
+        from broken (observed: `rpc sessions.list failed: URLError — [Errno 61]
+        Connection refused` on a host whose dashboard had exited with its
+        shell).
+
+        `serve` is the lean surface for this: the same `/api/*` routes with no
+        SPA and no UI build. It is spawned as a child of the gateway with
+        HERMES_PARENT_PID set, which arms Hermes' OWN parent-death watchdog
+        (`web_server._start_parent_death_watchdog`) so the backend exits when
+        this gateway does — no service file to install, no orphan to reap.
+
+        Never spawns when something already answers: an operator's own
+        dashboard keeps serving, and this is a no-op on reconnects.
+        `HERMES_BRIDGE_START_API=0` opts out entirely.
+        """
+        if os.getenv("HERMES_BRIDGE_START_API", "1").strip().lower() in ("0", "false", "no"):
+            return
+        if self._api_proc is not None and self._api_proc.poll() is None:
+            return
+
+        loop = asyncio.get_event_loop()
+        live = await loop.run_in_executor(None, self._dashboard_listening)
+        if live is not None:
+            logger.debug("[hermes_bridge] local API already on :%d — not starting one", live)
+            return
+
+        port = _DASHBOARD_PORTS[0]
+        hermes_home = Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes")
+        log_path = hermes_home / "logs" / "hermes-bridge-api.log"
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            # Left open deliberately: it is the child's stdout for its lifetime.
+            handle = open(log_path, "a", buffering=1)  # noqa: SIM115
+            self._api_proc = subprocess.Popen(  # noqa: S603
+                [
+                    sys.executable,
+                    "-m",
+                    "hermes_cli.main",
+                    "serve",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                ],
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                env={**os.environ, "HERMES_PARENT_PID": str(os.getpid())},
+            )
+        except Exception as exc:
+            # Not fatal: chat does not need this, and the Agent tab's own error
+            # already names the fix. Never let it block the relay connection.
+            logger.warning(
+                "[hermes_bridge] could not start Hermes' local API (%s: %s) — "
+                "the Agent screen will report hermes_offline until "
+                "`hermes dashboard` runs",
+                type(exc).__name__,
+                exc,
+            )
+            self._api_proc = None
+            return
+        logger.info(
+            "[hermes_bridge] started Hermes' local API for the Agent screen "
+            "(hermes serve on :%d, pid %d) — log: %s",
+            port,
+            self._api_proc.pid,
+            log_path,
+        )
 
     async def _connect_ws(self) -> bool:
         url = f"{self._relay_url}/ws/hermes/{self._profile_id}"
@@ -697,6 +800,13 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         if self._ws:
             await self._ws.close()
             self._ws = None
+        # Only ever the backend WE spawned; an operator's own dashboard has no
+        # handle here and is left alone. HERMES_PARENT_PID's watchdog is the
+        # backstop if this path is skipped (hard kill, crash).
+        if self._api_proc is not None:
+            if self._api_proc.poll() is None:
+                self._api_proc.terminate()
+            self._api_proc = None
         for task in list(getattr(self, "_bot_poll_tasks", {}).values()):
             task.cancel()
         if hasattr(self, "_bot_poll_tasks"):

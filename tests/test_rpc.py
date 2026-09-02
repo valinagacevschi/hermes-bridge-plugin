@@ -343,6 +343,59 @@ class TestHermesRequestPortSelection(unittest.IsolatedAsyncioTestCase):
 
         assert adapter._hermes_api_port is None, "a 404 must not leave the wrong port pinned"
 
+    async def test_starts_the_local_api_when_nothing_serves_it(self):
+        """Hermes has no autostart config for the dashboard, so a gateway-only
+        install answered every Agent-tab RPC with hermes_offline. The adapter
+        spawns the lean headless backend itself, parented to this gateway."""
+        adapter = _make_adapter()
+
+        with patch.object(adapter, "_dashboard_listening", return_value=None), patch(
+            "hermes_bridge.adapter.subprocess.Popen"
+        ) as popen:
+            popen.return_value.pid = 4242
+            popen.return_value.poll.return_value = None
+            await adapter._ensure_local_api()
+
+        argv, kwargs = popen.call_args[0][0], popen.call_args[1]
+        assert argv[1:4] == ["-m", "hermes_cli.main", "serve"], f"lean surface only: {argv}"
+        assert "9119" in argv, f"pin the port the probe list starts with: {argv}"
+        # Hermes' own watchdog reaps the child when this gateway dies — that is
+        # what makes a service file unnecessary.
+        assert kwargs["env"]["HERMES_PARENT_PID"] == str(os.getpid())
+
+    async def test_does_not_start_a_second_api_over_a_live_one(self):
+        adapter = _make_adapter()
+
+        with patch.object(adapter, "_dashboard_listening", return_value=9119), patch(
+            "hermes_bridge.adapter.subprocess.Popen"
+        ) as popen:
+            await adapter._ensure_local_api()
+        popen.assert_not_called()
+
+        # Opting out must hold even when nothing is listening.
+        with patch.dict(os.environ, {"HERMES_BRIDGE_START_API": "0"}), patch.object(
+            adapter, "_dashboard_listening", return_value=None
+        ), patch("hermes_bridge.adapter.subprocess.Popen") as popen:
+            await adapter._ensure_local_api()
+        popen.assert_not_called()
+
+    async def test_a_listener_on_8642_does_not_pass_for_the_dashboard(self):
+        """8642 is the api_server platform: it serves /v1/* and none of the
+        routes the Agent tab needs, so it must not suppress the spawn."""
+        adapter = _make_adapter()
+        attempted: list = []
+
+        def fake_connect(addr, timeout=None):
+            attempted.append(addr[1])
+            raise OSError("refused")
+
+        with patch.object(adapter, "_ports_to_probe", return_value=[8642, 9119]), patch(
+            "hermes_bridge.adapter.socket.create_connection",
+            side_effect=fake_connect,
+        ):
+            assert adapter._dashboard_listening() is None
+        assert attempted == [9119], f"8642 must be skipped entirely: {attempted}"
+
     async def test_api_port_override_is_tried_first(self):
         """psutil discovery is the only thing that finds a --port 0 dashboard.
         When it comes up empty (no psutil, AccessDenied, an unfamiliar command

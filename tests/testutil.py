@@ -207,6 +207,8 @@ def make_adapter(psk: bytes = PSK, profile_id: str = PROFILE):
         adapter._stream_pending = set()
         adapter._hermes_session_tokens = {}
         adapter._hermes_api_port = None
+        # Nothing spawned by _ensure_local_api in a test adapter.
+        adapter._api_proc = None
         adapter._local_ws = None
         adapter._local_ws_lock = None
         adapter._local_ws_next_id = 1

@@ -1,4 +1,4 @@
-# Hermes Bridge — three steps left
+# Hermes Bridge — two steps left
 
 **1. Install the two dependencies** (Hermes ships `websockets`, but neither of
 these, and it never installs plugin dependencies for you):
@@ -24,22 +24,17 @@ default-denies any sender with no allowlist configured. Answer *yes* to the enab
 Re-run `pair.py` any time to pair another phone or replace an expired invite —
 it reuses the same profile.
 
-**3. Leave the dashboard running** — the app's Agent screen (sessions, skills,
-cron, runs, approvals, usage, memory) reads Hermes through its local REST API,
-which lives in the dashboard process, not the gateway:
+Nothing else to run. The app's Agent screen (sessions, skills, cron, usage,
+memory) reads Hermes through its local REST API, which lives in the dashboard
+process rather than the gateway — so on startup the plugin starts Hermes' own
+headless backend (`hermes serve` on 127.0.0.1:9119) whenever nothing already
+serves it, as a child of the gateway that exits with it. Already run your own
+`hermes dashboard`? It is left alone, and `HERMES_BRIDGE_API_PORT=<port>` in
+`~/.hermes/.env` points the plugin at a non-default port.
+`HERMES_BRIDGE_START_API=0` turns the auto-start off. It logs to
+`~/.hermes/logs/hermes-bridge-api.log`.
 
-    hermes dashboard --no-open
-
-Chat works without it; the Agent screen shows `hermes_offline` on every tab
-until it runs. **It is a foreground process, not a service** — a closed
-terminal, a Ctrl-C or a dropped SSH session takes it down with SIGHUP and the
-Agent screen fails again. Keep it alive with a launchd agent (macOS) or a
-systemd unit, or at minimum `nohup ... &` plus `disown`. Pinning `--port 9119`
-means the plugin finds it without relying on process discovery.
-
-Already running on a non-default port and still offline? Add
-`HERMES_BRIDGE_API_PORT=<port>` to `~/.hermes/.env`. `pair.py --check` reports
-this and everything else above without touching the relay.
+`pair.py --check` reports all of the above without touching the relay.
 
 The Runs and Approvals tabs need one more surface — Hermes' `/v1/runs` routes.
 Set `platforms.api_server.enabled: true` in `~/.hermes/config.yaml` for those

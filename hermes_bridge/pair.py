@@ -188,9 +188,9 @@ def dashboard_port(env: dict) -> Optional[int]:
 
     Chat only needs the gateway, but every Agent-tab screen (sessions, skills,
     cron, runs, usage, memory) is an RPC the adapter proxies to Hermes' local
-    dashboard REST API — a SEPARATE process the gateway does not start. With no
-    dashboard running, chat works perfectly and every Agent tab shows
-    `hermes_offline`.
+    dashboard REST API — a SEPARATE process. The adapter starts one itself when
+    nothing serves it (adapter.py `_ensure_local_api`), so this reports whether
+    that has happened yet rather than asking the operator to do it.
 
     A TCP connect is all this can honestly check: the routes are session-token
     gated, and the token is scraped out of the dashboard's own HTML at request
@@ -249,18 +249,17 @@ def readiness_report(hermes_home: Path, env: dict) -> list:
             "re-run this script, or send /sethome from the app",
         ))
 
-    # Advisory, deliberately never a ✗: chat does not need the dashboard, and
-    # it is a separate long-running process the operator may well start after
-    # this script. Failing the exit code on it would red-flag a pairing that
-    # actually succeeded — the false alarm this whole report exists to avoid.
+    # Advisory, deliberately never a ✗: the adapter starts this itself on the
+    # next gateway restart (see adapter.py _ensure_local_api), so at the moment
+    # this script runs it is normally, correctly, absent. Failing the exit code
+    # on it would red-flag a pairing that actually succeeded.
     port = dashboard_port(env)
     checks.append((
         True,
-        f"dashboard API on :{port} — the Agent tab can load"
+        f"local REST API on :{port} — the Agent tab can load"
         if port
-        else "no dashboard API yet — chat is unaffected, but the Agent tab needs "
-        "`hermes dashboard --no-open` (or HERMES_BRIDGE_API_PORT=<port> in "
-        f"{hermes_home}/.env if it runs on another port)",
+        else "no local REST API yet — the gateway starts one for the Agent tab "
+        "on `hermes gateway restart` (chat never needed it)",
         "",
     ))
 

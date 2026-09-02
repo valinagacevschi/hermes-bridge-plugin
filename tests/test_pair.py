@@ -188,9 +188,10 @@ class PairScriptTest(unittest.TestCase):
             self._run()
         execv.assert_not_called()
 
-    def test_reports_the_dashboard_api_only_when_something_answers(self):
-        """The Agent tab's every RPC needs the local dashboard, which the
-        gateway does not start — so a healthy chat proves nothing about it."""
+    def test_reports_the_local_rest_api_only_when_something_answers(self):
+        """The Agent tab's every RPC needs Hermes' local REST API, which lives
+        outside the gateway — so a healthy chat proves nothing about it. The
+        adapter starts one itself, so this line is advisory either way."""
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
             listener.listen(1)
@@ -206,12 +207,12 @@ class PairScriptTest(unittest.TestCase):
 
         labels = [label for _, label, _ in report]
         self.assertTrue(
-            any("dashboard API" in label for label in labels),
+            any("local REST API" in label for label in labels),
             f"the readiness report must cover the dashboard: {labels}",
         )
-        # Advisory only: pair.py runs before the operator starts the dashboard,
-        # so a missing one must not fail `--check` on a healthy pairing.
-        dashboard_ok = [ok for ok, label, _ in report if "dashboard API" in label]
+        # Advisory only: pair.py runs before the gateway restart that starts
+        # the API, so a missing one must not fail `--check` on a good pairing.
+        dashboard_ok = [ok for ok, label, _ in report if "local REST API" in label]
         self.assertEqual(dashboard_ok, [True])
 
     def test_second_run_repairs_without_reprovisioning(self):
