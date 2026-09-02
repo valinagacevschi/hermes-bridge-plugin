@@ -218,7 +218,11 @@ were delivered to the wrong adapter and silently dropped. It now registers as
 - **Chat works but the app's Agent screen says `hermes_offline` on every tab** — the two
   features talk to different processes. Chat needs only the gateway; the Agent screen reads
   Hermes through its local dashboard REST API, which `hermes dashboard` serves and the
-  gateway does not start. Run `hermes dashboard --no-open` and pull to refresh. If a
+  gateway does not start. Run `hermes dashboard --no-open` and pull to refresh. The
+  gateway log names this exactly: `rpc sessions.list failed: URLError — [Errno 61]
+  Connection refused`. **The dashboard is a foreground process, not a service** — a closed
+  terminal or a dropped SSH session SIGHUPs it and the Agent screen fails again, so run it
+  from a launchd agent (macOS) or a systemd unit, pinned to `--port 9119`. If a
   dashboard is already running on a non-default port, add `HERMES_BRIDGE_API_PORT=<port>`
   to `~/.hermes/.env` and restart the gateway. The Runs and Approvals tabs want one more
   surface — `platforms.api_server.enabled: true` in `~/.hermes/config.yaml` — because they

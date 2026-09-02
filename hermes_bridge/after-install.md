@@ -31,7 +31,13 @@ which lives in the dashboard process, not the gateway:
     hermes dashboard --no-open
 
 Chat works without it; the Agent screen shows `hermes_offline` on every tab
-until it runs. Already running on a non-default port and still offline? Add
+until it runs. **It is a foreground process, not a service** — a closed
+terminal, a Ctrl-C or a dropped SSH session takes it down with SIGHUP and the
+Agent screen fails again. Keep it alive with a launchd agent (macOS) or a
+systemd unit, or at minimum `nohup ... &` plus `disown`. Pinning `--port 9119`
+means the plugin finds it without relying on process discovery.
+
+Already running on a non-default port and still offline? Add
 `HERMES_BRIDGE_API_PORT=<port>` to `~/.hermes/.env`. `pair.py --check` reports
 this and everything else above without touching the relay.
 
