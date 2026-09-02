@@ -145,26 +145,26 @@ class PairScriptTest(unittest.TestCase):
         (self.home / "config.yaml").write_text("plugins:\n  enabled:\n    - something_else\n")
         self._run()  # pairs, and writes the allowlist
 
-        def enablement_check():
+        def enablement_status():
             env = pair.read_env(self.home / ".env")
             return next(
-                (ok for ok, label, _ in pair.readiness_report(self.home, env)
+                (status for status, label, _ in pair.readiness_report(self.home, env)
                  if "enabl" in label),
                 None,
             )
 
-        self.assertIs(enablement_check(), False)
+        self.assertEqual(enablement_status(), pair.FAIL)
 
         (self.home / "config.yaml").write_text("plugins:\n  enabled:\n    - hermes_bridge\n")
-        self.assertIs(enablement_check(), True)
+        self.assertEqual(enablement_status(), pair.OK)
 
         # The inline-list form, and a legacy nested key, both count.
         (self.home / "config.yaml").write_text("plugins:\n  enabled: [other, hermes_bridge]\n")
-        self.assertIs(enablement_check(), True)
+        self.assertEqual(enablement_status(), pair.OK)
         (self.home / "config.yaml").write_text(
             "plugins:\n  enabled:\n    - platforms/hermes_bridge\n"
         )
-        self.assertIs(enablement_check(), True)
+        self.assertEqual(enablement_status(), pair.OK)
 
         # No config at all is "unknown", never a false alarm.
         (self.home / "config.yaml").unlink()
@@ -200,7 +200,7 @@ class PairScriptTest(unittest.TestCase):
             self.assertEqual(pair.dashboard_port(env), live_port)
 
         # Same port, nothing listening now — and no fallback may rescue it.
-        with patch.object(pair, "_API_PORTS", ()):
+        with patch.object(pair, "DASHBOARD_PORTS", ()):
             self.assertIsNone(pair.dashboard_port(env))
 
             report = pair.readiness_report(self.home, env)
@@ -210,10 +210,13 @@ class PairScriptTest(unittest.TestCase):
             any("local REST API" in label for label in labels),
             f"the readiness report must cover the dashboard: {labels}",
         )
-        # Advisory only: pair.py runs before the gateway restart that starts
-        # the API, so a missing one must not fail `--check` on a good pairing.
-        dashboard_ok = [ok for ok, label, _ in report if "local REST API" in label]
-        self.assertEqual(dashboard_ok, [True])
+        # WARN, not FAIL: pair.py runs before the gateway restart that starts
+        # the API, so a missing one must not fail `--check` on a good pairing —
+        # and must not print OK in front of a missing thing either.
+        statuses = [s for s, label, _ in report if "local REST API" in label]
+        self.assertEqual(statuses, [pair.WARN])
+        self.assertTrue(pair.is_ready([(pair.WARN, "advisory", "")]))
+        self.assertFalse(pair.is_ready([(pair.FAIL, "real", "")]))
 
     def test_second_run_repairs_without_reprovisioning(self):
         self._run()

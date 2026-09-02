@@ -30,6 +30,16 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
+# The port list belongs to local_api.py, which owns everything about Hermes'
+# localhost API — importing it keeps this script from carrying a second copy
+# that can drift. Both spellings are needed: pair.py is documented as a script
+# (`python3 ~/.hermes/plugins/hermes_bridge/pair.py`, no package context) and
+# imported as a package module by its tests.
+try:
+    from .local_api import DASHBOARD_PORTS
+except ImportError:
+    from local_api import DASHBOARD_PORTS
+
 DEFAULT_RELAY = "https://herelay.appcenter.ro"
 ENV_KEYS = (
     "HERMES_BRIDGE_RELAY_URL",
@@ -42,12 +52,14 @@ ENV_KEYS = (
     # probes the same port the adapter will.
     "HERMES_BRIDGE_API_PORT",
 )
-# Dashboard defaults, mirroring adapter.py's _HERMES_API_PORTS. 8642 is left
-# out: it belongs to the api_server platform, which a bridge install has off.
-_API_PORTS = (9119, 9120)
 # Every inbound frame reports this one synthetic user id (adapter.py's two
 # build_source calls) — one phone or five, they are all "mobile".
 ADAPTER_USER_ID = "mobile"
+# Readiness severities. WARN exists because one check is genuinely advisory
+# (the local REST API is started later, by the gateway) and reporting it as OK
+# put a false "OK" in front of a missing thing to keep --check's exit code
+# honest. Only FAIL votes on the exit code.
+OK, WARN, FAIL = "OK", "WARN", "FAIL"
 _REEXEC_FLAG = "HERMES_BRIDGE_PAIR_REEXEC"
 
 
@@ -197,7 +209,7 @@ def dashboard_port(env: dict) -> Optional[int]:
     time. Something listening on a Hermes port is enough of a signal.
     """
     override = env.get("HERMES_BRIDGE_API_PORT", "").strip()
-    ports = ([int(override)] if override.isdigit() else []) + list(_API_PORTS)
+    ports = ([int(override)] if override.isdigit() else []) + list(DASHBOARD_PORTS)
     for port in ports:
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.3):
@@ -216,15 +228,15 @@ def readiness_report(hermes_home: Path, env: dict) -> list:
     install-time security scan. Checking them here costs milliseconds and moves
     the discovery from "my agent is broken" to a line of terminal output.
     """
-    checks: list[tuple[bool, str, str]] = []
+    checks: list[tuple[str, str, str]] = []
 
     try:
         import nacl  # noqa: F401,PLC0415
 
-        checks.append((True, "PyNaCl — messages can be encrypted", ""))
+        checks.append((OK, "PyNaCl — messages can be encrypted", ""))
     except ImportError:
         checks.append((
-            False,
+            FAIL,
             "PyNaCl missing — the adapter will not load",
             '~/.hermes/hermes-agent/venv/bin/pip install "PyNaCl>=1.6,<1.7"',
         ))
@@ -232,66 +244,70 @@ def readiness_report(hermes_home: Path, env: dict) -> list:
     try:
         import qrcode  # noqa: F401,PLC0415
 
-        checks.append((True, "qrcode — pairing QR renders", ""))
+        checks.append((OK, "qrcode — pairing QR renders", ""))
     except ImportError:
         checks.append((
-            False,
+            FAIL,
             "qrcode missing — pairing falls back to an unscannable payload",
             '~/.hermes/hermes-agent/venv/bin/pip install "qrcode>=7.4,<8"',
         ))
 
     if env.get("HERMES_BRIDGE_HOME_CHANNEL"):
-        checks.append((True, "home channel set — cron results reach the phone", ""))
+        checks.append((OK, "home channel set — cron results reach the phone", ""))
     else:
         checks.append((
-            False,
+            FAIL,
             "no home channel — cron results have nowhere to go, and Hermes will ask",
             "re-run this script, or send /sethome from the app",
         ))
 
-    # Advisory, deliberately never a ✗: the adapter starts this itself on the
-    # next gateway restart (see adapter.py _ensure_local_api), so at the moment
-    # this script runs it is normally, correctly, absent. Failing the exit code
-    # on it would red-flag a pairing that actually succeeded.
+    # WARN, never FAIL: the gateway starts this itself (adapter.py's LocalApi),
+    # so at the moment this script runs it is normally, correctly, absent.
     port = dashboard_port(env)
-    checks.append((
-        True,
-        f"local REST API on :{port} — the Agent tab can load"
+    checks.append(
+        (OK, f"local REST API on :{port} — the Agent tab can load", "")
         if port
-        else "no local REST API yet — the gateway starts one for the Agent tab "
-        "on `hermes gateway restart` (chat never needed it)",
-        "",
-    ))
+        else (
+            WARN,
+            "no local REST API yet — the gateway starts one for the Agent tab",
+            "hermes gateway restart",
+        )
+    )
 
     allowed = [u.strip() for u in env.get("HERMES_BRIDGE_ALLOWED_USERS", "").split(",")]
     if ADAPTER_USER_ID in allowed:
-        checks.append((True, "sender allowlisted — Hermes will accept the phone", ""))
+        checks.append((OK, "sender allowlisted — Hermes will accept the phone", ""))
     else:
         checks.append((
-            False,
+            FAIL,
             "sender not allowlisted — Hermes answers the first message with a pairing code",
             f"echo HERMES_BRIDGE_ALLOWED_USERS={ADAPTER_USER_ID} >> {hermes_home}/.env",
         ))
 
     enabled = _plugin_enabled(hermes_home)
     if enabled is None:
-        checks.append((True, "plugin enablement — not checked (no readable config.yaml)", ""))
+        checks.append((WARN, "plugin enablement — not checked (no readable config.yaml)", ""))
     elif enabled:
-        checks.append((True, "plugin enabled in config.yaml", ""))
+        checks.append((OK, "plugin enabled in config.yaml", ""))
     else:
         checks.append((
-            False,
+            FAIL,
             "plugin not enabled — Hermes skips it silently at startup",
             "hermes plugins enable hermes_bridge",
         ))
 
     print()
     print("Readiness:")
-    for ok, label, fix in checks:
-        print(f"  {'OK  ' if ok else 'FAIL'} {label}")
+    for status, label, fix in checks:
+        print(f"  {status:<4} {label}")
         if fix:
             print(f"       fix: {fix}")
     return checks
+
+
+def is_ready(checks: list) -> bool:
+    """True when nothing FAILed. WARN lines are reported, never fatal."""
+    return not any(status == FAIL for status, _, _ in checks)
 
 
 def _plugin_enabled(hermes_home: Path) -> Optional[bool]:
@@ -369,8 +385,7 @@ def main() -> None:
     # `pair.py --check` diagnoses an existing install without minting an
     # invite: same checks, no side effects, safe to tell a user to run.
     if "--check" in sys.argv[1:]:
-        ready = all(ok for ok, _, _ in readiness_report(hermes_home, env))
-        sys.exit(0 if ready else 1)
+        sys.exit(0 if is_ready(readiness_report(hermes_home, env)) else 1)
 
     relay_http = to_http(env.get("HERMES_BRIDGE_RELAY_URL") or DEFAULT_RELAY)
     if not env.get("HERMES_BRIDGE_RELAY_URL") and sys.stdin.isatty():
@@ -417,7 +432,7 @@ def main() -> None:
     print()
     print("The QR carries the invite AND the encryption key — keep it on screen only until scanned.")
 
-    if all(ok for ok, _, _ in readiness_report(hermes_home, read_env(env_file))):
+    if is_ready(readiness_report(hermes_home, read_env(env_file))):
         print()
         print("All set. Apply it:  hermes gateway restart")
     else:

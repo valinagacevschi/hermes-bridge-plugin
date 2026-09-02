@@ -185,7 +185,10 @@ def make_adapter(psk: bytes = PSK, profile_id: str = PROFILE):
         ),
         patch("hermes_bridge.adapter.load_psk", return_value=psk),
     ):
+        # Imported here, not at module scope: the package __init__ pulls in
+        # adapter.py, which must not be imported before the stubs above.
         from hermes_bridge.adapter import HermesBridgeAdapter
+        from hermes_bridge.local_api import LocalApi
 
         adapter = HermesBridgeAdapter.__new__(HermesBridgeAdapter)
         # Every field below mirrors the monorepo's testutil.make_adapter. The
@@ -205,10 +208,9 @@ def make_adapter(psk: bytes = PSK, profile_id: str = PROFILE):
         adapter._ws_connected_at = _time.time()
         adapter._pending_prompts = {}
         adapter._stream_pending = set()
-        adapter._hermes_session_tokens = {}
-        adapter._hermes_api_port = None
-        # Nothing spawned by _ensure_local_api in a test adapter.
-        adapter._api_proc = None
+        # Hermes' localhost REST API (local_api.LocalApi): port discovery,
+        # per-port session tokens, and the backend process it may start.
+        adapter._api = LocalApi()
         adapter._local_ws = None
         adapter._local_ws_lock = None
         adapter._local_ws_next_id = 1

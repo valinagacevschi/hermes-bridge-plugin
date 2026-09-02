@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from testutil import make_adapter as _make_adapter
 from hermes_bridge.adapter import _diff_new_pending
+from hermes_bridge.local_api import API_SERVER_PORT
 
 
 def _rpc_payload(method, params=None, rpc_id="test-id-001"):
@@ -45,7 +46,7 @@ class TestCronWriteMethods(unittest.IsolatedAsyncioTestCase):
 
         hermes_response = {"status": "ok"}
         with patch.object(
-            self.adapter, "_hermes_post", AsyncMock(return_value=hermes_response)
+            self.adapter._api, "post", AsyncMock(return_value=hermes_response)
         ) as mock_post:
             await self.adapter._handle_rpc(
                 _rpc_payload(method, params, rpc_id=rpc_id)
@@ -83,7 +84,7 @@ class TestCronWriteMethods(unittest.IsolatedAsyncioTestCase):
 
         self.adapter._ws.send = capture_send
 
-        with patch.object(self.adapter, "_hermes_post", AsyncMock()) as mock_post:
+        with patch.object(self.adapter._api, "post", AsyncMock()) as mock_post:
             await self.adapter._handle_rpc(_rpc_payload("cron.pause", {"id": ""}))
 
         mock_post.assert_not_called()
@@ -99,7 +100,7 @@ class TestCronWriteMethods(unittest.IsolatedAsyncioTestCase):
         self.adapter._ws.send = capture_send
 
         with patch.object(
-            self.adapter, "_hermes_post", AsyncMock(return_value={"ok": True})
+            self.adapter._api, "post", AsyncMock(return_value={"ok": True})
         ) as mock_post:
             # First call — should be processed
             await self.adapter._handle_rpc(
@@ -122,7 +123,7 @@ class TestCronWriteMethods(unittest.IsolatedAsyncioTestCase):
         self.adapter._ws.send = capture_send
 
         with patch.object(
-            self.adapter, "_hermes_post", AsyncMock(return_value={"ok": True})
+            self.adapter._api, "post", AsyncMock(return_value={"ok": True})
         ) as mock_post:
             await self.adapter._handle_rpc(
                 _rpc_payload("cron.trigger", {"id": "job-1"}, rpc_id="id-A")
@@ -178,14 +179,14 @@ class TestCronCreateEdit(unittest.IsolatedAsyncioTestCase):
         self.adapter._ws.send = capture_send
 
     async def test_create_missing_schedule_returns_error(self):
-        with patch.object(self.adapter, "_hermes_post", AsyncMock()) as mock_post:
+        with patch.object(self.adapter._api, "post", AsyncMock()) as mock_post:
             await self.adapter._handle_rpc(_rpc_payload("cron.create", {"prompt": "hello"}))
         mock_post.assert_not_called()
         assert len(self.sent_frames) == 1
 
     async def test_create_calls_correct_path_with_body(self):
         with patch.object(
-            self.adapter, "_hermes_post", AsyncMock(return_value={"id": "job-new"})
+            self.adapter._api, "post", AsyncMock(return_value={"id": "job-new"})
         ) as mock_post:
             await self.adapter._handle_rpc(
                 _rpc_payload(
@@ -218,7 +219,7 @@ class TestCronCreateEdit(unittest.IsolatedAsyncioTestCase):
         error = _http_error(400, "Could not parse schedule: 'whenever'")
         with patch.object(
             self.adapter, "_send_rpc_response", AsyncMock()
-        ) as mock_response, patch.object(self.adapter, "_hermes_post", AsyncMock(side_effect=error)):
+        ) as mock_response, patch.object(self.adapter._api, "post", AsyncMock(side_effect=error)):
             await self.adapter._handle_rpc(
                 _rpc_payload("cron.create", {"schedule": "whenever", "prompt": "x"})
             )
@@ -227,20 +228,20 @@ class TestCronCreateEdit(unittest.IsolatedAsyncioTestCase):
         assert "Could not parse schedule" in call_kwargs["error"]
 
     async def test_edit_missing_job_id_returns_error(self):
-        with patch.object(self.adapter, "_hermes_post", AsyncMock()) as mock_post:
+        with patch.object(self.adapter._api, "post", AsyncMock()) as mock_post:
             await self.adapter._handle_rpc(_rpc_payload("cron.edit", {"schedule": "1h"}))
         mock_post.assert_not_called()
         assert len(self.sent_frames) == 1
 
     async def test_edit_no_fields_returns_error(self):
-        with patch.object(self.adapter, "_hermes_post", AsyncMock()) as mock_post:
+        with patch.object(self.adapter._api, "post", AsyncMock()) as mock_post:
             await self.adapter._handle_rpc(_rpc_payload("cron.edit", {"id": "job-1"}))
         mock_post.assert_not_called()
         assert len(self.sent_frames) == 1
 
     async def test_edit_sends_partial_updates_wrapped(self):
         with patch.object(
-            self.adapter, "_hermes_post", AsyncMock(return_value={"id": "job-1"})
+            self.adapter._api, "post", AsyncMock(return_value={"id": "job-1"})
         ) as mock_post:
             await self.adapter._handle_rpc(
                 _rpc_payload("cron.edit", {"id": "job-1", "schedule": "every 1h"})
@@ -256,7 +257,7 @@ class TestCronCreateEdit(unittest.IsolatedAsyncioTestCase):
         error = _http_error(400, "Could not parse schedule: 'nonsense'")
         with patch.object(
             self.adapter, "_send_rpc_response", AsyncMock()
-        ) as mock_response, patch.object(self.adapter, "_hermes_post", AsyncMock(side_effect=error)):
+        ) as mock_response, patch.object(self.adapter._api, "post", AsyncMock(side_effect=error)):
             await self.adapter._handle_rpc(
                 _rpc_payload("cron.edit", {"id": "job-1", "schedule": "nonsense"})
             )
@@ -275,8 +276,8 @@ class TestHermesRequestHttpError(unittest.IsolatedAsyncioTestCase):
         import urllib.error
 
         adapter = _make_adapter()
-        adapter._hermes_session_tokens = {9119: "cached-token"}
-        adapter._hermes_api_port = None
+        adapter._api._tokens = {9119: "cached-token"}
+        adapter._api.port = None
 
         attempted_urls = []
 
@@ -284,16 +285,16 @@ class TestHermesRequestHttpError(unittest.IsolatedAsyncioTestCase):
             attempted_urls.append(req.full_url)
             raise _http_error(400, "Could not parse schedule: 'whenever'")
 
-        with patch.object(adapter, "_ports_to_probe", return_value=[9119, 9120, 8642]), patch(
+        with patch.object(adapter._api, "ports_to_probe", return_value=[9119, 9120, 8642]), patch(
             "urllib.request.urlopen", side_effect=fake_urlopen
         ):
             with self.assertRaises(urllib.error.HTTPError) as ctx:
-                await adapter._hermes_request("/api/cron/jobs", method="POST", body={"schedule": "whenever"})
+                await adapter._api.request("/api/cron/jobs", method="POST", body={"schedule": "whenever"})
 
         assert len(attempted_urls) == 1, f"expected single attempt, got {attempted_urls}"
         assert ctx.exception.code == 400
         # The answering port is the working port — cache it.
-        assert adapter._hermes_api_port == 9119
+        assert adapter._api.port == 9119
 
 
 class TestHermesRequestPortSelection(unittest.IsolatedAsyncioTestCase):
@@ -308,8 +309,8 @@ class TestHermesRequestPortSelection(unittest.IsolatedAsyncioTestCase):
 
     async def test_404_keeps_probing_and_does_not_pin_the_port(self):
         adapter = _make_adapter()
-        adapter._hermes_session_tokens = {}
-        adapter._hermes_api_port = None
+        adapter._api._tokens = {}
+        adapter._api.port = None
         attempted = []
 
         def fake_urlopen(req, timeout=None):
@@ -318,83 +319,30 @@ class TestHermesRequestPortSelection(unittest.IsolatedAsyncioTestCase):
                 raise _http_error(404, "Not Found")
             return _json_response({"ok": True, "port": 9120})
 
-        with patch.object(adapter, "_ports_to_probe", return_value=[9119, 9120]), patch.object(
-            adapter, "_ensure_hermes_token", AsyncMock(return_value="tok")
+        with patch.object(adapter._api, "ports_to_probe", return_value=[9119, 9120]), patch.object(
+            adapter._api, "token", AsyncMock(return_value="tok")
         ), patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            result = await adapter._hermes_request("/api/sessions")
+            result = await adapter._api.request("/api/sessions")
 
         assert len(attempted) == 2, f"404 should not stop the probe: {attempted}"
         assert result["port"] == 9120
-        assert adapter._hermes_api_port == 9120, "must pin the port that actually answered"
+        assert adapter._api.port == 9120, "must pin the port that actually answered"
 
     async def test_404_on_a_cached_port_clears_the_cache(self):
         adapter = _make_adapter()
-        adapter._hermes_session_tokens = {}
-        adapter._hermes_api_port = 9119  # stale pin at the wrong service
+        adapter._api._tokens = {}
+        adapter._api.port = 9119  # stale pin at the wrong service
 
         def fake_urlopen(req, timeout=None):
             raise _http_error(404, "Not Found")
 
-        with patch.object(adapter, "_ports_to_probe", return_value=[9119]), patch.object(
-            adapter, "_ensure_hermes_token", AsyncMock(return_value="tok")
+        with patch.object(adapter._api, "ports_to_probe", return_value=[9119]), patch.object(
+            adapter._api, "token", AsyncMock(return_value="tok")
         ), patch("urllib.request.urlopen", side_effect=fake_urlopen):
             with self.assertRaises(Exception):
-                await adapter._hermes_request("/api/sessions")
+                await adapter._api.request("/api/sessions")
 
-        assert adapter._hermes_api_port is None, "a 404 must not leave the wrong port pinned"
-
-    async def test_starts_the_local_api_when_nothing_serves_it(self):
-        """Hermes has no autostart config for the dashboard, so a gateway-only
-        install answered every Agent-tab RPC with hermes_offline. The adapter
-        spawns the lean headless backend itself, parented to this gateway."""
-        adapter = _make_adapter()
-
-        with patch.object(adapter, "_dashboard_listening", return_value=None), patch(
-            "hermes_bridge.adapter.subprocess.Popen"
-        ) as popen:
-            popen.return_value.pid = 4242
-            popen.return_value.poll.return_value = None
-            await adapter._ensure_local_api()
-
-        argv, kwargs = popen.call_args[0][0], popen.call_args[1]
-        assert argv[1:4] == ["-m", "hermes_cli.main", "serve"], f"lean surface only: {argv}"
-        assert "9119" in argv, f"pin the port the probe list starts with: {argv}"
-        # Hermes' own watchdog reaps the child when this gateway dies — that is
-        # what makes a service file unnecessary.
-        assert kwargs["env"]["HERMES_PARENT_PID"] == str(os.getpid())
-
-    async def test_does_not_start_a_second_api_over_a_live_one(self):
-        adapter = _make_adapter()
-
-        with patch.object(adapter, "_dashboard_listening", return_value=9119), patch(
-            "hermes_bridge.adapter.subprocess.Popen"
-        ) as popen:
-            await adapter._ensure_local_api()
-        popen.assert_not_called()
-
-        # Opting out must hold even when nothing is listening.
-        with patch.dict(os.environ, {"HERMES_BRIDGE_START_API": "0"}), patch.object(
-            adapter, "_dashboard_listening", return_value=None
-        ), patch("hermes_bridge.adapter.subprocess.Popen") as popen:
-            await adapter._ensure_local_api()
-        popen.assert_not_called()
-
-    async def test_a_listener_on_8642_does_not_pass_for_the_dashboard(self):
-        """8642 is the api_server platform: it serves /v1/* and none of the
-        routes the Agent tab needs, so it must not suppress the spawn."""
-        adapter = _make_adapter()
-        attempted: list = []
-
-        def fake_connect(addr, timeout=None):
-            attempted.append(addr[1])
-            raise OSError("refused")
-
-        with patch.object(adapter, "_ports_to_probe", return_value=[8642, 9119]), patch(
-            "hermes_bridge.adapter.socket.create_connection",
-            side_effect=fake_connect,
-        ):
-            assert adapter._dashboard_listening() is None
-        assert attempted == [9119], f"8642 must be skipped entirely: {attempted}"
+        assert adapter._api.port is None, "a 404 must not leave the wrong port pinned"
 
     async def test_api_port_override_is_tried_first(self):
         """psutil discovery is the only thing that finds a --port 0 dashboard.
@@ -402,13 +350,13 @@ class TestHermesRequestPortSelection(unittest.IsolatedAsyncioTestCase):
         line), a running dashboard still reads as hermes_offline with nothing
         the user can change — HERMES_BRIDGE_API_PORT is that escape hatch."""
         adapter = _make_adapter()
-        adapter._hermes_api_port = 9120  # a stale pin must not outrank it
+        adapter._api.port = 9120  # a stale pin must not outrank it
 
         with patch.dict(os.environ, {"HERMES_BRIDGE_API_PORT": "51234"}), patch(
-            "hermes_bridge.adapter._discover_dashboard_ports",
+            "hermes_bridge.local_api.discover_dashboard_ports",
             return_value=[],
         ):
-            ports = adapter._ports_to_probe()
+            ports = adapter._api.ports_to_probe()
 
         assert ports[0] == 51234, f"the override must be probed first: {ports}"
         assert 9119 in ports, "the defaults stay as fallbacks"
@@ -421,31 +369,84 @@ class TestHermesRequestPortSelection(unittest.IsolatedAsyncioTestCase):
         other's routes, so both must stay probeable -- dropping 8642 would break
         approvals and runs. What must NOT happen is a 404 from one being read as
         "this is the working port", which is the bug this class covers."""
-        from hermes_bridge.adapter import _HERMES_API_PORTS
+        adapter = _make_adapter()
+        with patch(
+            "hermes_bridge.local_api.discover_dashboard_ports",
+            return_value=[],
+        ):
+            probe = adapter._api.ports_to_probe()
+            dashboard_only = adapter._api.dashboard_candidates()
 
-        assert _HERMES_API_PORTS[0] == 9119, "the dashboard default is tried first"
-        assert 8642 in _HERMES_API_PORTS, "api_server's port serves the /v1/* routes"
+        assert probe[0] == 9119, "the dashboard default is tried first"
+        assert API_SERVER_PORT in probe, "api_server's port serves the /v1/* routes"
+        # The two orderings are the reason no `port == 8642` filter is needed
+        # anywhere: a listener there must never read as "the Agent screen's API
+        # is up", so `listening()`/`_ensure()` walk the dashboard list only.
+        assert API_SERVER_PORT not in dashboard_only
 
+
+class TestLocalApiAutostart(unittest.IsolatedAsyncioTestCase):
+    """Hermes ships no autostart setting for the dashboard, and a hand-started
+    one dies with its terminal — so LocalApi starts the headless backend
+    itself, parented to this gateway, and keeps out of the way of an
+    operator's own.
+    """
+
+    async def test_starts_the_local_api_when_nothing_serves_it(self):
+        """Hermes has no autostart config for the dashboard, so a gateway-only
+        install answered every Agent-tab RPC with hermes_offline. The adapter
+        spawns the lean headless backend itself, parented to this gateway."""
+        adapter = _make_adapter()
+
+        with patch.object(adapter._api, "listening", return_value=None), patch(
+            "hermes_bridge.local_api.subprocess.Popen"
+        ) as popen:
+            popen.return_value.pid = 4242
+            popen.return_value.poll.return_value = None
+            await adapter._api._ensure()
+
+        argv, kwargs = popen.call_args[0][0], popen.call_args[1]
+        assert argv[1:4] == ["-m", "hermes_cli.main", "serve"], f"lean surface only: {argv}"
+        assert "9119" in argv, f"pin the port the probe list starts with: {argv}"
+        # Hermes' own watchdog reaps the child when this gateway dies — that is
+        # what makes a service file unnecessary.
+        assert kwargs["env"]["HERMES_PARENT_PID"] == str(os.getpid())
+
+    async def test_does_not_start_a_second_api_over_a_live_one(self):
+        adapter = _make_adapter()
+
+        with patch.object(adapter._api, "listening", return_value=9119), patch(
+            "hermes_bridge.local_api.subprocess.Popen"
+        ) as popen:
+            await adapter._api._ensure()
+        popen.assert_not_called()
+
+        # Opting out must hold even when nothing is listening.
+        with patch.dict(os.environ, {"HERMES_BRIDGE_START_API": "0"}), patch.object(
+            adapter._api, "listening", return_value=None
+        ), patch("hermes_bridge.local_api.subprocess.Popen") as popen:
+            await adapter._api._ensure()
+        popen.assert_not_called()
 
 class TestHermesSessionTokenIsPerPort(unittest.IsolatedAsyncioTestCase):
     """(#64) The dashboard mints its session token per process
     (secrets.token_urlsafe(32) in hermes_cli/web_server.py), so a token scraped
     from one dashboard is invalid on another. The cache must be keyed by port --
-    _discover_dashboard_ports() deliberately returns several (main + per-profile).
+    discover_dashboard_ports() deliberately returns several (main + per-profile).
     """
 
     async def test_token_cached_for_one_port_is_not_reused_for_another(self):
         adapter = _make_adapter()
-        adapter._hermes_session_tokens = {9119: "token-for-9119"}
+        adapter._api._tokens = {9119: "token-for-9119"}
         scraped = []
 
         def fake_fetch(port):
             scraped.append(port)
             return f"token-for-{port}"
 
-        with patch.object(adapter, "_fetch_session_token", side_effect=fake_fetch):
-            same = await adapter._ensure_hermes_token(9119)
-            other = await adapter._ensure_hermes_token(9120)
+        with patch.object(adapter._api, "_fetch_session_token", side_effect=fake_fetch):
+            same = await adapter._api.token(9119)
+            other = await adapter._api.token(9120)
 
         assert same == "token-for-9119", "cached port must not re-scrape"
         assert scraped == [9120], f"only the uncached port should be scraped: {scraped}"
@@ -453,21 +454,21 @@ class TestHermesSessionTokenIsPerPort(unittest.IsolatedAsyncioTestCase):
 
     async def test_401_clears_only_the_failing_port_token(self):
         adapter = _make_adapter()
-        adapter._hermes_session_tokens = {9119: "stale", 9120: "still-good"}
-        adapter._hermes_api_port = None
+        adapter._api._tokens = {9119: "stale", 9120: "still-good"}
+        adapter._api.port = None
 
         def fake_urlopen(req, timeout=None):
             if ":9119" in req.full_url:
                 raise _http_error(401, "Unauthorized")
             return _json_response({"ok": True})
 
-        with patch.object(adapter, "_ports_to_probe", return_value=[9119, 9120]), patch.object(
-            adapter, "_fetch_session_token", side_effect=lambda port: None
+        with patch.object(adapter._api, "ports_to_probe", return_value=[9119, 9120]), patch.object(
+            adapter._api, "_fetch_session_token", side_effect=lambda port: None
         ), patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            await adapter._hermes_request("/api/sessions")
+            await adapter._api.request("/api/sessions")
 
-        assert 9119 not in adapter._hermes_session_tokens, "failing port's token must be cleared"
-        assert adapter._hermes_session_tokens.get(9120) == "still-good", (
+        assert 9119 not in adapter._api._tokens, "failing port's token must be cleared"
+        assert adapter._api._tokens.get(9120) == "still-good", (
             "a 401 on one port must not invalidate another port's token"
         )
 

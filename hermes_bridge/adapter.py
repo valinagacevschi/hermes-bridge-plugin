@@ -8,14 +8,10 @@ import os
 import random
 import re
 import secrets
-import socket
-import subprocess
-import sys
 import threading
 import time
 import urllib.request
 import uuid
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode
 
@@ -33,6 +29,7 @@ from gateway.platforms.base import (
 
 from .capability import CapabilityDescriptor
 from .crypto import load_psk, open_blob, open_frame, seal, seal_blob
+from .local_api import API_SERVER_PORT, SESSION_HEADER, LocalApi
 
 logger = logging.getLogger(__name__)
 
@@ -75,42 +72,6 @@ _RECONNECT_MAX = 30.0
 # JSON frames over a live WS.
 _INBOUND_REPLAY_GRACE_S = 30.0
 
-# Hermes local REST fallback ports. This adapter talks to TWO different local
-# services and reaches both through _hermes_request's probe loop:
-#
-#   * the dashboard (`hermes dashboard`, default 9119) serves the `/api/*`
-#     routes — sessions, skills, status, cron, model options, system stats
-#   * the api_server platform (default 8642) serves the `/v1/*` routes —
-#     `/v1/runs` (POST/GET/SSE) and `/v1/runs/{id}/approval`. There is no
-#     aggregate `/v1/approvals` list — run approvals are cached in-process
-#     from `approval.request` SSE frames (see `_pending_approvals`).
-#
-# Neither serves the other's routes, so whichever port is tried first answers
-# 404 for half of them. That is fine and expected: _hermes_request treats a 404
-# as "wrong service, keep probing" (issue 64). It must NOT treat it as "this is
-# the working port" — doing so pinned every RPC to whichever service was probed
-# first and made the whole Agent tab fail with 404s that looked like real
-# answers.
-#
-# In practice the dashboard often uses --port 0 (OS-assigned), so
-# _discover_dashboard_ports() finds its real port via psutil first and these are
-# only the fallback.
-#
-# 8642 SHOULD be enableable again (issue 62) — UNVERIFIED on a live gateway.
-# This adapter no longer squats on `Platform.API_SERVER`, so core's own
-# api_server platform can hold that value without one adapter overwriting the
-# other in the gateway's registry. That is read off the registry code, not
-# observed, and the last confident claim about this exact config silently ate
-# every reply. Flip it and send one message before relying on it. It is OFF by
-# default, and `runs.*` is the only thing that needs it — with the dashboard
-# alone every other tab works and Runs/Approvals report offline.
-#
-# Neither service starts with the gateway. `hermes dashboard` serves 9119;
-# nothing at all serves these ports on a fresh install, which is what made the
-# whole Agent tab report `hermes_offline` while chat was healthy. See
-# pair.py's readiness report and HERMES_BRIDGE_API_PORT below.
-_DASHBOARD_PORTS = [9119, 9120]
-_HERMES_API_PORTS = _DASHBOARD_PORTS + [8642]
 # Dedup window: retried RPC requests (same rpc.id) within this window are no-ops.
 _RPC_DEDUP_WINDOW_S = 30.0
 
@@ -446,50 +407,6 @@ def _pending_summary(rec: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _discover_dashboard_ports() -> List[int]:
-    """Return listening ports of running `hermes dashboard` processes via psutil.
-
-    Priority:
-      1. Main dashboard (no --profile flag) — matches this adapter's context.
-      2. Any other dashboard processes (profile-specific) as fallbacks.
-
-    Returns empty list if psutil is unavailable or no dashboard is running.
-    """
-    try:
-        import psutil  # optional — available in the Hermes venv
-    except ImportError:
-        return []
-
-    main_ports: List[int] = []
-    profile_ports: List[int] = []
-    try:
-        for proc in psutil.process_iter(["pid", "cmdline"]):
-            try:
-                cmd: List[str] = proc.info.get("cmdline") or []
-                cmd_str = " ".join(cmd)
-                # Must be a hermes dashboard process (not a gateway/other subcommand).
-                if "hermes" not in cmd_str or "dashboard" not in cmd_str:
-                    continue
-                is_profile = "--profile" in cmd_str
-                # `Process.connections` is a deprecated shim for
-                # `net_connections` in psutil 6+ (core pins 7.2.2) and is
-                # slated for removal — when it goes, the AttributeError would
-                # land in the outer catch and silently return no ports at all.
-                list_conns = getattr(proc, "net_connections", None) or proc.connections
-                for conn in list_conns("inet"):
-                    if conn.status == "LISTEN":
-                        port = conn.laddr.port
-                        if is_profile:
-                            profile_ports.append(port)
-                        else:
-                            main_ports.append(port)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-    except Exception as exc:
-        logger.debug("[hermes_bridge] psutil discovery failed: %s", exc)
-    return main_ports + profile_ports
-
-
 class HermesBridgeAdapter(BasePlatformAdapter):
     """Connects Hermes Agent to the Hermes Bridge relay via outbound WebSocket.
 
@@ -522,18 +439,9 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         self._pending_approvals: Dict[str, Dict[str, Any]] = {}
         # Hermes dashboard session token — extracted from the SPA HTML on first
         # API call. Per-process ephemeral; refreshed when a request 401s.
-        # Keyed BY PORT: the dashboard mints _SESSION_TOKEN per process
-        # (secrets.token_urlsafe(32) in hermes_cli/web_server.py), so a token
-        # scraped from one dashboard is invalid on another. A single shared
-        # cache sent the wrong token whenever more than one candidate port
-        # served a dashboard -- and _discover_dashboard_ports() deliberately
-        # returns several (main + per-profile).
-        self._hermes_session_tokens: Dict[int, str] = {}
-        # Cached working port — avoids re-probing all 3 ports on every RPC call.
-        self._hermes_api_port: Optional[int] = None
-        # Hermes' local REST API when this adapter had to start it itself —
-        # see _ensure_local_api. None when an operator runs their own.
-        self._api_proc: Optional[subprocess.Popen] = None
+        # Hermes' localhost REST API — port discovery, session token, requests
+        # and (when nothing else serves it) the backend process. See local_api.py.
+        self._api = LocalApi()
         # Background poll for newly staged memory/skill writes (PRD_Features.md
         # §2.7) — see _poll_pending_writes for why this is polling, not a push.
         self._approval_poll_task: Optional[asyncio.Task] = None
@@ -602,106 +510,12 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         if is_reconnect and self._run_task is not None and not self._run_task.done():
             # Supervisor already owns reconnection — just report current state.
             return self._ws is not None
-        await self._ensure_local_api()
+        await self._api.start()
         ok = await self._connect_ws()
         self._run_task = asyncio.ensure_future(self._run_loop())
         if self._approval_poll_task is None or self._approval_poll_task.done():
             self._approval_poll_task = asyncio.ensure_future(self._poll_pending_writes())
         return ok
-
-    def _dashboard_listening(self) -> Optional[int]:
-        """First dashboard port that accepts a connection, or None. Blocking."""
-        seen = set()
-        for port in self._ports_to_probe():
-            # 8642 belongs to the api_server platform, which serves `/v1/*`
-            # only — something listening there is NOT the REST API the Agent
-            # tab needs, so it must not suppress the spawn below.
-            if port in seen or port == 8642:
-                continue
-            seen.add(port)
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.3):
-                    return port
-            except OSError:
-                continue
-        return None
-
-    async def _ensure_local_api(self) -> None:
-        """Start Hermes' local REST API if nothing is serving it.
-
-        Every Agent-screen RPC is proxied to Hermes' local dashboard REST API,
-        which lives in `hermes dashboard` / `hermes serve` — a process the
-        gateway neither starts nor supervises, and for which Hermes has no
-        autostart config. Installing this plugin therefore used to yield a
-        working chat and an Agent screen where every tab reported
-        `hermes_offline`; telling operators to keep a second process alive by
-        hand puts the feature one closed terminal or dropped SSH session away
-        from broken (observed: `rpc sessions.list failed: URLError — [Errno 61]
-        Connection refused` on a host whose dashboard had exited with its
-        shell).
-
-        `serve` is the lean surface for this: the same `/api/*` routes with no
-        SPA and no UI build. It is spawned as a child of the gateway with
-        HERMES_PARENT_PID set, which arms Hermes' OWN parent-death watchdog
-        (`web_server._start_parent_death_watchdog`) so the backend exits when
-        this gateway does — no service file to install, no orphan to reap.
-
-        Never spawns when something already answers: an operator's own
-        dashboard keeps serving, and this is a no-op on reconnects.
-        `HERMES_BRIDGE_START_API=0` opts out entirely.
-        """
-        if os.getenv("HERMES_BRIDGE_START_API", "1").strip().lower() in ("0", "false", "no"):
-            return
-        if self._api_proc is not None and self._api_proc.poll() is None:
-            return
-
-        loop = asyncio.get_event_loop()
-        live = await loop.run_in_executor(None, self._dashboard_listening)
-        if live is not None:
-            logger.debug("[hermes_bridge] local API already on :%d — not starting one", live)
-            return
-
-        port = _DASHBOARD_PORTS[0]
-        hermes_home = Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes")
-        log_path = hermes_home / "logs" / "hermes-bridge-api.log"
-        try:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            # Left open deliberately: it is the child's stdout for its lifetime.
-            handle = open(log_path, "a", buffering=1)  # noqa: SIM115
-            self._api_proc = subprocess.Popen(  # noqa: S603
-                [
-                    sys.executable,
-                    "-m",
-                    "hermes_cli.main",
-                    "serve",
-                    "--host",
-                    "127.0.0.1",
-                    "--port",
-                    str(port),
-                ],
-                stdout=handle,
-                stderr=subprocess.STDOUT,
-                env={**os.environ, "HERMES_PARENT_PID": str(os.getpid())},
-            )
-        except Exception as exc:
-            # Not fatal: chat does not need this, and the Agent tab's own error
-            # already names the fix. Never let it block the relay connection.
-            logger.warning(
-                "[hermes_bridge] could not start Hermes' local API (%s: %s) — "
-                "the Agent screen will report hermes_offline until "
-                "`hermes dashboard` runs",
-                type(exc).__name__,
-                exc,
-            )
-            self._api_proc = None
-            return
-        logger.info(
-            "[hermes_bridge] started Hermes' local API for the Agent screen "
-            "(hermes serve on :%d, pid %d) — log: %s",
-            port,
-            self._api_proc.pid,
-            log_path,
-        )
 
     async def _connect_ws(self) -> bool:
         url = f"{self._relay_url}/ws/hermes/{self._profile_id}"
@@ -800,13 +614,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         if self._ws:
             await self._ws.close()
             self._ws = None
-        # Only ever the backend WE spawned; an operator's own dashboard has no
-        # handle here and is left alone. HERMES_PARENT_PID's watchdog is the
-        # backstop if this path is skipped (hard kill, crash).
-        if self._api_proc is not None:
-            if self._api_proc.poll() is None:
-                self._api_proc.terminate()
-            self._api_proc = None
+        await self._api.stop()
         for task in list(getattr(self, "_bot_poll_tasks", {}).values()):
             task.cancel()
         if hasattr(self, "_bot_poll_tasks"):
@@ -1714,7 +1522,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
 
     async def _rpc_sessions_messages(self, p: Dict[str, Any]) -> Any:
         session_id = _require(p, "id", "missing_session_id")
-        return await self._hermes_get(f"/api/sessions/{session_id}/messages")
+        return await self._api.get(f"/api/sessions/{session_id}/messages")
 
     async def _rpc_sessions_switch(self, p: Dict[str, Any]) -> Any:
         # Hermes has no REST endpoint to switch active session context.
@@ -1723,45 +1531,45 @@ class HermesBridgeAdapter(BasePlatformAdapter):
 
     async def _rpc_sessions_delete(self, p: Dict[str, Any]) -> Any:
         session_id = _require(p, "id", "missing_session_id")
-        await self._hermes_request(f"/api/sessions/{session_id}", method="DELETE")
+        await self._api.request(f"/api/sessions/{session_id}", method="DELETE")
         return {"deleted": True}
 
     async def _rpc_sessions_search(self, p: Dict[str, Any]) -> Any:
         q = str(p.get("q", "")).strip()
         limit = int(p.get("limit", 20))
-        return await self._hermes_get(f"/api/sessions/search?q={q}&limit={limit}")
+        return await self._api.get(f"/api/sessions/search?q={q}&limit={limit}")
 
     async def _rpc_sessions_export(self, p: Dict[str, Any]) -> Any:
         session_id = _require(p, "id", "missing_session_id")
-        return await self._hermes_get(f"/api/sessions/{session_id}/export")
+        return await self._api.get(f"/api/sessions/{session_id}/export")
 
     async def _rpc_skills_toggle(self, p: Dict[str, Any]) -> Any:
         name = _require(p, "name", "missing_skill_name")
         body = {"name": name, "enabled": bool(p.get("enabled"))}
-        return await self._hermes_post("/api/skills/toggle", body=body, method="PUT")
+        return await self._api.post("/api/skills/toggle", body=body, method="PUT")
 
     async def _rpc_skills_content(self, p: Dict[str, Any]) -> Any:
         name = _require(p, "name", "missing_skill_name")
-        return await self._hermes_get(f"/api/skills/content?name={name}")
+        return await self._api.get(f"/api/skills/content?name={name}")
 
     async def _rpc_skills_hub_search(self, p: Dict[str, Any]) -> Any:
         q = str(p.get("q", "")).strip()
         limit = int(p.get("limit", 20))
         source = str(p.get("source", "all")).strip() or "all"
-        return await self._hermes_get(f"/api/skills/hub/search?q={q}&limit={limit}&source={source}")
+        return await self._api.get(f"/api/skills/hub/search?q={q}&limit={limit}&source={source}")
 
     async def _rpc_skills_hub_install(self, p: Dict[str, Any]) -> Any:
         identifier = _require(p, "identifier", "missing_identifier")
-        return await self._hermes_post("/api/skills/hub/install", body={"identifier": identifier})
+        return await self._api.post("/api/skills/hub/install", body={"identifier": identifier})
 
     async def _rpc_skills_hub_uninstall(self, p: Dict[str, Any]) -> Any:
         name = _require(p, "name", "missing_skill_name")
-        return await self._hermes_post("/api/skills/hub/uninstall", body={"name": name})
+        return await self._api.post("/api/skills/hub/uninstall", body={"name": name})
 
     async def _rpc_agent_status(self, p: Dict[str, Any]) -> Any:
-        data = await self._hermes_get("/api/status")
+        data = await self._api.get("/api/status")
         try:
-            stats = await self._hermes_get("/api/system/stats")
+            stats = await self._api.get("/api/system/stats")
             if isinstance(data, dict) and isinstance(stats, dict):
                 data = {**data, **stats}
         except Exception:
@@ -1772,17 +1580,17 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         model = _require(p, "model", "missing_model")
         scope = str(p.get("scope", "main")).strip() or "main"
         provider = str(p.get("provider", "")).strip()
-        return await self._hermes_post(
+        return await self._api.post(
             "/api/model/set", body={"scope": scope, "provider": provider, "model": model}
         )
 
     async def _rpc_usage_get(self, p: Dict[str, Any]) -> Any:
         days = p.get("days", 7)
-        return await self._hermes_get(f"/api/analytics/usage?days={days}")
+        return await self._api.get(f"/api/analytics/usage?days={days}")
 
     async def _rpc_cron_action(self, p: Dict[str, Any], action: str) -> Any:
         job_id = _require(p, "id", "missing_job_id")
-        return await self._hermes_post(f"/api/cron/jobs/{job_id}/{action}")
+        return await self._api.post(f"/api/cron/jobs/{job_id}/{action}")
 
     async def _rpc_cron_create(self, p: Dict[str, Any]) -> Any:
         schedule = _require(p, "schedule", "missing_schedule")
@@ -1793,7 +1601,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         skills = p.get("skills")
         if skills:
             body["skills"] = skills if isinstance(skills, list) else [str(skills)]
-        return await self._hermes_post("/api/cron/jobs", body=body)
+        return await self._api.post("/api/cron/jobs", body=body)
 
     async def _rpc_cron_edit(self, p: Dict[str, Any]) -> Any:
         job_id = _require(p, "id", "missing_job_id")
@@ -1803,22 +1611,22 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             updates["skills"] = skills if isinstance(skills, list) else ([str(skills)] if skills else [])
         if not updates:
             raise _RpcError("no_updates")
-        return await self._hermes_post(f"/api/cron/jobs/{job_id}", body={"updates": updates}, method="PUT")
+        return await self._api.post(f"/api/cron/jobs/{job_id}", body={"updates": updates}, method="PUT")
 
     async def _rpc_cron_delete(self, p: Dict[str, Any]) -> Any:
         # (#46) DELETE on the bare job resource, unlike pause/resume/trigger's
         # POST-to-an-action-sub-path — matches upstream's real REST route
         # (hermes_cli/web_routers/cron.py), not a _rpc_cron_action suffix-call.
         job_id = _require(p, "id", "missing_job_id")
-        return await self._hermes_post(f"/api/cron/jobs/{job_id}", method="DELETE")
+        return await self._api.post(f"/api/cron/jobs/{job_id}", method="DELETE")
 
     async def _rpc_cron_runs(self, p: Dict[str, Any]) -> Any:
         job_id = _require(p, "job_id", "missing_job_id")
         limit = int(p.get("limit", 20))
-        return await self._hermes_get(f"/api/cron/jobs/{job_id}/runs?limit={limit}")
+        return await self._api.get(f"/api/cron/jobs/{job_id}/runs?limit={limit}")
 
     async def _rpc_runs_start(self, p: Dict[str, Any]) -> Any:
-        run_data = await self._hermes_post("/v1/runs", body=p)
+        run_data = await self._api.post("/v1/runs", body=p)
         run_id = str(run_data.get("run_id") or run_data.get("id") or "").strip()
         if not run_id:
             raise _RpcError("no_run_id_in_response")
@@ -1834,7 +1642,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         if task:
             task.cancel()
         try:
-            await self._hermes_post(f"/v1/runs/{run_id}/stop")
+            await self._api.post(f"/v1/runs/{run_id}/stop")
         except Exception:
             pass
         return {"stopped": True}
@@ -1845,7 +1653,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         if not run_id or not approval_id:
             raise _RpcError("missing_run_id_or_approval_id")
         decision = str(p.get("decision", "approve")).strip()
-        result = await self._hermes_post(f"/v1/runs/{run_id}/approval/{approval_id}/{decision}")
+        result = await self._api.post(f"/v1/runs/{run_id}/approval/{approval_id}/{decision}")
         self._evict_approval(approval_id)
         return result
 
@@ -2025,8 +1833,10 @@ class HermesBridgeAdapter(BasePlatformAdapter):
 
         last_exc: Optional[Exception] = None
         saw_dashboard = False
-        for port in self._ports_to_probe():
-            token = await self._ensure_hermes_token(port)
+        # Dashboard candidates, not ports_to_probe(): `/api/ws` is a dashboard
+        # route, and api_server's port serves no HTML to scrape a token from.
+        for port in self._api.dashboard_candidates():
+            token = await self._api.token(port)
             if not token:
                 continue
             saw_dashboard = True
@@ -2172,7 +1982,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         )
         path = f"/api/sessions/{quote(stored_id, safe='')}/messages?{qs}"
         try:
-            raw = await self._hermes_get(path)
+            raw = await self._api.get(path)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 raise _RpcError("chat_expired") from exc
@@ -2471,24 +2281,24 @@ class HermesBridgeAdapter(BasePlatformAdapter):
     # method name → handler(self, params). Plain functions (dict values don't
     # bind), so _handle_rpc calls handler(self, params) explicitly.
     _RPC_HANDLERS: Dict[str, Any] = {
-        "sessions.list": lambda self, p: self._hermes_get("/api/sessions"),
+        "sessions.list": lambda self, p: self._api.get("/api/sessions"),
         "sessions.messages": _rpc_sessions_messages,
         "sessions.switch": _rpc_sessions_switch,
         "sessions.delete": _rpc_sessions_delete,
         "sessions.search": _rpc_sessions_search,
         "sessions.export": _rpc_sessions_export,
-        "skills.list": lambda self, p: self._hermes_get("/api/skills"),
+        "skills.list": lambda self, p: self._api.get("/api/skills"),
         "skills.toggle": _rpc_skills_toggle,
         "skills.content": _rpc_skills_content,
         "skills.hub.search": _rpc_skills_hub_search,
         "skills.hub.install": _rpc_skills_hub_install,
         "skills.hub.uninstall": _rpc_skills_hub_uninstall,
-        "skills.hub.update": lambda self, p: self._hermes_post("/api/skills/hub/update", body={}),
+        "skills.hub.update": lambda self, p: self._api.post("/api/skills/hub/update", body={}),
         "agent.status": _rpc_agent_status,
         "agent.set_model": _rpc_agent_set_model,
         "usage.get": _rpc_usage_get,
-        "model.options": lambda self, p: self._hermes_get("/api/model/options"),
-        "cron.list": lambda self, p: self._hermes_get("/api/cron/jobs"),
+        "model.options": lambda self, p: self._api.get("/api/model/options"),
+        "cron.list": lambda self, p: self._api.get("/api/cron/jobs"),
         "cron.pause": lambda self, p: self._rpc_cron_action(p, "pause"),
         "cron.resume": lambda self, p: self._rpc_cron_action(p, "resume"),
         "cron.trigger": lambda self, p: self._rpc_cron_action(p, "trigger"),
@@ -2516,181 +2326,6 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         "bots.close": _rpc_bots_close,
         "bots.history": _rpc_bots_history,
     }
-
-    def _fetch_session_token(self, port: int) -> Optional[str]:
-        """Extract the Hermes dashboard session token from the SPA HTML.
-
-        Tries multiple patterns to handle different Hermes versions:
-          - 0.16+:  SESSION_TOKEN__="<token>"
-          - older:  SESSION_TOKEN__ = "<token>"  (spaces around =)
-          - JSON:   "sessionToken":"<token>"
-        """
-        try:
-            with urllib.request.urlopen(f"http://localhost:{port}/", timeout=5) as r:
-                html = r.read().decode()
-            for pat in [
-                r'SESSION_TOKEN__\s*=\s*["\']([^"\']+)["\']',
-                r'"sessionToken"\s*:\s*"([^"]+)"',
-                r"'sessionToken'\s*:\s*'([^']+)'",
-            ]:
-                m = re.search(pat, html)
-                if m:
-                    return m.group(1)
-            logger.debug("[hermes_bridge] session token not found in Hermes HTML on port %d", port)
-            return None
-        except Exception as exc:
-            logger.debug("[hermes_bridge] _fetch_session_token port %d: %s", port, exc)
-            return None
-
-    async def _ensure_hermes_token(self, port: int) -> Optional[str]:
-        """Return cached token or bootstrap from env var / SPA HTML.
-
-        Priority:
-          1. In-process cache (set once per gateway lifetime, cleared on 401)
-          2. HERMES_SESSION_TOKEN env var (manual override — useful when HTML
-             extraction fails on a Hermes version that changed the token format)
-          3. Scrape from Hermes dashboard HTML
-        """
-        cached = self._hermes_session_tokens.get(port)
-        if cached:
-            return cached
-        env_token = os.getenv("HERMES_SESSION_TOKEN")
-        if env_token:
-            self._hermes_session_tokens[port] = env_token
-            return env_token
-        loop = asyncio.get_event_loop()
-        token = await loop.run_in_executor(None, self._fetch_session_token, port)
-        if token:
-            self._hermes_session_tokens[port] = token
-        return token
-
-    def _ports_to_probe(self) -> List[int]:
-        """Return ports to try in priority order, deduplicated.
-
-        0. HERMES_BRIDGE_API_PORT — escape hatch for a dashboard psutil
-           discovery cannot see (psutil missing, AccessDenied, or a command
-           line that does not look like `hermes ... dashboard`). Without it,
-           such a user gets `hermes_offline` on every Agent tab from a
-           dashboard that is in fact running, with nothing to change.
-        1. Cached known-good port (fast path, avoids re-probing).
-        2. Live psutil discovery (handles --port 0 / auto-assigned ports).
-        3. Static fallback list (well-known defaults).
-        """
-        override = os.getenv("HERMES_BRIDGE_API_PORT", "").strip()
-        candidates: List[int] = [int(override)] if override.isdigit() else []
-        if self._hermes_api_port is not None:
-            candidates.append(self._hermes_api_port)
-        candidates += _discover_dashboard_ports()
-        candidates += _HERMES_API_PORTS
-
-        seen = set()
-        ordered = []
-        for port in candidates:
-            if port not in seen:
-                seen.add(port)
-                ordered.append(port)
-        return ordered
-
-    async def _hermes_request(
-        self,
-        path: str,
-        method: str = "GET",
-        body: Optional[Dict[str, Any]] = None,
-    ) -> Any:
-        """Shared GET/POST/PUT helper: port-probe with cache, 401 token refresh."""
-        loop = asyncio.get_event_loop()
-        body_bytes = (json.dumps(body).encode() if body is not None else b"{}") if method != "GET" else None
-        last_exc: Optional[Exception] = None
-
-        for port in self._ports_to_probe():
-            url = f"http://localhost:{port}{path}"
-            token = await self._ensure_hermes_token(port)
-
-            def _do(u=url, t=token, m=method, b=body_bytes):
-                headers: Dict[str, str] = {}
-                if t:
-                    headers["X-Hermes-Session-Token"] = t
-                if b is not None:
-                    headers["Content-Type"] = "application/json"
-                    headers["Content-Length"] = str(len(b))
-                req = urllib.request.Request(u, method=m, data=b, headers=headers)
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    raw = resp.read()
-                    return json.loads(raw.decode()) if raw else {"ok": True}
-
-            try:
-                result = await loop.run_in_executor(None, _do)
-                # Cache this port so future calls skip the probe loop.
-                self._hermes_api_port = port
-                return result
-            except urllib.error.HTTPError as exc:
-                if exc.code not in (401, 404):
-                    # A live Hermes dashboard answered — this IS the working
-                    # port; the request itself was rejected (validation 4xx /
-                    # server 5xx). Do NOT keep probing: other ports would just
-                    # refuse the connection and bury this error (losing e.g. a
-                    # cron schedule-parse 400 detail), and re-sending a POST to
-                    # them would replay a non-idempotent request.
-                    self._hermes_api_port = port
-                    raise
-                if exc.code == 404:
-                    # 404 means SOMETHING is listening but it does not serve
-                    # this route -- i.e. the wrong service, not a bad request.
-                    # Treating it as proof of the working port is what pinned
-                    # this adapter to the api_server platform on 8642 and made
-                    # every Agent-tab RPC fail with a 404 that looked like a
-                    # real answer (issue 64). Keep probing instead.
-                    last_exc = exc
-                    if port == self._hermes_api_port:
-                        self._hermes_api_port = None
-                    continue
-                # 401: token stale — clear THIS port's token and retry once
-                # with a freshly extracted one.
-                self._hermes_session_tokens.pop(port, None)
-                fresh = await self._ensure_hermes_token(port)
-                if fresh and fresh != token:
-                    try:
-                        def _retry(u=url, t=fresh, m=method, b=body_bytes):
-                            headers: Dict[str, str] = {"X-Hermes-Session-Token": t}
-                            if b is not None:
-                                headers["Content-Type"] = "application/json"
-                                headers["Content-Length"] = str(len(b))
-                            req = urllib.request.Request(u, method=m, data=b, headers=headers)
-                            with urllib.request.urlopen(req, timeout=5) as r:
-                                raw = r.read()
-                                return json.loads(raw.decode()) if raw else {"ok": True}
-                        result = await loop.run_in_executor(None, _retry)
-                        self._hermes_api_port = port
-                        return result
-                    except Exception as e2:
-                        last_exc = e2
-                else:
-                    # Token extraction itself is failing — no point retrying other ports
-                    # for auth; but still try them in case one allows unauthenticated access.
-                    logger.warning(
-                        "[hermes_bridge] 401 from port %d and token re-extraction failed — "
-                        "Hermes may require auth but SESSION_TOKEN__ is not in the HTML. "
-                        "Check Hermes version or set HERMES_SESSION_TOKEN env var.",
-                        port,
-                    )
-                    last_exc = exc
-            except Exception as exc:
-                last_exc = exc
-                # Clear port cache on connection-level errors.
-                if port == self._hermes_api_port:
-                    self._hermes_api_port = None
-
-        raise last_exc or RuntimeError("no hermes api port reachable")
-
-    async def _hermes_get(self, path: str) -> Any:
-        """GET from Hermes local REST API."""
-        return await self._hermes_request(path, method="GET")
-
-    async def _hermes_post(
-        self, path: str, body: Optional[Dict[str, Any]] = None, method: str = "POST"
-    ) -> Any:
-        """POST/PUT to Hermes local REST API."""
-        return await self._hermes_request(path, method=method, body=body)
 
     # ── Reaction-ack lifecycle (#45): 👀 → ✅/❌ ─────────────────────────
     #
@@ -3071,15 +2706,15 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         q: asyncio.Queue = asyncio.Queue()
         # Token is typically already cached by the preceding runs.start POST.
         # Resolve it before spawning the thread so the thread stays synchronous.
-        probe_port = self._hermes_api_port or _HERMES_API_PORTS[0]
-        session_token = await self._ensure_hermes_token(probe_port)
+        probe_port = self._api.port or API_SERVER_PORT
+        session_token = await self._api.token(probe_port)
 
         def _sse_thread(port: int) -> None:
             url = f"http://localhost:{port}/v1/runs/{run_id}/events"
             try:
                 headers: Dict[str, str] = {"Accept": "text/event-stream"}
                 if session_token:
-                    headers["X-Hermes-Session-Token"] = session_token
+                    headers[SESSION_HEADER] = session_token
                 req = urllib.request.Request(url, headers=headers)
                 with urllib.request.urlopen(req, timeout=300) as resp:
                     current: Dict[str, Any] = {}
@@ -3101,7 +2736,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 asyncio.run_coroutine_threadsafe(q.put(("error", str(exc))), loop)
 
         # Use cached working port; fall back to first default if none known yet.
-        sse_port = self._hermes_api_port or _HERMES_API_PORTS[0]
+        sse_port = self._api.port or API_SERVER_PORT
         t = threading.Thread(target=_sse_thread, args=(sse_port,), daemon=True)
         t.start()
         started = True
