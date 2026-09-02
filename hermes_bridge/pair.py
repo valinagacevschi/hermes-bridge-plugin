@@ -23,6 +23,7 @@ python3 works.
 import binascii
 import json
 import os
+import socket
 import sys
 import urllib.error
 import urllib.request
@@ -36,7 +37,14 @@ ENV_KEYS = (
     "HERMES_BRIDGE_API_KEY",
     "HERMES_BRIDGE_ALLOWED_USERS",
     "HERMES_BRIDGE_HOME_CHANNEL",
+    # Only ever set by hand — the escape hatch for a dashboard on a port the
+    # adapter's psutil discovery cannot see. Read here so the readiness check
+    # probes the same port the adapter will.
+    "HERMES_BRIDGE_API_PORT",
 )
+# Dashboard defaults, mirroring adapter.py's _HERMES_API_PORTS. 8642 is left
+# out: it belongs to the api_server platform, which a bridge install has off.
+_API_PORTS = (9119, 9120)
 # Every inbound frame reports this one synthetic user id (adapter.py's two
 # build_source calls) — one phone or five, they are all "mobile".
 ADAPTER_USER_ID = "mobile"
@@ -175,6 +183,30 @@ def set_home_channel(env_file: Path, env: dict, profile_id: str) -> None:
     print(f"Set this chat as the home channel for cron results and notifications")
 
 
+def dashboard_port(env: dict) -> Optional[int]:
+    """Return a localhost port that accepts a connection, or None.
+
+    Chat only needs the gateway, but every Agent-tab screen (sessions, skills,
+    cron, runs, usage, memory) is an RPC the adapter proxies to Hermes' local
+    dashboard REST API — a SEPARATE process the gateway does not start. With no
+    dashboard running, chat works perfectly and every Agent tab shows
+    `hermes_offline`.
+
+    A TCP connect is all this can honestly check: the routes are session-token
+    gated, and the token is scraped out of the dashboard's own HTML at request
+    time. Something listening on a Hermes port is enough of a signal.
+    """
+    override = env.get("HERMES_BRIDGE_API_PORT", "").strip()
+    ports = ([int(override)] if override.isdigit() else []) + list(_API_PORTS)
+    for port in ports:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                return port
+        except OSError:
+            continue
+    return None
+
+
 def readiness_report(hermes_home: Path, env: dict) -> list:
     """Check the things that only fail at first use, and say how to fix them.
 
@@ -215,6 +247,17 @@ def readiness_report(hermes_home: Path, env: dict) -> list:
             False,
             "no home channel — cron results have nowhere to go, and Hermes will ask",
             "re-run this script, or send /sethome from the app",
+        ))
+
+    port = dashboard_port(env)
+    if port:
+        checks.append((True, f"dashboard API on :{port} — the Agent tab can load", ""))
+    else:
+        checks.append((
+            False,
+            "no dashboard API — chat works but every Agent tab shows hermes_offline",
+            "run `hermes dashboard --no-open`; if it already runs on another "
+            "port, add HERMES_BRIDGE_API_PORT=<port> to " f"{hermes_home}/.env",
         ))
 
     allowed = [u.strip() for u in env.get("HERMES_BRIDGE_ALLOWED_USERS", "").split(",")]

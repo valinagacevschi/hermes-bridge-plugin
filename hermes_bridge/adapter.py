@@ -92,10 +92,16 @@ _INBOUND_REPLAY_GRACE_S = 30.0
 # _discover_dashboard_ports() finds its real port via psutil first and these are
 # only the fallback.
 #
-# Note 8642 cannot currently be relied on: enabling the api_server platform is
-# what silently breaks reply delivery (issue 62), so a working chat setup has it
-# off and the `/v1/*` routes are unreachable. That trade-off is issue 62's to
-# resolve, not something the port list can fix.
+# 8642 is safe to enable again (issue 62): this adapter no longer squats on
+# `Platform.API_SERVER`, so core's own api_server platform can hold that value
+# without one adapter overwriting the other in the gateway's registry. It is
+# still OFF by default, and `runs.*` is the only thing that needs it — with the
+# dashboard alone every other tab works and Runs/Approvals report offline.
+#
+# Neither service starts with the gateway. `hermes dashboard` serves 9119;
+# nothing at all serves these ports on a fresh install, which is what made the
+# whole Agent tab report `hermes_offline` while chat was healthy. See
+# pair.py's readiness report and HERMES_BRIDGE_API_PORT below.
 _HERMES_API_PORTS = [9119, 9120, 8642]
 # Dedup window: retried RPC requests (same rpc.id) within this window are no-ops.
 _RPC_DEDUP_WINDOW_S = 30.0
@@ -457,7 +463,12 @@ def _discover_dashboard_ports() -> List[int]:
                 if "hermes" not in cmd_str or "dashboard" not in cmd_str:
                     continue
                 is_profile = "--profile" in cmd_str
-                for conn in proc.connections("inet"):
+                # `Process.connections` is a deprecated shim for
+                # `net_connections` in psutil 6+ (core pins 7.2.2) and is
+                # slated for removal — when it goes, the AttributeError would
+                # land in the outer catch and silently return no ports at all.
+                list_conns = getattr(proc, "net_connections", None) or proc.connections
+                for conn in list_conns("inet"):
                     if conn.status == "LISTEN":
                         port = conn.laddr.port
                         if is_profile:
@@ -2441,28 +2452,31 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         return token
 
     def _ports_to_probe(self) -> List[int]:
-        """Return ports to try in priority order.
+        """Return ports to try in priority order, deduplicated.
 
+        0. HERMES_BRIDGE_API_PORT — escape hatch for a dashboard psutil
+           discovery cannot see (psutil missing, AccessDenied, or a command
+           line that does not look like `hermes ... dashboard`). Without it,
+           such a user gets `hermes_offline` on every Agent tab from a
+           dashboard that is in fact running, with nothing to change.
         1. Cached known-good port (fast path, avoids re-probing).
         2. Live psutil discovery (handles --port 0 / auto-assigned ports).
         3. Static fallback list (well-known defaults).
         """
+        override = os.getenv("HERMES_BRIDGE_API_PORT", "").strip()
+        candidates: List[int] = [int(override)] if override.isdigit() else []
         if self._hermes_api_port is not None:
-            # Cached port first; keep others as fallback for Hermes restart.
-            discovered = _discover_dashboard_ports()
-            rest = [p for p in (discovered + _HERMES_API_PORTS) if p != self._hermes_api_port]
-            # Deduplicate while preserving order.
-            seen = {self._hermes_api_port}
-            deduped_rest = []
-            for p in rest:
-                if p not in seen:
-                    seen.add(p)
-                    deduped_rest.append(p)
-            return [self._hermes_api_port] + deduped_rest
+            candidates.append(self._hermes_api_port)
+        candidates += _discover_dashboard_ports()
+        candidates += _HERMES_API_PORTS
 
-        discovered = _discover_dashboard_ports()
-        combined = discovered + [p for p in _HERMES_API_PORTS if p not in discovered]
-        return combined if combined else _HERMES_API_PORTS
+        seen = set()
+        ordered = []
+        for port in candidates:
+            if port not in seen:
+                seen.add(port)
+                ordered.append(port)
+        return ordered
 
     async def _hermes_request(
         self,

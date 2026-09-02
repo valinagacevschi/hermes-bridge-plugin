@@ -343,6 +343,24 @@ class TestHermesRequestPortSelection(unittest.IsolatedAsyncioTestCase):
 
         assert adapter._hermes_api_port is None, "a 404 must not leave the wrong port pinned"
 
+    async def test_api_port_override_is_tried_first(self):
+        """psutil discovery is the only thing that finds a --port 0 dashboard.
+        When it comes up empty (no psutil, AccessDenied, an unfamiliar command
+        line), a running dashboard still reads as hermes_offline with nothing
+        the user can change — HERMES_BRIDGE_API_PORT is that escape hatch."""
+        adapter = _make_adapter()
+        adapter._hermes_api_port = 9120  # a stale pin must not outrank it
+
+        with patch.dict(os.environ, {"HERMES_BRIDGE_API_PORT": "51234"}), patch(
+            "hermes_bridge.adapter._discover_dashboard_ports",
+            return_value=[],
+        ):
+            ports = adapter._ports_to_probe()
+
+        assert ports[0] == 51234, f"the override must be probed first: {ports}"
+        assert 9119 in ports, "the defaults stay as fallbacks"
+        assert len(ports) == len(set(ports)), f"ports must be deduplicated: {ports}"
+
     async def test_both_local_services_stay_in_the_probe_list(self):
         """The adapter talks to two local services through one probe loop: the
         dashboard (/api/* routes, default 9119) and the api_server platform

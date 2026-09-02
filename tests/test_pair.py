@@ -11,6 +11,7 @@ would have to fake.
 
 import json
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -186,6 +187,26 @@ class PairScriptTest(unittest.TestCase):
         with patch.object(pair.os, "execv") as execv:
             self._run()
         execv.assert_not_called()
+
+    def test_reports_the_dashboard_api_only_when_something_answers(self):
+        """The Agent tab's every RPC needs the local dashboard, which the
+        gateway does not start — so a healthy chat proves nothing about it."""
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            live_port = listener.getsockname()[1]
+            env = {"HERMES_BRIDGE_API_PORT": str(live_port)}
+            self.assertEqual(pair.dashboard_port(env), live_port)
+
+        # Same port, nothing listening now — and no fallback may rescue it.
+        with patch.object(pair, "_API_PORTS", ()):
+            self.assertIsNone(pair.dashboard_port(env))
+
+        labels = [label for _, label, _ in pair.readiness_report(self.home, env)]
+        self.assertTrue(
+            any("dashboard API" in label for label in labels),
+            f"the readiness report must cover the dashboard: {labels}",
+        )
 
     def test_second_run_repairs_without_reprovisioning(self):
         self._run()

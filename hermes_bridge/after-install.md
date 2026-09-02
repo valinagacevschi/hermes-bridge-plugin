@@ -1,4 +1,4 @@
-# Hermes Bridge — two steps left
+# Hermes Bridge — three steps left
 
 **1. Install the two dependencies** (Hermes ships `websockets`, but neither of
 these, and it never installs plugin dependencies for you):
@@ -23,6 +23,21 @@ default-denies any sender with no allowlist configured. Answer *yes* to the enab
 
 Re-run `pair.py` any time to pair another phone or replace an expired invite —
 it reuses the same profile.
+
+**3. Leave the dashboard running** — the app's Agent screen (sessions, skills,
+cron, runs, approvals, usage, memory) reads Hermes through its local REST API,
+which lives in the dashboard process, not the gateway:
+
+    hermes dashboard --no-open
+
+Chat works without it; the Agent screen shows `hermes_offline` on every tab
+until it runs. Already running on a non-default port and still offline? Add
+`HERMES_BRIDGE_API_PORT=<port>` to `~/.hermes/.env`. `pair.py --check` reports
+this and everything else above without touching the relay.
+
+The Runs and Approvals tabs need one more surface — Hermes' `/v1/runs` routes.
+Set `platforms.api_server.enabled: true` in `~/.hermes/config.yaml` for those
+two; every other tab works on the dashboard alone.
 
 To upgrade later, reinstall with `--force`. `hermes plugins update` cannot
 work here: this plugin installs from a subdirectory, so its directory holds no

@@ -57,6 +57,7 @@ hermes plugins install valinagacevschi/hermes-bridge-plugin/hermes_bridge
 ~/.hermes/hermes-agent/venv/bin/pip install "PyNaCl>=1.6,<1.7" "qrcode>=7.4,<8"
 python3 ~/.hermes/plugins/hermes_bridge/pair.py
 hermes gateway restart
+hermes dashboard --no-open   # only the Agent screen needs this — see below
 ```
 
 Answer **yes** to the installer's "Enable now?" prompt (that writes `plugins.enabled` for
@@ -65,8 +66,8 @@ without the subdir and Hermes clones the whole repo, README included, which its 
 security scanner flags.
 
 `pair.py` finishes with a readiness report — dependencies importable, sender allowlisted,
-plugin actually enabled — and prints the fix for anything that fails. To re-run those
-checks later without minting an invite:
+home channel set, dashboard API answering, plugin actually enabled — and prints the fix for
+anything that fails. To re-run those checks later without minting an invite:
 
 ```bash
 python3 ~/.hermes/plugins/hermes_bridge/pair.py --check
@@ -121,6 +122,7 @@ Written by `pair.py` into `~/.hermes/.env`; listed in `hermes config` for inspec
 | `HERMES_BRIDGE_API_KEY` | minted by `pair.py` |
 | `HERMES_BRIDGE_ALLOWED_USERS` | `mobile` — written by `pair.py`, see below |
 | `HERMES_BRIDGE_HOME_CHANNEL` | your `profile_id` — where cron results are delivered |
+| `HERMES_BRIDGE_API_PORT` | optional, by hand only — the dashboard's port when it is not 9119 |
 
 Hermes authorizes senders per platform and **default-denies when no allowlist is
 configured**, answering the first message with "I don't recognize you yet" and a pairing
@@ -213,6 +215,14 @@ were delivered to the wrong adapter and silently dropped. It now registers as
   (it mints a fresh invite and reprints, so an expired one costs nothing). If you installed
   `qrcode` and still get the payload, your copy of `pair.py` predates the fix that re-execs
   it under the Hermes venv's interpreter — reinstall with `--force` (above).
+- **Chat works but the app's Agent screen says `hermes_offline` on every tab** — the two
+  features talk to different processes. Chat needs only the gateway; the Agent screen reads
+  Hermes through its local dashboard REST API, which `hermes dashboard` serves and the
+  gateway does not start. Run `hermes dashboard --no-open` and pull to refresh. If a
+  dashboard is already running on a non-default port, add `HERMES_BRIDGE_API_PORT=<port>`
+  to `~/.hermes/.env` and restart the gateway. The Runs and Approvals tabs want one more
+  surface — `platforms.api_server.enabled: true` in `~/.hermes/config.yaml` — because they
+  post to Hermes' `/v1/runs` routes rather than the dashboard's.
 - **"Hi, I don't recognize you yet" + a pairing code, after a successful pairing** — the
   platform allowlist is missing. Re-run `pair.py` (it writes it and is safe to re-run), or
   run the `hermes pairing approve hermes_bridge <code>` that the message gives you. An
