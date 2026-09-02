@@ -37,7 +37,9 @@ this and everything else above without touching the relay.
 
 The Runs and Approvals tabs need one more surface — Hermes' `/v1/runs` routes.
 Set `platforms.api_server.enabled: true` in `~/.hermes/config.yaml` for those
-two; every other tab works on the dashboard alone.
+two, then send one chat message to confirm replies still arrive: that setting
+collided with an older version of this plugin, and the fix is not yet verified
+on a live gateway. Every other tab works on the dashboard alone.
 
 To upgrade later, reinstall with `--force`. `hermes plugins update` cannot
 work here: this plugin installs from a subdirectory, so its directory holds no

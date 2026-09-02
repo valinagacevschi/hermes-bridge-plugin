@@ -222,7 +222,9 @@ were delivered to the wrong adapter and silently dropped. It now registers as
   dashboard is already running on a non-default port, add `HERMES_BRIDGE_API_PORT=<port>`
   to `~/.hermes/.env` and restart the gateway. The Runs and Approvals tabs want one more
   surface — `platforms.api_server.enabled: true` in `~/.hermes/config.yaml` — because they
-  post to Hermes' `/v1/runs` routes rather than the dashboard's.
+  post to Hermes' `/v1/runs` routes rather than the dashboard's. Send a chat message after
+  enabling it: that setting collided with an older version of this plugin, and the fix for
+  the collision has not been verified on a live gateway yet.
 - **"Hi, I don't recognize you yet" + a pairing code, after a successful pairing** — the
   platform allowlist is missing. Re-run `pair.py` (it writes it and is safe to re-run), or
   run the `hermes pairing approve hermes_bridge <code>` that the message gives you. An

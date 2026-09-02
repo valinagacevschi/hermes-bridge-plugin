@@ -202,11 +202,17 @@ class PairScriptTest(unittest.TestCase):
         with patch.object(pair, "_API_PORTS", ()):
             self.assertIsNone(pair.dashboard_port(env))
 
-        labels = [label for _, label, _ in pair.readiness_report(self.home, env)]
+            report = pair.readiness_report(self.home, env)
+
+        labels = [label for _, label, _ in report]
         self.assertTrue(
             any("dashboard API" in label for label in labels),
             f"the readiness report must cover the dashboard: {labels}",
         )
+        # Advisory only: pair.py runs before the operator starts the dashboard,
+        # so a missing one must not fail `--check` on a healthy pairing.
+        dashboard_ok = [ok for ok, label, _ in report if "dashboard API" in label]
+        self.assertEqual(dashboard_ok, [True])
 
     def test_second_run_repairs_without_reprovisioning(self):
         self._run()

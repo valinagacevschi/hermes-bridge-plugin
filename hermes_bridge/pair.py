@@ -249,16 +249,20 @@ def readiness_report(hermes_home: Path, env: dict) -> list:
             "re-run this script, or send /sethome from the app",
         ))
 
+    # Advisory, deliberately never a ✗: chat does not need the dashboard, and
+    # it is a separate long-running process the operator may well start after
+    # this script. Failing the exit code on it would red-flag a pairing that
+    # actually succeeded — the false alarm this whole report exists to avoid.
     port = dashboard_port(env)
-    if port:
-        checks.append((True, f"dashboard API on :{port} — the Agent tab can load", ""))
-    else:
-        checks.append((
-            False,
-            "no dashboard API — chat works but every Agent tab shows hermes_offline",
-            "run `hermes dashboard --no-open`; if it already runs on another "
-            "port, add HERMES_BRIDGE_API_PORT=<port> to " f"{hermes_home}/.env",
-        ))
+    checks.append((
+        True,
+        f"dashboard API on :{port} — the Agent tab can load"
+        if port
+        else "no dashboard API yet — chat is unaffected, but the Agent tab needs "
+        "`hermes dashboard --no-open` (or HERMES_BRIDGE_API_PORT=<port> in "
+        f"{hermes_home}/.env if it runs on another port)",
+        "",
+    ))
 
     allowed = [u.strip() for u in env.get("HERMES_BRIDGE_ALLOWED_USERS", "").split(",")]
     if ADAPTER_USER_ID in allowed:

@@ -92,11 +92,14 @@ _INBOUND_REPLAY_GRACE_S = 30.0
 # _discover_dashboard_ports() finds its real port via psutil first and these are
 # only the fallback.
 #
-# 8642 is safe to enable again (issue 62): this adapter no longer squats on
-# `Platform.API_SERVER`, so core's own api_server platform can hold that value
-# without one adapter overwriting the other in the gateway's registry. It is
-# still OFF by default, and `runs.*` is the only thing that needs it — with the
-# dashboard alone every other tab works and Runs/Approvals report offline.
+# 8642 SHOULD be enableable again (issue 62) — UNVERIFIED on a live gateway.
+# This adapter no longer squats on `Platform.API_SERVER`, so core's own
+# api_server platform can hold that value without one adapter overwriting the
+# other in the gateway's registry. That is read off the registry code, not
+# observed, and the last confident claim about this exact config silently ate
+# every reply. Flip it and send one message before relying on it. It is OFF by
+# default, and `runs.*` is the only thing that needs it — with the dashboard
+# alone every other tab works and Runs/Approvals report offline.
 #
 # Neither service starts with the gateway. `hermes dashboard` serves 9119;
 # nothing at all serves these ports on a fresh install, which is what made the
