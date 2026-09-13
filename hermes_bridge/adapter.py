@@ -30,6 +30,7 @@ from gateway.platforms.base import (
 from .capability import CapabilityDescriptor
 from .crypto import load_psk, open_blob, open_frame, seal, seal_blob
 from .local_api import API_SERVER_PORT, SESSION_HEADER, LocalApi
+from .operation_dispatch import OperationDispatcher, _LocalRpcError, _RpcError
 
 logger = logging.getLogger(__name__)
 
@@ -72,9 +73,6 @@ _RECONNECT_MAX = 30.0
 # JSON frames over a live WS.
 _INBOUND_REPLAY_GRACE_S = 30.0
 
-# Dedup window: retried RPC requests (same rpc.id) within this window are no-ops.
-_RPC_DEDUP_WINDOW_S = 30.0
-
 # Interactive-controls prompt lifetime (#42), seconds — mirrors upstream
 # tools.slash_confirm.resolve's own default `timeout=300`. Embedded in every
 # `prompt` frame as an ABSOLUTE `expires_at` (epoch ms), not a relative
@@ -84,39 +82,6 @@ _RPC_DEDUP_WINDOW_S = 30.0
 # open_frame() after use. Comparing wall-clock against an absolute deadline
 # sidesteps that entirely.
 _PROMPT_TIMEOUT_S = 300.0
-
-
-def _http_error_detail(exc: "urllib.error.HTTPError") -> str:
-    """Extract FastAPI's ``{"detail": "..."}`` from an HTTPError body.
-
-    Hermes's local dashboard API returns 400 with a human-readable ``detail``
-    message for validation errors (e.g. an unparseable cron schedule string —
-    ``hermes_cli/web_server.py`` ``_create_cron_job_sync``/``_update_cron_job_sync``).
-    Falls back to the bare exception string if the body isn't the expected
-    shape. Read the body at most once — HTTPError is a file-like object.
-    """
-    try:
-        body = exc.read()
-        data = json.loads(body.decode())
-        detail = data.get("detail") if isinstance(data, dict) else None
-        if detail:
-            return str(detail)
-    except Exception:
-        pass
-    return str(exc)
-
-
-class _RpcError(Exception):
-    """Validation failure inside an RPC handler — str(exc) is the wire error code."""
-
-
-class _LocalRpcError(Exception):
-    """JSON-RPC error from the local /api/ws door. `code` is Hermes' numeric code."""
-
-    def __init__(self, code: int, message: str):
-        super().__init__(message)
-        self.code = int(code)
-        self.message = message
 
 
 def _require(params: Dict[str, Any], key: str, error: str) -> str:
@@ -428,8 +393,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         self._profile_id: str = os.getenv("HERMES_BRIDGE_PROFILE_ID", "")
         self._api_key: str = os.getenv("HERMES_BRIDGE_API_KEY", "")
         self._psk: bytes = load_psk()  # raises RuntimeError if absent — hard fail on startup
-        # rpc.id → received_at (epoch); pruned lazily to prevent unbounded growth.
-        self._seen_rpc_ids: Dict[str, float] = {}
+        self._rpc_dispatcher = OperationDispatcher(self)
         # run_id → asyncio.Task; cancelled on disconnect or runs.stop.
         self._active_run_tasks: Dict[str, asyncio.Task] = {}
         # approval_id → {id, run_id, message, timestamp, command, choices}.
@@ -480,6 +444,10 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         # preview is deliberately not persisted, so if the stream dies before
         # finalize nothing else ever will — see edit_message's flush.
         self._stream_pending: set = set()
+        # Streaming msg_id -> phone-authored message id it answers. edit_message
+        # receives only the streaming id, so preserve reply correlation from
+        # the initial send through every replacement/final frame.
+        self._stream_reply_to: Dict[str, str] = {}
         # Local JSON-RPC door to Hermes' /api/ws (PRD_Bots.md). Isolated from
         # the relay socket and from REST-backed RPCs. Connect lazily on the
         # first bots.* op so a laptop that never opens the Bots tab never
@@ -572,6 +540,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             # Any stream still awaiting its finalize died with the socket. The
             # flush in edit_message already ran for whichever edit failed.
             self._stream_pending.clear()
+            self._stream_reply_to.clear()
             if self._should_run:
                 logger.info("[hermes_bridge] reconnecting to relay…")
                 await asyncio.sleep(backoff * (0.8 + 0.4 * random.random()))
@@ -719,6 +688,12 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         expect_edits = edit_requested and self._supports("edit")
 
         payload: Dict[str, Any] = {"role": "assistant", "content": content, "msg_id": msg_id}
+        if reply_to:
+            payload["reply_to"] = reply_to
+        if expect_edits:
+            # The seed is already a live preview. Without this marker the
+            # phone classifies and persists the partial text as a final reply.
+            payload["edit"] = True
         if is_unsolicited:
             payload["unsolicited"] = True
         if attachments:
@@ -740,6 +715,8 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             return result
         if expect_edits:
             self._stream_pending.add(msg_id)
+            if reply_to:
+                self._stream_reply_to[msg_id] = reply_to
         # message_id=None — ONLY when editing was requested but this relay
         # can't do it — is the signal GatewayStreamConsumer reads as
         # "edit-incapable"; it then sends the complete answer as a fresh
@@ -785,6 +762,9 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             "msg_id": message_id,
             "edit": True,
         }
+        reply_to = self._stream_reply_to.get(message_id)
+        if reply_to:
+            payload["reply_to"] = reply_to
         if finalize:
             payload["final"] = True
 
@@ -795,6 +775,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         )
         if finalize:
             self._stream_pending.discard(message_id)
+            self._stream_reply_to.pop(message_id, None)
             return result
         if result.success:
             return result
@@ -811,6 +792,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         # without updating sealed_frame (a partial would stick permanently).
         if message_id in self._stream_pending:
             self._stream_pending.discard(message_id)
+            self._stream_reply_to.pop(message_id, None)
             logger.warning(
                 "[hermes_bridge] stream %s died before finalize — persisting "
                 "the %d chars delivered so far",
@@ -1463,58 +1445,15 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         )
 
     async def _handle_rpc(self, payload: Dict[str, Any]) -> None:
-        """Dispatch an rpc.request frame via _RPC_HANDLERS and respond over WS."""
-        rpc = payload.get("rpc") or {}
-        rpc_id = rpc.get("id", "")
-        method = rpc.get("method", "")
-        params = rpc.get("params") or {}
-
-        # Idempotency: drop retried requests with the same rpc.id within the dedup window.
-        loop = asyncio.get_event_loop()
-        now = loop.time()
-        if rpc_id and rpc_id in self._seen_rpc_ids:
-            logger.debug("[hermes_bridge] rpc %s duplicate — skipping (dedup)", rpc_id)
-            return
-        if rpc_id:
-            self._seen_rpc_ids[rpc_id] = now
-            cutoff = now - _RPC_DEDUP_WINDOW_S
-            stale = [k for k, t in self._seen_rpc_ids.items() if t < cutoff]
-            for k in stale:
-                del self._seen_rpc_ids[k]
-
-        handler = self._RPC_HANDLERS.get(method)
-        if handler is None:
-            await self._send_rpc_response(rpc_id, ok=False, error="method_not_found")
-            return
-
-        try:
-            data = await handler(self, params)
-            await self._send_rpc_response(rpc_id, ok=True, data=data)
-        except _RpcError as exc:
-            await self._send_rpc_response(rpc_id, ok=False, error=str(exc))
-        except urllib.error.HTTPError as exc:
-            # A live Hermes answered but rejected the request. 401/403 keep the
-            # stable auth error code; anything else passes Hermes's own
-            # human-readable {"detail": "..."} through (e.g. an unparseable
-            # cron schedule from cron.create/cron.edit).
-            logger.warning("[hermes_bridge] rpc %s failed: HTTP %d", method, exc.code)
-            error = "hermes_auth_failed" if exc.code in (401, 403) else _http_error_detail(exc)
-            await self._send_rpc_response(rpc_id, ok=False, error=error)
-        except Exception as exc:
-            logger.warning("[hermes_bridge] rpc %s failed: %s — %s", method, type(exc).__name__, exc)
-            # Classify error so the client can distinguish "Hermes not running" from
-            # "auth failed" vs a transient API error.
-            err_str = str(exc).lower()
-            if "refused" in err_str or "no hermes api port reachable" in err_str or "timed out" in err_str:
-                error_code = "hermes_offline"
-            elif "401" in err_str or "unauthorized" in err_str or "auth" in err_str:
-                error_code = "hermes_auth_failed"
-            else:
-                error_code = "hermes_api_unavailable"
-            await self._send_rpc_response(rpc_id, ok=False, error=error_code)
+        """Dispatch an RPC frame through the operation policy module."""
+        dispatcher = getattr(self, "_rpc_dispatcher", None)
+        if dispatcher is None:  # test harnesses may construct via __new__.
+            dispatcher = OperationDispatcher(self)
+            self._rpc_dispatcher = dispatcher
+        await dispatcher.dispatch(payload)
 
     # ------------------------------------------------------------------
-    # RPC handlers — dispatched by _handle_rpc via _RPC_HANDLERS below.
+    # RPC handlers — invoked by OperationDispatcher through this host.
     # Contract: take a params dict, return the response data. Raise
     # _RpcError("<code>") for validation failures; let HTTPError and
     # connection errors propagate — _handle_rpc classifies them uniformly.
@@ -2277,55 +2216,6 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         return await self._fetch_bot_history(
             str(chat["stored_id"]), str(chat["name"]), token, offset, limit
         )
-
-    # method name → handler(self, params). Plain functions (dict values don't
-    # bind), so _handle_rpc calls handler(self, params) explicitly.
-    _RPC_HANDLERS: Dict[str, Any] = {
-        "sessions.list": lambda self, p: self._api.get("/api/sessions"),
-        "sessions.messages": _rpc_sessions_messages,
-        "sessions.switch": _rpc_sessions_switch,
-        "sessions.delete": _rpc_sessions_delete,
-        "sessions.search": _rpc_sessions_search,
-        "sessions.export": _rpc_sessions_export,
-        "skills.list": lambda self, p: self._api.get("/api/skills"),
-        "skills.toggle": _rpc_skills_toggle,
-        "skills.content": _rpc_skills_content,
-        "skills.hub.search": _rpc_skills_hub_search,
-        "skills.hub.install": _rpc_skills_hub_install,
-        "skills.hub.uninstall": _rpc_skills_hub_uninstall,
-        "skills.hub.update": lambda self, p: self._api.post("/api/skills/hub/update", body={}),
-        "agent.status": _rpc_agent_status,
-        "agent.set_model": _rpc_agent_set_model,
-        "usage.get": _rpc_usage_get,
-        "model.options": lambda self, p: self._api.get("/api/model/options"),
-        "cron.list": lambda self, p: self._api.get("/api/cron/jobs"),
-        "cron.pause": lambda self, p: self._rpc_cron_action(p, "pause"),
-        "cron.resume": lambda self, p: self._rpc_cron_action(p, "resume"),
-        "cron.trigger": lambda self, p: self._rpc_cron_action(p, "trigger"),
-        "cron.create": _rpc_cron_create,
-        "cron.edit": _rpc_cron_edit,
-        "cron.delete": _rpc_cron_delete,
-        "cron.runs": _rpc_cron_runs,
-        "runs.start": _rpc_runs_start,
-        "runs.stop": _rpc_runs_stop,
-        "approval.resolve": _rpc_approval_resolve,
-        "approvals.list": _rpc_approvals_list,
-        "memory.list": _rpc_memory_list,
-        "memory.delete": _rpc_memory_delete,
-        "memory.pending": _rpc_memory_pending,
-        "memory.approve": _rpc_memory_approve,
-        "memory.reject": _rpc_memory_reject,
-        "skills.pending": _rpc_skills_pending,
-        "skills.approve": _rpc_skills_pending_approve,
-        "skills.reject": _rpc_skills_pending_reject,
-        "skills.diff": _rpc_skills_pending_diff,
-        "chat.stop": _rpc_chat_stop,
-        "bots.list": _rpc_bots_list,
-        "bots.open": _rpc_bots_open,
-        "bots.send": _rpc_bots_send,
-        "bots.close": _rpc_bots_close,
-        "bots.history": _rpc_bots_history,
-    }
 
     # ── Reaction-ack lifecycle (#45): 👀 → ✅/❌ ─────────────────────────
     #

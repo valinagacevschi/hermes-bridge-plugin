@@ -4,12 +4,17 @@
 Run it once after installing the plugin:
 
     python3 ~/.hermes/plugins/hermes_bridge/pair.py
+    python3 ~/.hermes/plugins/hermes_bridge/pair.py --verbose
 
 First run provisions a self-serve profile + laptop API key, writes them to
 ``~/.hermes/.env``, authorizes the adapter's sender with Hermes, generates the
 end-to-end PSK at ``~/.hermes/psk``, and prints a QR holding ``{token, psk}``. Later runs reuse that profile and mint a
 fresh phone invite — run it again whenever an invite expires or a second phone
 needs pairing.
+
+Pass ``--verbose`` to print the complete provision response, credentials, PSK,
+and exact QR payload for troubleshooting or manual entry. These values are
+sensitive and are hidden by default.
 
 The PSK never leaves this machine except through the QR you scan; the relay
 never sees it.
@@ -374,11 +379,29 @@ def print_qr(payload: str) -> None:
     qr.print_ascii(invert=True)
 
 
+def print_verbose_pairing_data(response: dict, profile_id: str, api_key: str,
+                               psk_hex: str, payload: str) -> None:
+    """Print every pairing value for troubleshooting and manual entry.
+
+    These values are deliberately omitted from the normal output because the
+    API key and PSK grant access to the paired bridge.  ``--verbose`` is an
+    explicit opt-in for operators who need to inspect or recover the payload.
+    """
+    print("\nVerbose pairing data (sensitive — do not share):")
+    print(f"  provision response: {json.dumps(response, sort_keys=True)}")
+    print(f"  profile_id: {profile_id}")
+    print(f"  api_key: {api_key}")
+    print(f"  pairing code: {response.get('token')}")
+    print(f"  psk: {psk_hex}")
+    print(f"  payload: {payload}")
+
+
 def main() -> None:
     hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
     if not hermes_home.is_dir():
         die(f"{hermes_home} not found — is Hermes installed?")
     reexec_under_hermes_python(hermes_home)
+    verbose = "--verbose" in sys.argv[1:]
     env_file = hermes_home / ".env"
     env = read_env(env_file)
 
@@ -424,8 +447,11 @@ def main() -> None:
     psk_hex = load_or_create_psk(hermes_home / "psk")
     payload = json.dumps({"token": token, "psk": psk_hex}, separators=(",", ":"))
 
+    if verbose:
+        print_verbose_pairing_data(response, profile_id, api_key, psk_hex, payload)
+
     print()
-    print(f"Invite {token} — single use, expires {response.get('expires_at', 'in 1 hour')}")
+    print(f"Pairing code: {token} — single use, expires {response.get('expires_at', 'in 1 hour')}")
     print("Open Hermes Bridge on your phone → Pair new device → scan:")
     print()
     print_qr(payload)

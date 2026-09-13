@@ -16,6 +16,8 @@ import sys
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -232,6 +234,19 @@ class PairScriptTest(unittest.TestCase):
         env_text = (self.home / ".env").read_text()
         self.assertEqual(env_text.count("HERMES_BRIDGE_API_KEY"), 1)
         self.assertEqual((self.home / "psk").read_bytes(), psk_before)
+
+    def test_verbose_prints_all_pairing_data(self):
+        output = StringIO()
+        with redirect_stdout(output), patch.object(sys, "argv", ["pair.py", "--verbose"]):
+            self._run()
+
+        text = output.getvalue()
+        psk = (self.home / "psk").read_bytes().hex()
+        self.assertIn('"token": "tok_fresh"', text)
+        self.assertIn("api_key: hb_secret", text)
+        self.assertIn(f"psk: {psk}", text)
+        self.assertIn(f'"token":"tok_fresh","psk":"{psk}"', text)
+        self.assertIn("Pairing code: tok_fresh", text)
 
 
 if __name__ == "__main__":

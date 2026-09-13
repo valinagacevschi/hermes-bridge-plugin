@@ -22,7 +22,9 @@ default-denies any sender with no allowlist configured. Answer *yes* to the enab
 (`hermes gateway restart`), and your agent is on your phone.
 
 Re-run `pair.py` any time to pair another phone or replace an expired invite —
-it reuses the same profile.
+it reuses the same profile. Self-serve provisioning allows five requests per
+client IP per hour; if that limit is reached, wait for the window to expire
+before trying again.
 
 Nothing else to run. The app's Agent screen (sessions, skills, cron, usage,
 memory) reads Hermes through its local REST API, which lives in the dashboard
