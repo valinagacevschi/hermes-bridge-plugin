@@ -208,6 +208,7 @@ def make_adapter(psk: bytes = PSK, profile_id: str = PROFILE):
         adapter._ws_connected_at = _time.time()
         adapter._pending_prompts = {}
         adapter._stream_pending = set()
+        adapter._stream_reply_to = {}
         # Hermes' localhost REST API (local_api.LocalApi): port discovery,
         # per-port session tokens, and the backend process it may start.
         adapter._api = LocalApi()
