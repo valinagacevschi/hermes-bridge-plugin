@@ -202,11 +202,37 @@ def _message_ts_ms(row: Dict[str, Any]) -> int:
     return int(n * 1000)
 
 
+def _display_reasoning(row: Dict[str, Any]) -> Optional[str]:
+    """Plain reasoning text the phone can show. Skips redacted signature blobs."""
+    parts: List[str] = []
+
+    def add(value: Any) -> None:
+        if not isinstance(value, str):
+            return
+        text = value.strip()
+        if text and text not in parts:
+            parts.append(text)
+
+    add(row.get("reasoning"))
+    add(row.get("reasoning_content"))
+    details = row.get("reasoning_details")
+    if isinstance(details, list):
+        for detail in details:
+            if not isinstance(detail, dict) or detail.get("type") == "redacted_thinking":
+                continue
+            for key in ("summary", "thinking", "content", "text"):
+                if isinstance(detail.get(key), str) and str(detail.get(key)).strip():
+                    add(detail.get(key))
+                    break
+    return "\n\n".join(parts) if parts else None
+
+
 def _project_bot_messages(rows: Any, chat: str) -> List[Dict[str, Any]]:
     """Project REST message rows down to what the phone renders.
 
-    The REST payload is much richer (tool_calls, reasoning_details, …).
+    The REST payload is much richer (tool_calls, opaque reasoning_details, …).
     Shipping that over the relay would be a large multiple of the text.
+    Displayable reasoning summaries are the exception: the phone collapses them.
     """
     if not isinstance(rows, list):
         return []
@@ -220,24 +246,26 @@ def _project_bot_messages(rows: Any, chat: str) -> List[Dict[str, Any]]:
         if row.get("display_kind") == "hidden":
             continue
         text = _message_text(row)
+        reasoning = _display_reasoning(row) if role == "assistant" else None
         row_id = row.get("id") if row.get("id") is not None else row.get("row_id")
         if row_id is None or row_id == "":
             continue
-        out.append(
-            {
-                "id": str(row_id),
-                "session_id": chat,
-                "role": role,
-                "content": text,
-                "sealed_frame": None,
-                "ts": _message_ts_ms(row),
-                "is_error": 1 if row.get("error") else 0,
-                "attachments": None,
-                "is_gap": 0,
-                "controls": None,
-                "ack_state": None,
-            }
-        )
+        projected: Dict[str, Any] = {
+            "id": str(row_id),
+            "session_id": chat,
+            "role": role,
+            "content": text,
+            "sealed_frame": None,
+            "ts": _message_ts_ms(row),
+            "is_error": 1 if row.get("error") else 0,
+            "attachments": None,
+            "is_gap": 0,
+            "controls": None,
+            "ack_state": None,
+        }
+        if reasoning:
+            projected["reasoning"] = reasoning
+        out.append(projected)
     return out
 
 
