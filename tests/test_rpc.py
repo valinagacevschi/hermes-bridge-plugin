@@ -867,8 +867,12 @@ class TestSessionHistoryPagination(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result, response)
-        mock_get.assert_awaited_once_with(
-            "/api/sessions/session%2Fone/messages?limit=20&offset=40&order=latest"
+        self.assertEqual(
+            [call.args for call in mock_get.await_args_list],
+            [
+                ("/api/sessions?limit=100",),
+                ("/api/sessions/session%2Fone/messages?limit=20&offset=40&order=latest",),
+            ],
         )
 
     async def test_messages_without_page_parameters_preserves_legacy_path(self):
@@ -877,7 +881,13 @@ class TestSessionHistoryPagination(unittest.IsolatedAsyncioTestCase):
         ) as mock_get:
             await self.adapter._rpc_sessions_messages({"id": "session-one"})
 
-        mock_get.assert_awaited_once_with("/api/sessions/session-one/messages")
+        self.assertEqual(
+            [call.args for call in mock_get.await_args_list],
+            [
+                ("/api/sessions?limit=100",),
+                ("/api/sessions/session-one/messages",),
+            ],
+        )
 
     async def test_messages_rejects_invalid_page_parameters(self):
         with self.assertRaisesRegex(Exception, "invalid_history_page"):

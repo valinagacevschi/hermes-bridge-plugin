@@ -31,7 +31,13 @@ from .capability import CapabilityDescriptor
 from .crypto import load_psk, open_blob, open_frame, seal, seal_blob
 from .local_api import API_SERVER_PORT, SESSION_HEADER, LocalApi
 from .operation_dispatch import OperationDispatcher, _LocalRpcError, _RpcError
-from .session_continue import hermes_session_to_continue
+from .session_continue import (
+    bridge_thread_id,
+    hermes_session_to_continue,
+    new_bridge_chat_id,
+    resolve_message_session_id,
+    rewrite_listed_sessions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1384,13 +1390,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                     asyncio.ensure_future(self._consume_prompt_response(payload))
                 else:
                     event = await self._build_event(payload)
-                    stored = hermes_session_to_continue(payload)
-                    if stored:
-                        # Continue that Hermes session. Do not also hand the
-                        # same text to the gateway's current thread.
-                        asyncio.ensure_future(self._continue_or_gateway(stored, event))
-                    else:
-                        await self.handle_message(event)
+                    await self.handle_message(event)
             except Exception as exc:
                 logger.error(
                     "[hermes_bridge] dispatch failed at seq=%s: %s — dropping the "
@@ -1439,7 +1439,11 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 message_type = MessageType.DOCUMENT
         return MessageEvent(
             text=payload["content"],
-            source=self.build_source(chat_id=self._profile_id, user_id="mobile"),
+            source=self.build_source(
+                chat_id=self._profile_id,
+                user_id="mobile",
+                thread_id=await self._bridge_thread_id(payload),
+            ),
             media_urls=media_urls,
             media_types=media_types,
             message_type=message_type,
@@ -1467,8 +1471,37 @@ class HermesBridgeAdapter(BasePlatformAdapter):
     # connection errors propagate — _handle_rpc classifies them uniformly.
     # ------------------------------------------------------------------
 
+    async def _listed_bridge_sessions(self) -> List[dict]:
+        data = await self._api.get("/api/sessions?limit=100")
+        if not isinstance(data, dict):
+            return []
+        rows = data.get("sessions")
+        return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+    async def _bridge_thread_id(self, payload: Dict[str, Any]) -> Optional[str]:
+        """Phone chat id, used as the gateway thread so each chat is its own session."""
+        session_id = hermes_session_to_continue(payload)
+        if not session_id:
+            return None
+        try:
+            rows = await self._listed_bridge_sessions()
+        except Exception:
+            logger.warning("[hermes_bridge] session list unavailable; isolating %s", session_id)
+            return session_id
+        return bridge_thread_id(session_id, rows)
+
+    async def _gateway_session_id(self, session_id: str) -> str:
+        try:
+            rows = await self._listed_bridge_sessions()
+        except Exception:
+            return session_id
+        return resolve_message_session_id(session_id, rows)
+
+    async def _rpc_sessions_list(self, p: Dict[str, Any]) -> Any:
+        return rewrite_listed_sessions(await self._api.get("/api/sessions?limit=100"))
+
     async def _rpc_sessions_messages(self, p: Dict[str, Any]) -> Any:
-        session_id = _require(p, "id", "missing_session_id")
+        session_id = await self._gateway_session_id(_require(p, "id", "missing_session_id"))
         path = f"/api/sessions/{quote(session_id, safe='')}/messages"
         if not any(key in p for key in ("limit", "offset", "order")):
             return await self._api.get(path)
@@ -1483,88 +1516,9 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         query = urlencode({"limit": limit, "offset": offset, "order": order})
         return await self._api.get(f"{path}?{query}")
 
-    async def _continue_or_gateway(self, stored_id: str, event: MessageEvent) -> None:
-        """Resume the named Hermes session and submit there.
-
-        A failure stays on that session. It does not fall through to whatever
-        thread the gateway currently has open.
-        """
-        try:
-            lock = getattr(self, "_continue_lock", None)
-            if lock is None:
-                lock = asyncio.Lock()
-                self._continue_lock = lock
-            # One dashboard runtime. Turns run one at a time so a second
-            # session is resumed only after the first has finished.
-            async with lock:
-                await self._continue_hermes_session(stored_id, event.text or "", event.message_id)
-        except Exception as exc:
-            logger.warning("[hermes_bridge] continue session %s failed: %s", stored_id, exc)
-            try:
-                await self.send(
-                    self._profile_id,
-                    "Couldn't continue this Hermes session.",
-                    reply_to=event.message_id,
-                )
-            except Exception:
-                logger.warning("[hermes_bridge] failed to report continue error for %s", stored_id)
-
-    async def _continue_hermes_session(
-        self, stored_id: str, text: str, reply_to: Optional[str]
-    ) -> None:
-        snap = await self._local_rpc(
-            "session.resume",
-            {"session_id": stored_id, "omit_messages": True},
-        )
-        if not isinstance(snap, dict):
-            raise _RpcError("offline")
-        runtime = str(snap.get("session_id") or "").strip()
-        if not runtime:
-            raise _RpcError("offline")
-        await self._local_rpc("prompt.submit", {"session_id": runtime, "text": text})
-        preview_id: Optional[str] = None
-        last = ""
-        for _ in range(60):
-            await asyncio.sleep(1)
-            snap = await self._local_rpc(
-                "session.resume",
-                {"session_id": stored_id, "omit_messages": True},
-            )
-            if not isinstance(snap, dict):
-                break
-            inflight = snap.get("inflight") if isinstance(snap.get("inflight"), dict) else {}
-            assistant = str((inflight or {}).get("assistant") or "")
-            if assistant and assistant != last:
-                last = assistant
-                if preview_id is None:
-                    result = await self.send(
-                        self._profile_id,
-                        last,
-                        reply_to=reply_to,
-                        metadata={"expect_edits": True},
-                    )
-                    preview_id = result.message_id
-                elif preview_id:
-                    await self.edit_message(self._profile_id, preview_id, last)
-            if not snap.get("running") and not (inflight or {}).get("streaming"):
-                break
-        if preview_id:
-            await self.edit_message(self._profile_id, preview_id, last, finalize=True)
-        elif last:
-            await self.send(self._profile_id, last, reply_to=reply_to)
-
     async def _rpc_sessions_create(self, p: Dict[str, Any]) -> Any:
-        """Mint a Hermes session. The phone caches the stored id; it does not invent one."""
-        try:
-            created = await self._local_rpc("session.create", {})
-        except _LocalRpcError as exc:
-            raise _RpcError("hermes_offline") from exc
-        if not isinstance(created, dict):
-            raise _RpcError("hermes_offline")
-        stored = str(created.get("stored_session_id") or created.get("id") or "").strip()
-        if not stored:
-            raise _RpcError("hermes_offline")
-        return {"id": stored}
+        """Id the phone keeps. The gateway row appears on the first message, keyed by this thread."""
+        return {"id": new_bridge_chat_id()}
 
     async def _rpc_sessions_switch(self, p: Dict[str, Any]) -> Any:
         # Hermes has no REST endpoint to switch active session context.
@@ -1572,7 +1526,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         return {"switched": True}
 
     async def _rpc_sessions_delete(self, p: Dict[str, Any]) -> Any:
-        session_id = _require(p, "id", "missing_session_id")
+        session_id = await self._gateway_session_id(_require(p, "id", "missing_session_id"))
         await self._api.request(f"/api/sessions/{session_id}", method="DELETE")
         return {"deleted": True}
 
@@ -1583,7 +1537,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         return await self._api.get(f"/api/sessions/search?{query}")
 
     async def _rpc_sessions_export(self, p: Dict[str, Any]) -> Any:
-        session_id = _require(p, "id", "missing_session_id")
+        session_id = await self._gateway_session_id(_require(p, "id", "missing_session_id"))
         return await self._api.get(f"/api/sessions/{session_id}/export")
 
     async def _rpc_skills_toggle(self, p: Dict[str, Any]) -> Any:

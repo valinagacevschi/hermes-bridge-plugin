@@ -55,6 +55,7 @@ class OperationDispatcher:
 
     _HANDLER_NAMES = {
         "sessions.messages": "_rpc_sessions_messages",
+        "sessions.list": "_rpc_sessions_list",
         "sessions.create": "_rpc_sessions_create",
         "sessions.switch": "_rpc_sessions_switch",
         "sessions.delete": "_rpc_sessions_delete",
@@ -150,7 +151,6 @@ class OperationDispatcher:
             return getattr(host, direct_name, None)
 
         simple = {
-            "sessions.list": lambda p: host._api.get("/api/sessions"),
             "skills.list": lambda p: host._api.get("/api/skills"),
             "skills.hub.update": lambda p: host._api.post("/api/skills/hub/update", body={}),
             "model.options": lambda p: host._api.get("/api/model/options"),
