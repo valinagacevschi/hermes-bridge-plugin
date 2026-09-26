@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Pair this laptop, and a phone, with the Hermes Bridge relay.
+"""Pair this laptop, and a phone, with the HermLink relay.
 
 Run it once after installing the plugin:
 
     python3 ~/.hermes/plugins/hermes_bridge/pair.py
+    python3 ~/.hermes/plugins/hermes_bridge/pair.py --verbose
 
 First run provisions a self-serve profile + laptop API key, writes them to
 ``~/.hermes/.env``, authorizes the adapter's sender with Hermes, generates the
@@ -11,19 +12,25 @@ end-to-end PSK at ``~/.hermes/psk``, and prints a QR holding ``{token, psk}``. L
 fresh phone invite — run it again whenever an invite expires or a second phone
 needs pairing.
 
+Pass ``--verbose`` to print the complete provision response, credentials, PSK,
+and exact QR payload for troubleshooting or manual entry. These values are
+sensitive and are hidden by default.
+
 The PSK never leaves this machine except through the QR you scan; the relay
 never sees it.
 
 Standard library only, plus ``qrcode`` for the terminal QR — declared in
-plugin.yaml and installed per after-install.md. That lives in the Hermes venv,
-so this script re-execs itself with the venv's interpreter: running it with any
-python3 works.
+plugin.yaml. Hermes 0.21+ prepares those dependencies after consent and
+selects the managed environment through its launcher and bootstrap. Older
+installs still keep them in the Hermes venv. This script re-execs onto
+whichever of those is installed, so ``python3 pair.py`` works either way.
 """
 
 import binascii
 import json
 import os
 import socket
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -122,31 +129,129 @@ def load_or_create_psk(psk_file: Path) -> str:
     return binascii.hexlify(psk).decode()
 
 
+# Published by current Hermes installs. Bootstrap, not this script, selects
+# the managed dependency environment — its directory changes between generations.
+_LAUNCHER = Path("hermes-agent") / ".hermes" / "bin" / "hermes"
+_LEGACY_PYTHON = Path("hermes-agent") / "venv" / "bin" / "python"
+_BOOTSTRAP_MARKER = "import hermes_bootstrap;"
+_MODERN_DEPS = "hermes plugins enable hermes_bridge — accept dependency preparation"
+_LEGACY_PYNACL = '~/.hermes/hermes-agent/venv/bin/pip install "PyNaCl>=1.6,<1.7"'
+_LEGACY_QR = '~/.hermes/hermes-agent/venv/bin/pip install "qrcode>=7.4,<8"'
+
+
+def _parse_runtime_command(stdout: str) -> Optional[list[str]]:
+    """Take the JSON argv from ``hermes --print-runtime-command``."""
+    for line in reversed(stdout.splitlines()):
+        stripped = line.strip()
+        if not stripped.startswith("["):
+            continue
+        try:
+            command = json.loads(stripped)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(command, list) and command and all(isinstance(part, str) for part in command):
+            return command
+        return None
+    return None
+
+
+def _rewrite_bootstrap_entry(command: list[str], script: str) -> Optional[list[str]]:
+    """Keep the launcher's bootstrap, then run this script instead of the CLI.
+
+    The printed command imports ``hermes_bootstrap``, which activates the
+    managed environment. Replacing only the entry point leaves that selection
+    — and the caller's arguments — intact.
+
+    ``runpy.run_path`` on a file does not put that file's directory on
+    ``sys.path`` the way ``python3 pair.py`` does, so the sibling import of
+    ``local_api`` would fail without the insert.
+    """
+    rewritten: list[str] = []
+    replaced = False
+    script_dir = os.path.dirname(script)
+    for part in command:
+        if not replaced and _BOOTSTRAP_MARKER in part:
+            head, _, _tail = part.partition(_BOOTSTRAP_MARKER)
+            part = (
+                head
+                + _BOOTSTRAP_MARKER
+                + f" sys.path.insert(0, {script_dir!r});"
+                + f" sys.argv = [{script!r}, *sys.argv[1:]];"
+                + f" runpy.run_path({script!r}, run_name='__main__')"
+            )
+            replaced = True
+        rewritten.append(part)
+    if not replaced:
+        return None
+    return rewritten
+
+
+def _modern_pair_command(hermes_home: Path) -> Optional[list[str]]:
+    """Ask the installed launcher for a bootstrap command that runs this script.
+
+    Returns None when this home has no published launcher, or the launcher
+    predates ``--print-runtime-command``.
+    """
+    launcher = hermes_home / _LAUNCHER
+    if not launcher.is_file() or not os.access(launcher, os.X_OK):
+        return None
+    script = os.path.abspath(__file__)
+    try:
+        completed = subprocess.run(
+            [str(launcher), "--print-runtime-command", "--", *sys.argv[1:]],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env={**os.environ, "HERMES_HOME": str(hermes_home)},
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    command = _parse_runtime_command(completed.stdout)
+    if command is None:
+        return None
+    return _rewrite_bootstrap_entry(command, script)
+
+
+def _legacy_venv_command(hermes_home: Path) -> Optional[list[str]]:
+    """Older supported installs keep plugin dependencies in hermes-agent/venv."""
+    python = hermes_home / _LEGACY_PYTHON
+    if not python.is_file():
+        return None
+    return [str(python), os.path.abspath(__file__), *sys.argv[1:]]
+
+
 def reexec_under_hermes_python(hermes_home: Path) -> None:
-    """Re-run this script with the Hermes venv's interpreter.
+    """Re-run this script under the interpreter that can import plugin dependencies.
 
-    ``qrcode`` is installed into ``~/.hermes/hermes-agent/venv`` — the only
-    environment the plugin's dependencies live in. A plain ``python3 pair.py``
-    uses the system interpreter, imports none of them, and degrades to an
-    unscannable payload string *after* the user has correctly installed
-    everything. Rather than make them remember a 50-character interpreter
-    path, hand the script to the right python ourselves.
+    Current Hermes publishes a launcher whose bootstrap selects the managed
+    dependency environment. That directory is not a stable path, so this asks
+    the launcher (``--print-runtime-command``) rather than naming a generation.
+    Homes without that launcher still fall back to ``hermes-agent/venv``.
 
-    Guarded by an env flag so a venv genuinely missing ``qrcode`` prints the
-    install hint instead of exec-looping.
+    Two environments can share one Python binary through symlinks. Comparing
+    ``Path.resolve()`` would treat them as the same environment and skip the
+    relaunch, so the only loop brake is ``HERMES_BRIDGE_PAIR_REEXEC``.
+    ``HERMES_HOME`` and the original arguments, including ``--check``, are
+    passed through.
     """
     if os.environ.get(_REEXEC_FLAG):
         return
-    venv_python = hermes_home / "hermes-agent" / "venv" / "bin" / "python"
-    if not venv_python.exists():
+    for command in (_modern_pair_command(hermes_home), _legacy_venv_command(hermes_home)):
+        if not command:
+            continue
+        os.environ["HERMES_HOME"] = str(hermes_home)
+        os.environ[_REEXEC_FLAG] = "1"
+        try:
+            os.execv(command[0], command)
+        except OSError:
+            os.environ.pop(_REEXEC_FLAG, None)
+            continue
+        # execv replaces this process. A test double returns instead, and the
+        # legacy candidate must not run after a successful handoff.
         return
-    try:
-        if Path(sys.executable).resolve() == venv_python.resolve():
-            return
-    except OSError:
-        return
-    os.environ[_REEXEC_FLAG] = "1"
-    os.execv(str(venv_python), [str(venv_python), os.path.abspath(__file__), *sys.argv[1:]])
 
 
 def authorize_adapter_user(env_file: Path, env: dict) -> None:
@@ -238,7 +343,7 @@ def readiness_report(hermes_home: Path, env: dict) -> list:
         checks.append((
             FAIL,
             "PyNaCl missing — the adapter will not load",
-            '~/.hermes/hermes-agent/venv/bin/pip install "PyNaCl>=1.6,<1.7"',
+            f"{_MODERN_DEPS}; older installs: {_LEGACY_PYNACL}",
         ))
 
     try:
@@ -249,7 +354,7 @@ def readiness_report(hermes_home: Path, env: dict) -> list:
         checks.append((
             FAIL,
             "qrcode missing — pairing falls back to an unscannable payload",
-            '~/.hermes/hermes-agent/venv/bin/pip install "qrcode>=7.4,<8"',
+            f"{_MODERN_DEPS}; older installs: {_LEGACY_QR}",
         ))
 
     if env.get("HERMES_BRIDGE_HOME_CHANNEL"):
@@ -363,9 +468,9 @@ def print_qr(payload: str) -> None:
     try:
         import qrcode  # noqa: PLC0415 — optional, absent on a bare Hermes install
     except ImportError:
-        print("  No QR: the `qrcode` package is missing from the Hermes venv.")
-        print("  Install it, then re-run this script for a scannable code:")
-        print('    ~/.hermes/hermes-agent/venv/bin/pip install "qrcode>=7.4,<8"')
+        print("  No QR: `qrcode` is missing from the Hermes dependency environment.")
+        print(f"  {_MODERN_DEPS}.")
+        print(f"  Older installs: {_LEGACY_QR}")
         print(f"  payload (manual entry): {payload}")
         return
     qr = qrcode.QRCode(border=1)
@@ -374,11 +479,29 @@ def print_qr(payload: str) -> None:
     qr.print_ascii(invert=True)
 
 
+def print_verbose_pairing_data(response: dict, profile_id: str, api_key: str,
+                               psk_hex: str, payload: str) -> None:
+    """Print every pairing value for troubleshooting and manual entry.
+
+    These values are deliberately omitted from the normal output because the
+    API key and PSK grant access to the paired bridge.  ``--verbose`` is an
+    explicit opt-in for operators who need to inspect or recover the payload.
+    """
+    print("\nVerbose pairing data (sensitive — do not share):")
+    print(f"  provision response: {json.dumps(response, sort_keys=True)}")
+    print(f"  profile_id: {profile_id}")
+    print(f"  api_key: {api_key}")
+    print(f"  pairing code: {response.get('token')}")
+    print(f"  psk: {psk_hex}")
+    print(f"  payload: {payload}")
+
+
 def main() -> None:
     hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
     if not hermes_home.is_dir():
         die(f"{hermes_home} not found — is Hermes installed?")
     reexec_under_hermes_python(hermes_home)
+    verbose = "--verbose" in sys.argv[1:]
     env_file = hermes_home / ".env"
     env = read_env(env_file)
 
@@ -424,9 +547,12 @@ def main() -> None:
     psk_hex = load_or_create_psk(hermes_home / "psk")
     payload = json.dumps({"token": token, "psk": psk_hex}, separators=(",", ":"))
 
+    if verbose:
+        print_verbose_pairing_data(response, profile_id, api_key, psk_hex, payload)
+
     print()
-    print(f"Invite {token} — single use, expires {response.get('expires_at', 'in 1 hour')}")
-    print("Open Hermes Bridge on your phone → Pair new device → scan:")
+    print(f"Pairing code: {token} — single use, expires {response.get('expires_at', 'in 1 hour')}")
+    print("Open HermLink on your phone → Pair new device → scan:")
     print()
     print_qr(payload)
     print()

@@ -7,10 +7,12 @@
 # regardless — only their unknown-field warnings drop to debug level.
 kind: platform
 name: hermes_bridge
-label: Hermes Bridge
+label: HermLink
 version: 0.2.0
+# Documented minimum. Hermes enforces this at load; pairing itself is unchanged.
+requires_hermes: ">=0.21.0"
 description: >
-  Connects Hermes to the Hermes Bridge mobile app over an end-to-end-encrypted
+  Connects Hermes to the HermLink mobile app over an end-to-end-encrypted
   cloud relay. The gateway dials out over WebSocket, so no inbound port and no
   tunnel is needed; the relay only ever sees XChaCha20-Poly1305 ciphertext.
 author: Valentin Nagacevschi
@@ -22,9 +24,10 @@ tags:
   - ios
   - relay
   - e2ee
-# websockets ships with Hermes core; PyNaCl does not (it only arrives as a
-# transitive of the `messaging` extra). Hermes never auto-installs plugin
-# dependencies — after-install.md carries the pip line.
+# websockets ships with Hermes core. PyNaCl and qrcode do not.
+# Hermes 0.21+ prepares these declared dependencies after consent at install
+# or enable time, into the environment its bootstrap selects. Older installs
+# do not — after-install.md has the manual pip fallback for those.
 python_dependencies:
   - PyNaCl>=1.6,<1.7
   # pair.py renders the pairing QR with it; without it pairing degrades to a
@@ -38,13 +41,13 @@ python_dependencies:
 optional_env:
   - name: HERMES_BRIDGE_RELAY_URL
     description: "Relay WebSocket URL (default wss://herelay.appcenter.ro)"
-    prompt: "Hermes Bridge relay URL"
+    prompt: "HermLink relay URL"
     password: false
   - name: HERMES_BRIDGE_PROFILE_ID
     description: "Profile minted by pair.py — identifies this laptop to the relay"
-    prompt: "Hermes Bridge profile id"
+    prompt: "HermLink profile id"
     password: false
   - name: HERMES_BRIDGE_API_KEY
     description: "Laptop API key minted by pair.py (hb_...)"
-    prompt: "Hermes Bridge API key"
+    prompt: "HermLink API key"
     password: true

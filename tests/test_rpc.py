@@ -853,5 +853,51 @@ class TestPollPendingWrites(unittest.IsolatedAsyncioTestCase):
         mock_push.assert_not_called()
 
 
+class TestSessionHistoryPagination(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.adapter = _make_adapter()
+
+    async def test_messages_forwards_latest_page_parameters(self):
+        response = {"messages": [], "pagination": {"returned": 0}}
+        with patch.object(
+            self.adapter._api, "get", AsyncMock(return_value=response)
+        ) as mock_get:
+            result = await self.adapter._rpc_sessions_messages(
+                {"id": "session/one", "limit": 20, "offset": 40, "order": "latest"}
+            )
+
+        self.assertEqual(result, response)
+        mock_get.assert_awaited_once_with(
+            "/api/sessions/session%2Fone/messages?limit=20&offset=40&order=latest"
+        )
+
+    async def test_messages_without_page_parameters_preserves_legacy_path(self):
+        with patch.object(
+            self.adapter._api, "get", AsyncMock(return_value={"messages": []})
+        ) as mock_get:
+            await self.adapter._rpc_sessions_messages({"id": "session-one"})
+
+        mock_get.assert_awaited_once_with("/api/sessions/session-one/messages")
+
+    async def test_messages_rejects_invalid_page_parameters(self):
+        with self.assertRaisesRegex(Exception, "invalid_history_page"):
+            await self.adapter._rpc_sessions_messages(
+                {"id": "session-one", "limit": 501, "offset": 0, "order": "latest"}
+            )
+
+
+class TestSessionSearch(unittest.IsolatedAsyncioTestCase):
+    async def test_search_quotes_query_parameters(self):
+        adapter = _make_adapter()
+        response = {"results": []}
+        with patch.object(adapter._api, "get", AsyncMock(return_value=response)) as mock_get:
+            result = await adapter._rpc_sessions_search({"q": "release & notes", "limit": 20})
+
+        self.assertEqual(result, response)
+        mock_get.assert_awaited_once_with(
+            "/api/sessions/search?q=release+%26+notes&limit=20"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

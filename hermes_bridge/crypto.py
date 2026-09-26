@@ -1,5 +1,5 @@
 """
-E2E message encryption for the Hermes Bridge relay.
+E2E message encryption for the HermLink relay.
 
 Algorithm: XChaCha20-Poly1305 (IETF) via PyNaCl.
 Wire format: base64( 0x01 || nonce(24) || ciphertext )

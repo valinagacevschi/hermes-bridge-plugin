@@ -34,11 +34,16 @@ sent to the relay**. The relay stores and forwards opaque ciphertext.
 
 - [Hermes agent](https://github.com/NousResearch/hermes) **0.21.0 or newer** — the plugin
   registers itself as a platform named `hermes_bridge`, which needs the runtime plugin
-  platform registry.
-- **PyNaCl** and **qrcode** in the Hermes venv. `websockets` already ships with Hermes;
-  these two do not, and Hermes never auto-installs plugin dependencies. PyNaCl does the
+  platform registry. `plugin.yaml` declares that floor as `requires_hermes: ">=0.21.0"`.
+- **PyNaCl** and **qrcode**. `websockets` already ships with Hermes. PyNaCl does the
   encryption; `qrcode` draws the pairing QR (without it `pair.py` prints an unscannable
-  payload string).
+  payload string). On Hermes 0.21 and newer, install or enable asks before it prepares
+  those declared dependencies. Answer yes. Older installations leave them uninstalled;
+  put them in the Hermes venv:
+
+  ```bash
+  ~/.hermes/hermes-agent/venv/bin/pip install "PyNaCl>=1.6,<1.7" "qrcode>=7.4,<8"
+  ```
 
 ## Access
 
@@ -52,40 +57,71 @@ fresh invite for your *existing* profile — same script, no re-provisioning.
 
 ## Install
 
-```bash
-hermes plugins install valinagacevschi/hermes-bridge-plugin/hermes_bridge
-~/.hermes/hermes-agent/venv/bin/pip install "PyNaCl>=1.6,<1.7" "qrcode>=7.4,<8"
-python3 ~/.hermes/plugins/hermes_bridge/pair.py
-hermes gateway restart
-```
-
-Answer **yes** to the installer's "Enable now?" prompt (that writes `plugins.enabled` for
-you). The trailing `/hermes_bridge` is the plugin package inside this repo — install it
-without the subdir and Hermes clones the whole repo, README included, which its plugin
+Answer **yes** to "Enable now?" and to preparing Python dependencies. The trailing
+`/hermes_bridge` is the plugin package inside this repo — install it without the
+subdir and Hermes clones the whole repo, README included, which its plugin
 security scanner flags.
 
-`pair.py` finishes with a readiness report — dependencies importable, sender allowlisted,
-home channel set, local REST API answering, plugin actually enabled — and prints the fix for
-anything that fails. To re-run those checks later without minting an invite:
+Install:
+
+```bash
+hermes plugins install valinagacevschi/hermes-bridge-plugin/hermes_bridge
+```
+
+Pair. The first run creates the profile, the laptop API key, and the end-to-end
+key, then prints the QR. Run it again and it keeps that profile and key, and
+mints a fresh invite:
+
+```bash
+python3 ~/.hermes/plugins/hermes_bridge/pair.py
+```
+
+Scan that QR in the **Hermes Bridge** app: **Pair new device**.
+
+Check the install without minting another invite. `pair.py` prints a readiness
+report — dependencies importable, sender allowlisted, home channel set, local
+REST API answering, plugin actually enabled — and the fix for anything that fails:
 
 ```bash
 python3 ~/.hermes/plugins/hermes_bridge/pair.py --check
 ```
 
+Restart the gateway so the adapter loads:
+
+```bash
+hermes gateway restart
+```
+
 Useful afterwards:
 
 ```bash
-hermes plugins list                 # is it installed and enabled?
-hermes plugins doctor hermes_bridge # validate against the real runtime contracts
-# upgrade — note --force, not `hermes plugins update`:
+hermes plugins list
+```
+
+```bash
+hermes plugins doctor hermes_bridge
+```
+
+### Upgrade
+
+A tracked install, including one installed from a subdirectory, updates in place.
+Hermes reinstalls from the recorded source when the plugin directory has no `.git`:
+
+```bash
+hermes plugins update hermes_bridge
+```
+
+If that says the plugin was not installed from git, force a reinstall instead.
+`~/.hermes/.env` and `~/.hermes/psk` sit outside the plugin directory, so neither
+command re-pairs.
+
+```bash
 hermes plugins install valinagacevschi/hermes-bridge-plugin/hermes_bridge --force
 ```
 
-`hermes plugins update` does not work for this plugin. Installing from a
-subdirectory moves the package directory into place without the clone's `.git`,
-and update refuses a plugin directory that has none. Reinstalling with `--force`
-is the upgrade path; your `~/.hermes/.env` credentials and `~/.hermes/psk` are
-outside the plugin directory, so nothing re-pairs.
+```bash
+hermes gateway restart
+```
 
 ### Upgrading from the old `curl | bash` installer
 
@@ -104,11 +140,29 @@ same phone stays paired.
 
 ### Manual install
 
-1. Copy `hermes_bridge/` → `~/.hermes/plugins/hermes_bridge/`.
-2. `~/.hermes/hermes-agent/venv/bin/pip install "PyNaCl>=1.6,<1.7" "qrcode>=7.4,<8"`.
-3. `hermes plugins enable hermes_bridge` (non-bundled plugins are opt-in).
-4. `python3 ~/.hermes/plugins/hermes_bridge/pair.py`.
-5. `hermes gateway restart`.
+Copy `hermes_bridge/` → `~/.hermes/plugins/hermes_bridge/`.
+
+On Hermes 0.21+, enable the plugin and accept dependency preparation:
+
+```bash
+hermes plugins enable hermes_bridge
+```
+
+On an older install, install the packages into the Hermes venv:
+
+```bash
+~/.hermes/hermes-agent/venv/bin/pip install "PyNaCl>=1.6,<1.7" "qrcode>=7.4,<8"
+```
+
+Then pair and restart:
+
+```bash
+python3 ~/.hermes/plugins/hermes_bridge/pair.py
+```
+
+```bash
+hermes gateway restart
+```
 
 ## Environment variables
 
@@ -206,15 +260,27 @@ were delivered to the wrong adapter and silently dropped. It now registers as
 - **Plugin silently not loading** — non-bundled plugins under `~/.hermes/plugins/` are
   skipped unless listed in `config.yaml` under `plugins.enabled`. `hermes plugins list`
   shows the truth; `hermes plugins enable hermes_bridge` fixes it.
-- **`No module named 'nacl'` in the gateway log** — PyNaCl is missing. Install it with the
-  Hermes venv's pip (`~/.hermes/hermes-agent/venv/bin/pip`), not system pip.
+- **`No module named 'nacl'` in the gateway log** — PyNaCl is missing from the
+  Hermes dependency environment. On Hermes 0.21+, run `hermes plugins enable hermes_bridge`
+  and accept dependency preparation. On an older install:
+
+  ```bash
+  ~/.hermes/hermes-agent/venv/bin/pip install "PyNaCl>=1.6,<1.7"
+  ```
 - **Two copies loaded** — a leftover `~/.hermes/plugins/platforms/hermes_bridge` from the
   old installer registers under a different key. See *Upgrading*, above.
-- **No QR printed, just a payload line** — `qrcode` is missing from the Hermes venv:
-  `~/.hermes/hermes-agent/venv/bin/pip install "qrcode>=7.4,<8"`, then re-run `pair.py`
-  (it mints a fresh invite and reprints, so an expired one costs nothing). If you installed
-  `qrcode` and still get the payload, your copy of `pair.py` predates the fix that re-execs
-  it under the Hermes venv's interpreter — reinstall with `--force` (above).
+- **No QR printed, just a payload line** — `qrcode` is missing from the Hermes
+  dependency environment. Same consent path as PyNaCl, or on an older install:
+
+  ```bash
+  ~/.hermes/hermes-agent/venv/bin/pip install "qrcode>=7.4,<8"
+  ```
+
+  Then re-run `pair.py`. It keeps the profile and key, and mints a fresh invite.
+  `python3 ~/.hermes/plugins/hermes_bridge/pair.py` re-execs through the installed
+  Hermes launcher so it can import that package. A copy of `pair.py` from before
+  that relaunch still prints a payload after the package is installed — update the
+  plugin, or reinstall with `--force`.
 - **Chat works but the app's Agent screen says `hermes_offline` on every tab** — the two
   features talk to different processes. Chat needs only the gateway; the Agent screen reads
   Hermes through its local REST API, which lives in `hermes dashboard`/`hermes serve`. The

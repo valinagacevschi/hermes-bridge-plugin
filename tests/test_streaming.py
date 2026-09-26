@@ -65,7 +65,7 @@ class TestSendExpectEdits(unittest.IsolatedAsyncioTestCase):
         self.adapter._ws.send = AsyncMock(side_effect=lambda f: sent_frames.append(f))
         with patch.object(self.adapter, "_enqueue_durable", AsyncMock()) as mock_enqueue:
             result = await self.adapter.send(
-                "chat-1", "Hel", metadata={"expect_edits": True}
+                "chat-1", "Hel", reply_to="phone-request-1", metadata={"expect_edits": True}
             )
 
         self.assertTrue(result.success)
@@ -73,6 +73,13 @@ class TestSendExpectEdits(unittest.IsolatedAsyncioTestCase):
         mock_enqueue.assert_not_called()
         payload = _open(sent_frames[0])
         self.assertEqual(payload["content"], "Hel")
+        self.assertTrue(payload["edit"], "the phone must classify the seed as a live preview")
+        self.assertEqual(payload["reply_to"], "phone-request-1")
+
+        with patch.object(self.adapter, "_enqueue_durable", AsyncMock()):
+            await self.adapter.edit_message("chat-1", result.message_id, "Hello", finalize=True)
+        final_payload = _open(sent_frames[1])
+        self.assertEqual(final_payload["reply_to"], "phone-request-1")
 
     async def test_unsolicited_send_still_enqueues(self):
         """Cron/scheduled-job sends never set expect_edits — unaffected."""

@@ -1,19 +1,26 @@
-# Hermes Bridge — two steps left
+# HermLink — two steps left
 
-**1. Install the two dependencies** (Hermes ships `websockets`, but neither of
-these, and it never installs plugin dependencies for you):
+**1. Python dependencies.** Hermes ships `websockets`. This plugin also needs
+PyNaCl (end-to-end encryption) and `qrcode` (the pairing QR in your terminal).
+
+Hermes 0.21.0 and newer prepares those declared dependencies after you agree,
+during install or enable. Answer yes when asked. Hermes selects its managed
+environment; there is no generation path to type.
+
+Older installations leave plugin dependencies uninstalled. Install them into
+the Hermes venv yourself:
 
     ~/.hermes/hermes-agent/venv/bin/pip install "PyNaCl>=1.6,<1.7" "qrcode>=7.4,<8"
 
-PyNaCl does the end-to-end encryption; `qrcode` draws the pairing QR in your
-terminal. Skip `qrcode` and step 2 prints a payload string you cannot scan.
+Skip `qrcode` and step 2 prints a payload string you cannot scan.
 
-**2. Pair a phone** — provisions your own profile on the relay, generates the
-end-to-end key, prints the QR:
+**2. Pair a phone.** The first run creates the profile, the laptop API key,
+and the end-to-end key, then prints the QR. Run it again and it keeps that
+profile and key, and mints a fresh invite:
 
     python3 ~/.hermes/plugins/hermes_bridge/pair.py
 
-Then install **Hermes Bridge** from the App Store, tap *Pair new device*, and
+Then install **HermLink** from the App Store, tap *Pair new device*, and
 scan. `pair.py` also points cron delivery at this chat
 (`HERMES_BRIDGE_HOME_CHANNEL`) and allowlists the bridge's sender
 (`HERMES_BRIDGE_ALLOWED_USERS=mobile`) — without it Hermes answers your first
@@ -22,7 +29,9 @@ default-denies any sender with no allowlist configured. Answer *yes* to the enab
 (`hermes gateway restart`), and your agent is on your phone.
 
 Re-run `pair.py` any time to pair another phone or replace an expired invite —
-it reuses the same profile.
+it reuses the same profile. Self-serve provisioning allows five requests per
+client IP per hour; if that limit is reached, wait for the window to expire
+before trying again.
 
 Nothing else to run. The app's Agent screen (sessions, skills, cron, usage,
 memory) reads Hermes through its local REST API, which lives in the dashboard
@@ -42,9 +51,13 @@ two, then send one chat message to confirm replies still arrive: that setting
 collided with an older version of this plugin, and the fix is not yet verified
 on a live gateway. Every other tab works on the dashboard alone.
 
-To upgrade later, reinstall with `--force`. `hermes plugins update` cannot
-work here: this plugin installs from a subdirectory, so its directory holds no
-`.git` for update to pull.
+To upgrade a tracked install, including one installed from a subdirectory:
+
+    hermes plugins update hermes_bridge
+
+That reinstalls from the recorded source when the plugin directory has no
+`.git`. If no source was recorded, force a reinstall instead. Either way
+`~/.hermes/.env` and `~/.hermes/psk` stay put — updating does not re-pair.
 
     hermes plugins install valinagacevschi/hermes-bridge-plugin/hermes_bridge --force
 
