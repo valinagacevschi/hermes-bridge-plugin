@@ -101,8 +101,7 @@ def _require(params: Dict[str, Any], key: str, error: str) -> str:
 
 # Recognisably truthy values for HERMES_BRIDGE_BOTS_ENABLED. Anything else
 # (including "", "0", "false", "no", "off", garbage) fails closed.
-# Read at local-ws connect time, not per call — a change takes effect on
-# the next connection. Plain os.getenv, not _get_scoped_secret: this is
+# Read per Bot operation. Plain os.getenv, not _get_scoped_secret: this is
 # correct specifically because multiplex_profiles is never enabled in this
 # design. A scoped lookup here would be the bug it looks like.
 _BOTS_ENABLED_TRUTHY = frozenset({"1", "true", "yes", "on"})
@@ -567,15 +566,11 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         # receives only the streaming id, so preserve reply correlation from
         # the initial send through every replacement/final frame.
         self._stream_reply_to: Dict[str, str] = {}
-        # Local JSON-RPC door to Hermes' /api/ws (PRD_Bots.md). Isolated from
-        # the relay socket and from REST-backed RPCs. Connect lazily on the
-        # first bots.* op so a laptop that never opens the Bots tab never
-        # opens this socket. _bots_enabled is the connect-time read of
-        # HERMES_BRIDGE_BOTS_ENABLED (None = not yet read).
+        # Local JSON-RPC door to Hermes' /api/ws. Isolated from the relay
+        # socket and opened lazily for Bot and connector health operations.
         self._local_ws = None
         self._local_ws_lock: Optional[asyncio.Lock] = None
         self._local_ws_next_id: int = 1
-        self._bots_enabled: Optional[bool] = None
         # Opaque chat token → {name, stored_id, runtime_handle, run_id, …}.
         # Phone never sees either Hermes session id.
         self._bot_chats: Dict[str, Dict[str, Any]] = {}
@@ -1697,42 +1692,257 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         days = p.get("days", 7)
         return await self._api.get(f"/api/analytics/usage?days={days}")
 
+    @staticmethod
+    def _project_connector_status(row: Dict[str, Any]) -> Dict[str, Any]:
+        allowed = ("name", "transport", "tools", "connected", "disabled", "status", "source", "plugin")
+        projected: Dict[str, Any] = {}
+        for key in allowed:
+            value = row.get(key)
+            if key in ("name", "plugin"):
+                if isinstance(value, str):
+                    value = re.sub(r"(?i)(https?://|file://|ssh://)\S+", "[redacted]", value)
+                    value = re.sub(
+                        r"(?i)(token|secret|password|authorization|api[_-]?key)(\s*[:=]\s*)[^\s,;]+",
+                        r"\1\2[redacted]",
+                        value,
+                    )
+                    projected[key] = value[:160]
+            elif key == "transport":
+                if value in ("stdio", "http", "sse"):
+                    projected[key] = value
+                elif isinstance(value, str):
+                    projected[key] = "other"
+            elif key == "status":
+                if value in ("connected", "disabled", "connecting", "failed", "lazy", "configured", "authentication_needed"):
+                    projected[key] = value
+                elif value == "auth_required":
+                    projected[key] = "authentication_needed"
+                elif isinstance(value, str):
+                    projected[key] = "unknown"
+            elif key == "source":
+                if value in ("config", "plugin"):
+                    projected[key] = value
+            elif key == "tools":
+                if isinstance(value, int) and not isinstance(value, bool):
+                    projected[key] = max(0, value)
+            elif isinstance(value, bool):
+                projected[key] = value
+        return projected
+
+    async def _rpc_connector_health(self, p: Dict[str, Any]) -> Any:
+        try:
+            raw = await self._local_rpc("mcp.servers.status", {})
+        except _LocalRpcError as exc:
+            raise _RpcError("connector_unavailable") from exc
+        if not isinstance(raw, dict) or not isinstance(raw.get("servers"), list):
+            raise _RpcError("connector_unavailable")
+        servers = [
+            self._project_connector_status(row)
+            for row in raw["servers"]
+            if isinstance(row, dict) and isinstance(row.get("name"), str)
+        ]
+        return {
+            "connectors": servers,
+            "checked_at": raw.get("checked_at") if isinstance(raw.get("checked_at"), int) else None,
+        }
+
+    async def _rpc_connector_capabilities(self, p: Dict[str, Any]) -> Any:
+        try:
+            await self._local_rpc("mcp.servers.status", {})
+        except _LocalRpcError:
+            return {"available": False, "test": False, "reason": "connector_unavailable"}
+        except _RpcError as exc:
+            reason = "offline" if str(exc) == "offline" else "connector_unavailable"
+            return {"available": False, "test": False, "reason": reason}
+        test_supported = False
+        try:
+            await self._local_rpc(
+                "mcp.servers.test", {"name": f"__hermlink_probe_{secrets.token_hex(8)}"}
+            )
+            test_supported = True
+        except _LocalRpcError as exc:
+            # 4064 is the current method's normal "configured server not found"
+            # response. JSON-RPC -32601 means this runtime predates the method.
+            test_supported = exc.code != -32601
+        return {"available": True, "test": test_supported, "reason": None}
+
+    async def _rpc_connector_test(self, p: Dict[str, Any]) -> Any:
+        name = _require(p, "name", "missing_connector_name")
+        current = await self._local_rpc("mcp.servers.status", {})
+        rows = current.get("servers") if isinstance(current, dict) else None
+        matches = [
+            row
+            for row in rows or []
+            if isinstance(row, dict) and self._project_connector_status(row).get("name") == name
+        ]
+        if len(matches) != 1:
+            raise _RpcError("connector_not_found")
+        upstream_name = str(matches[0].get("name") or "")
+        try:
+            raw = await self._local_rpc("mcp.servers.test", {"name": upstream_name})
+        except _LocalRpcError as exc:
+            # Do not return upstream exception text; it can contain secret URLs,
+            # headers, or tool output from a connector process.
+            raise _RpcError("connector_test_failed") from exc
+        if not isinstance(raw, dict):
+            raise _RpcError("connector_test_failed")
+        oauth_needed = raw.get("oauth_needed") is True
+        token_present = raw.get("oauth_tokens_present")
+        auth_needed = oauth_needed and token_present is False
+        if raw.get("ok") is True:
+            status = "healthy"
+        elif auth_needed:
+            status = "authentication_needed"
+        else:
+            status = "unavailable"
+        tools = raw.get("tools")
+        return {
+            "name": name,
+            "ok": raw.get("ok") is True,
+            "status": status,
+            "authentication_needed": auth_needed,
+            "tool_count": len(tools) if isinstance(tools, list) else 0,
+        }
+
+    def _cron_profile_query(self, p: Dict[str, Any]) -> str:
+        profile = _require(p, "profile", "missing_profile")
+        return urlencode({"profile": profile})
+
+    async def _require_cron_owner(self, p: Dict[str, Any], id_key: str) -> str:
+        profile = _require(p, "profile", "missing_profile")
+        job_id = _require(p, id_key, "missing_job_id")
+        raw = await self._api.get(f"/api/cron/jobs?{urlencode({'profile': profile})}")
+        rows = raw.get("jobs", []) if isinstance(raw, dict) else raw
+        row = next(
+            (item for item in rows if isinstance(item, dict) and str(item.get("id")) == job_id),
+            None,
+        ) if isinstance(rows, list) else None
+        owner = (row.get("profile") or row.get("profile_name")) if row else None
+        if row and not owner:
+            # This lookup is profile-scoped; some Hermes versions omit owner
+            # metadata on the row, so its presence still proves that scope.
+            owner = profile
+        if owner and owner != profile:
+            raise _RpcError("cron_owner_mismatch")
+        if not owner and profile != "default":
+            raise _RpcError("cron_owner_unverified")
+        return profile
+
+    async def _rpc_cron_profiles(self, p: Dict[str, Any]) -> Any:
+        raw = await self._api.get("/api/profiles")
+        rows = raw.get("profiles") if isinstance(raw, dict) else None
+        if not isinstance(rows, list):
+            raise _RpcError("cron_profiles_unavailable")
+        return sorted(
+            {str(row["name"]).strip() for row in rows if isinstance(row, dict) and row.get("name")}
+        )
+
+    async def _rpc_cron_capabilities(self, p: Dict[str, Any]) -> Any:
+        try:
+            openapi = await self._api.get("/openapi.json")
+            await self._rpc_cron_profiles({})
+        except Exception:
+            return {"available": False, "continuity": False, "reason": "cron_unavailable"}
+        components = openapi.get("components") if isinstance(openapi, dict) else None
+        schemas = components.get("schemas", {}) if isinstance(components, dict) else {}
+        create_fields = schemas.get("CronJobCreate", {}).get("properties", {})
+        return {
+            "available": True,
+            "continuity": "context_from" in create_fields,
+            "reason": None if "context_from" in create_fields else "continuity_unsupported",
+        }
+
+    @staticmethod
+    def _project_cron_job(row: Dict[str, Any]) -> Dict[str, Any]:
+        allowed = (
+            "id", "name", "schedule", "schedule_display", "next_run_at", "last_run_at",
+            "enabled", "state", "paused_at", "prompt", "skills", "deliver", "context_from",
+        )
+        projected = {key: row[key] for key in allowed if key in row}
+        owner = row.get("profile") or row.get("profile_name")
+        if not owner and row.get("is_default_profile"):
+            owner = "default"
+        if owner:
+            projected["profile"] = str(owner)
+        return projected
+
+    async def _rpc_cron_list(self, p: Dict[str, Any]) -> Any:
+        try:
+            profiles = await self._rpc_cron_profiles({})
+        except Exception:
+            # Old dashboard versions can still serve their aggregate list. Rows
+            # without an owner remain visibly unscoped and cannot be mutated by
+            # the owner-aware mobile UI.
+            raw = await self._api.get("/api/cron/jobs")
+            rows = raw.get("jobs", []) if isinstance(raw, dict) else raw
+            return [self._project_cron_job(row) for row in rows if isinstance(row, dict)]
+        jobs: List[Dict[str, Any]] = []
+        for profile in profiles:
+            raw = await self._api.get(f"/api/cron/jobs?{urlencode({'profile': profile})}")
+            rows = raw.get("jobs", []) if isinstance(raw, dict) else raw
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if isinstance(row, dict):
+                    projected = self._project_cron_job(row)
+                    projected["profile"] = profile
+                    jobs.append(projected)
+        return jobs
+
     async def _rpc_cron_action(self, p: Dict[str, Any], action: str) -> Any:
-        job_id = _require(p, "id", "missing_job_id")
-        return await self._api.post(f"/api/cron/jobs/{job_id}/{action}")
+        job_id = quote(_require(p, "id", "missing_job_id"), safe="")
+        await self._require_cron_owner(p, "id")
+        query = self._cron_profile_query(p)
+        return await self._api.post(f"/api/cron/jobs/{job_id}/{action}?{query}")
 
     async def _rpc_cron_create(self, p: Dict[str, Any]) -> Any:
         schedule = _require(p, "schedule", "missing_schedule")
         body: Dict[str, Any] = {"schedule": schedule}
-        for key in ("prompt", "name", "deliver"):
-            if p.get(key):
-                body[key] = str(p[key])
+        for key in ("prompt", "name", "deliver", "context_from"):
+            if key in p:
+                body[key] = p[key] if key == "context_from" else str(p[key])
         skills = p.get("skills")
         if skills:
             body["skills"] = skills if isinstance(skills, list) else [str(skills)]
-        return await self._api.post("/api/cron/jobs", body=body)
+        return await self._api.post(
+            f"/api/cron/jobs?{self._cron_profile_query(p)}", body=body
+        )
 
     async def _rpc_cron_edit(self, p: Dict[str, Any]) -> Any:
         job_id = _require(p, "id", "missing_job_id")
-        updates: Dict[str, Any] = {k: p[k] for k in ("schedule", "prompt", "name", "deliver") if k in p}
+        updates: Dict[str, Any] = {
+            k: p[k] for k in ("schedule", "prompt", "name", "deliver", "context_from") if k in p
+        }
         if "skills" in p:
             skills = p.get("skills")
             updates["skills"] = skills if isinstance(skills, list) else ([str(skills)] if skills else [])
         if not updates:
             raise _RpcError("no_updates")
-        return await self._api.post(f"/api/cron/jobs/{job_id}", body={"updates": updates}, method="PUT")
+        await self._require_cron_owner(p, "id")
+        query = self._cron_profile_query(p)
+        return await self._api.post(
+            f"/api/cron/jobs/{quote(job_id, safe='')}?{query}",
+            body={"updates": updates},
+            method="PUT",
+        )
 
     async def _rpc_cron_delete(self, p: Dict[str, Any]) -> Any:
         # (#46) DELETE on the bare job resource, unlike pause/resume/trigger's
         # POST-to-an-action-sub-path — matches upstream's real REST route
         # (hermes_cli/web_routers/cron.py), not a _rpc_cron_action suffix-call.
         job_id = _require(p, "id", "missing_job_id")
-        return await self._api.post(f"/api/cron/jobs/{job_id}", method="DELETE")
+        await self._require_cron_owner(p, "id")
+        query = self._cron_profile_query(p)
+        return await self._api.post(
+            f"/api/cron/jobs/{quote(job_id, safe='')}?{query}", method="DELETE"
+        )
 
     async def _rpc_cron_runs(self, p: Dict[str, Any]) -> Any:
         job_id = _require(p, "job_id", "missing_job_id")
         limit = int(p.get("limit", 20))
-        return await self._api.get(f"/api/cron/jobs/{job_id}/runs?limit={limit}")
+        profile = await self._require_cron_owner(p, "job_id")
+        query = urlencode({"limit": str(limit), "profile": profile})
+        return await self._api.get(f"/api/cron/jobs/{quote(job_id, safe='')}/runs?{query}")
 
     async def _rpc_runs_start(self, p: Dict[str, Any]) -> Any:
         run_data = await self._api.post("/v1/runs", body=p)
@@ -1928,18 +2138,13 @@ class HermesBridgeAdapter(BasePlatformAdapter):
     async def _ensure_local_ws(self) -> None:
         """Open the dashboard JSON-RPC door. Isolated from the relay socket.
 
-        Flag is read here (connect time), not per call. Failures raise
-        _RpcError so _handle_rpc forwards the exact wire kind:
-        bots_disabled / offline / bots_unavailable.
+        Bot enablement is checked by Bot operations, not here, so Agent
+        connector health can use the same isolated local door independently.
+        Connection failures raise _RpcError with offline or bots_unavailable.
         """
         if getattr(self, "_local_ws", None) is not None:
             return
-        # Connect-time read. Not _get_scoped_secret — multiplex_profiles is
-        # never enabled in this design.
-        self._bots_enabled = _bots_flag_enabled()
-        if not self._bots_enabled:
-            raise _RpcError("bots_disabled")
-
+        # This adapter does not enable multiplexed gateway credentials.
         last_exc: Optional[Exception] = None
         saw_dashboard = False
         # Dashboard candidates, not ports_to_probe(): `/api/ws` is a dashboard
@@ -2001,6 +2206,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
 
     async def _rpc_bots_list(self, p: Dict[str, Any]) -> Any:
         """Roster of bot-managed core-profiles on this laptop."""
+        self._require_bots_enabled()
         try:
             result = await self._local_rpc("profiles.list", {"include_sessions": True})
         except _LocalRpcError as exc:
@@ -2012,6 +2218,25 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             rows = []
         return [_project_bot_row(r) for r in rows if isinstance(r, dict) and _is_bot_managed_row(r)]
 
+    async def _rpc_bots_capabilities(self, p: Dict[str, Any]) -> Any:
+        """Report Bot actions supported by this bridge and local runtime."""
+        if not _bots_flag_enabled():
+            return {"stop": {"available": False, "reason": "bots_disabled"}}
+        try:
+            result = await self._local_rpc("profiles.list", {"include_sessions": False})
+        except _RpcError as exc:
+            return {"stop": {"available": False, "reason": str(exc)}}
+        except _LocalRpcError:
+            return {"stop": {"available": False, "reason": "bots_unavailable"}}
+        if not isinstance(result, dict) or not result.get("bot_mode_protocol"):
+            return {"stop": {"available": False, "reason": "bots_unavailable"}}
+        return {"stop": {"available": True, "reason": None}}
+
+    @staticmethod
+    def _require_bots_enabled() -> None:
+        if not _bots_flag_enabled():
+            raise _RpcError("bots_disabled")
+
     async def _require_bot_profile(self, name: str) -> Dict[str, Any]:
         """Re-validate the name. Authorization boundary, not a display filter.
 
@@ -2020,6 +2245,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         laptop directory logs a warning and silently uses the default
         (gateway/run.py). We deliberately do not copy that.
         """
+        self._require_bots_enabled()
         try:
             result = await self._local_rpc("profiles.list", {"include_sessions": True})
         except _LocalRpcError as exc:
@@ -2208,6 +2434,11 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 inflight = snap.get("inflight") if isinstance(snap.get("inflight"), dict) else {}
                 text = str((inflight or {}).get("assistant") or "")
                 running = bool(snap.get("running") or (inflight or {}).get("streaming"))
+                if chat.get("suppress_running_until_idle"):
+                    if running:
+                        await asyncio.sleep(getattr(self, "_bot_poll_fast_s", _BOT_POLL_FAST_S))
+                        continue
+                    chat["suppress_running_until_idle"] = False
                 run_id = str(chat.get("run_id") or "")
                 if running:
                     if not run_id:
@@ -2341,6 +2572,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         }
 
     async def _rpc_bots_send(self, p: Dict[str, Any]) -> Any:
+        self._require_bots_enabled()
         token = str(p.get("chat") or "").strip()
         text = str(p.get("text") or "").strip()
         if not token:
@@ -2357,8 +2589,86 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         chat["run_id"] = run_id
         chat["was_running"] = True
         chat["last_text"] = ""
+        chat["suppress_running_until_idle"] = False
         self._start_bot_poll(token)
         return {"run_id": run_id}
+
+    async def _rpc_bots_stop(self, p: Dict[str, Any]) -> Any:
+        """Interrupt only the Bot chat named by a live opaque token."""
+        self._require_bots_enabled()
+        token = str(p.get("chat") or "").strip()
+        if not token:
+            raise _RpcError("chat_expired")
+        chat = getattr(self, "_bot_chats", {}).get(token)
+        if chat is None:
+            raise _RpcError("chat_expired")
+        await self._require_bot_profile(str(chat.get("name") or ""))
+        self._touch_bot_chat(chat)
+
+        recovered_stale_handle = False
+        try:
+            snapshot = await self._resume_bot_chat(str(chat["name"]), str(chat["stored_id"]))
+            runtime = str(snapshot.get("session_id") or "").strip()
+            if not runtime:
+                raise _RpcError("chat_expired")
+            chat["runtime_handle"] = runtime
+        except _RpcError as exc:
+            if str(exc) == "chat_expired":
+                await self._reresolve_bot_chat(chat)
+                recovered_stale_handle = True
+                snapshot = {"running": True}
+            else:
+                raise
+
+        run_id = str(chat.get("run_id") or "")
+        inflight = snapshot.get("inflight") if isinstance(snapshot.get("inflight"), dict) else {}
+        active = bool(snapshot.get("running") or inflight.get("streaming"))
+        if not active:
+            if run_id and chat.get("was_running"):
+                final_text = str(inflight.get("assistant") or chat.get("last_text") or "")
+                await self._send_run_event(
+                    run_id, "run.completed", {"text": final_text}, done=True
+                )
+            chat["was_running"] = False
+            chat["run_id"] = None
+            return {"stopped": False, "status": "already_finished"}
+
+        try:
+            outcome = await self._local_rpc(
+                "session.interrupt", {"session_id": chat["runtime_handle"]}
+            )
+        except _LocalRpcError as exc:
+            if not _is_stale_session(exc):
+                raise _RpcError("bots_unavailable") from exc
+            if recovered_stale_handle:
+                raise _RpcError("chat_expired") from exc
+            await self._reresolve_bot_chat(chat)
+            try:
+                outcome = await self._local_rpc(
+                    "session.interrupt", {"session_id": chat["runtime_handle"]}
+                )
+            except _LocalRpcError as retry_exc:
+                raise _RpcError("chat_expired") from retry_exc
+
+        interrupted = isinstance(outcome, dict) and outcome.get("status") == "interrupted"
+        if interrupted and run_id:
+            final_text = str(inflight.get("assistant") or chat.get("last_text") or "")
+            await self._send_run_event(
+                run_id, "run.stopped", {"text": final_text}, done=True
+            )
+        elif run_id and chat.get("was_running"):
+            final_text = str(inflight.get("assistant") or chat.get("last_text") or "")
+            await self._send_run_event(
+                run_id, "run.completed", {"text": final_text}, done=True
+            )
+        chat["was_running"] = False
+        chat["run_id"] = None
+        chat["last_text"] = ""
+        chat["suppress_running_until_idle"] = interrupted
+        return {
+            "stopped": interrupted,
+            "status": "stopped" if interrupted else "already_finished",
+        }
 
     async def _rpc_bots_close(self, p: Dict[str, Any]) -> Any:
         token = str(p.get("chat") or "").strip()
@@ -2367,6 +2677,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         return {"closed": True}
 
     async def _rpc_bots_history(self, p: Dict[str, Any]) -> Any:
+        self._require_bots_enabled()
         token = str(p.get("chat") or "").strip()
         if not token:
             raise _RpcError("chat_expired")

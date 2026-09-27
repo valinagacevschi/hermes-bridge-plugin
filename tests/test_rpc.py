@@ -53,7 +53,7 @@ class TestCronWriteMethods(unittest.IsolatedAsyncioTestCase):
         self.adapter._ws.send = capture_send
 
         hermes_response = {"status": "ok"}
-        with patch.object(
+        with patch.object(self.adapter._api, "get", AsyncMock(return_value=[{"id": "job", "profile": "default"}])), patch.object(
             self.adapter._api, "post", AsyncMock(return_value=hermes_response)
         ) as mock_post:
             await self.adapter._handle_rpc(
@@ -62,27 +62,47 @@ class TestCronWriteMethods(unittest.IsolatedAsyncioTestCase):
         return sent_frames, mock_post
 
     async def test_cron_pause_calls_correct_path(self):
-        frames, mock_post = await self._run("cron.pause", {"id": "job-abc"})
-        mock_post.assert_called_once_with("/api/cron/jobs/job-abc/pause")
+        frames, mock_post = await self._run("cron.pause", {"id": "job-abc", "profile": "default"})
+        mock_post.assert_called_once_with("/api/cron/jobs/job-abc/pause?profile=default")
         assert len(frames) == 1
 
     async def test_cron_resume_calls_correct_path(self):
-        frames, mock_post = await self._run("cron.resume", {"id": "job-xyz"})
-        mock_post.assert_called_once_with("/api/cron/jobs/job-xyz/resume")
+        frames, mock_post = await self._run("cron.resume", {"id": "job-xyz", "profile": "default"})
+        mock_post.assert_called_once_with("/api/cron/jobs/job-xyz/resume?profile=default")
         assert len(frames) == 1
 
     async def test_cron_trigger_calls_correct_path(self):
-        frames, mock_post = await self._run("cron.trigger", {"id": "job-123"})
-        mock_post.assert_called_once_with("/api/cron/jobs/job-123/trigger")
+        frames, mock_post = await self._run("cron.trigger", {"id": "job-123", "profile": "default"})
+        mock_post.assert_called_once_with("/api/cron/jobs/job-123/trigger?profile=default")
         assert len(frames) == 1
 
     async def test_cron_delete_calls_correct_path_and_method(self):
         """DELETE on the bare job resource (#46) — not a pause/resume/trigger-
         style POST to an action sub-path, since upstream's real route is
         `DELETE /api/cron/jobs/{id}` (hermes_cli/web_routers/cron.py)."""
-        frames, mock_post = await self._run("cron.delete", {"id": "job-999"})
-        mock_post.assert_called_once_with("/api/cron/jobs/job-999", method="DELETE")
+        frames, mock_post = await self._run("cron.delete", {"id": "job-999", "profile": "default"})
+        mock_post.assert_called_once_with("/api/cron/jobs/job-999?profile=default", method="DELETE")
         assert len(frames) == 1
+
+    async def test_cron_action_requires_an_explicit_profile(self):
+        frames, mock_post = await self._run("cron.pause", {"id": "job-abc"})
+        mock_post.assert_not_called()
+        assert len(frames) == 1
+
+    async def test_cron_action_rejects_profile_fallback_to_another_owner(self):
+        with patch.object(self.adapter._api, "get", AsyncMock(return_value=[{"id": "job", "profile": "default"}])), patch.object(
+            self.adapter._api, "post", AsyncMock()
+        ) as mock_post, patch.object(self.adapter, "_send_rpc_response", AsyncMock()) as response:
+            await self.adapter._handle_rpc(_rpc_payload("cron.pause", {"id": "job", "profile": "coder"}))
+        mock_post.assert_not_awaited()
+        self.assertEqual(response.await_args.kwargs["error"], "cron_owner_mismatch")
+
+    async def test_cron_action_accepts_ownerless_job_from_profile_scoped_list(self):
+        with patch.object(self.adapter._api, "get", AsyncMock(return_value=[{"id": "job-123"}])), patch.object(
+            self.adapter._api, "post", AsyncMock(return_value={"status": "ok"})
+        ) as mock_post:
+            await self.adapter._rpc_cron_action({"id": "job-123", "profile": "coder"}, "trigger")
+        mock_post.assert_awaited_once_with("/api/cron/jobs/job-123/trigger?profile=coder")
 
     async def test_missing_job_id_returns_error(self):
         sent_frames = []
@@ -108,15 +128,17 @@ class TestCronWriteMethods(unittest.IsolatedAsyncioTestCase):
         self.adapter._ws.send = capture_send
 
         with patch.object(
+            self.adapter._api, "get", AsyncMock(return_value=[{"id": "job-1", "profile": "default"}])
+        ), patch.object(
             self.adapter._api, "post", AsyncMock(return_value={"ok": True})
         ) as mock_post:
             # First call — should be processed
             await self.adapter._handle_rpc(
-                _rpc_payload("cron.trigger", {"id": "job-1"}, rpc_id="dup-id-001")
+                _rpc_payload("cron.trigger", {"id": "job-1", "profile": "default"}, rpc_id="dup-id-001")
             )
             # Second call — same rpc.id — should be dropped
             await self.adapter._handle_rpc(
-                _rpc_payload("cron.trigger", {"id": "job-1"}, rpc_id="dup-id-001")
+                _rpc_payload("cron.trigger", {"id": "job-1", "profile": "default"}, rpc_id="dup-id-001")
             )
 
         mock_post.assert_called_once()  # only fired once despite two calls
@@ -131,13 +153,15 @@ class TestCronWriteMethods(unittest.IsolatedAsyncioTestCase):
         self.adapter._ws.send = capture_send
 
         with patch.object(
+            self.adapter._api, "get", AsyncMock(return_value=[{"id": "job-1", "profile": "default"}])
+        ), patch.object(
             self.adapter._api, "post", AsyncMock(return_value={"ok": True})
         ) as mock_post:
             await self.adapter._handle_rpc(
-                _rpc_payload("cron.trigger", {"id": "job-1"}, rpc_id="id-A")
+                _rpc_payload("cron.trigger", {"id": "job-1", "profile": "default"}, rpc_id="id-A")
             )
             await self.adapter._handle_rpc(
-                _rpc_payload("cron.trigger", {"id": "job-1"}, rpc_id="id-B")
+                _rpc_payload("cron.trigger", {"id": "job-1", "profile": "default"}, rpc_id="id-B")
             )
 
         assert mock_post.call_count == 2
@@ -201,6 +225,8 @@ class TestCronCreateEdit(unittest.IsolatedAsyncioTestCase):
                     "cron.create",
                     {
                         "schedule": "every 2h",
+                        "profile": "coder",
+                        "context_from": ["self", "job-upstream"],
                         "prompt": "check server status",
                         "name": "Health check",
                         "deliver": "origin",
@@ -209,9 +235,10 @@ class TestCronCreateEdit(unittest.IsolatedAsyncioTestCase):
                 )
             )
         mock_post.assert_called_once_with(
-            "/api/cron/jobs",
+            "/api/cron/jobs?profile=coder",
             body={
                 "schedule": "every 2h",
+                "context_from": ["self", "job-upstream"],
                 "prompt": "check server status",
                 "name": "Health check",
                 "deliver": "origin",
@@ -219,6 +246,15 @@ class TestCronCreateEdit(unittest.IsolatedAsyncioTestCase):
             },
         )
         assert len(self.sent_frames) == 1
+
+    async def test_create_without_continuity_does_not_send_context_from(self):
+        with patch.object(self.adapter._api, "post", AsyncMock(return_value={"id": "new"})) as post:
+            await self.adapter._handle_rpc(_rpc_payload(
+                "cron.create", {"schedule": "every 1h", "profile": "default"}
+            ))
+        post.assert_called_once_with(
+            "/api/cron/jobs?profile=default", body={"schedule": "every 1h"}
+        )
 
     async def test_create_schedule_parse_error_surfaces_detail(self):
         """Hermes core's HTTP 400 {"detail": "..."} must reach the RPC caller
@@ -229,11 +265,12 @@ class TestCronCreateEdit(unittest.IsolatedAsyncioTestCase):
             self.adapter, "_send_rpc_response", AsyncMock()
         ) as mock_response, patch.object(self.adapter._api, "post", AsyncMock(side_effect=error)):
             await self.adapter._handle_rpc(
-                _rpc_payload("cron.create", {"schedule": "whenever", "prompt": "x"})
+                _rpc_payload("cron.create", {"schedule": "whenever", "prompt": "x", "profile": "default"})
             )
         call_kwargs = mock_response.call_args.kwargs
         assert call_kwargs["ok"] is False
         assert "Could not parse schedule" in call_kwargs["error"]
+
 
     async def test_edit_missing_job_id_returns_error(self):
         with patch.object(self.adapter._api, "post", AsyncMock()) as mock_post:
@@ -249,14 +286,16 @@ class TestCronCreateEdit(unittest.IsolatedAsyncioTestCase):
 
     async def test_edit_sends_partial_updates_wrapped(self):
         with patch.object(
+            self.adapter._api, "get", AsyncMock(return_value=[{"id": "job-1", "profile": "coder"}])
+        ), patch.object(
             self.adapter._api, "post", AsyncMock(return_value={"id": "job-1"})
         ) as mock_post:
             await self.adapter._handle_rpc(
-                _rpc_payload("cron.edit", {"id": "job-1", "schedule": "every 1h"})
+                _rpc_payload("cron.edit", {"id": "job-1", "schedule": "every 1h", "profile": "coder", "context_from": ["self"]})
             )
         mock_post.assert_called_once_with(
-            "/api/cron/jobs/job-1",
-            body={"updates": {"schedule": "every 1h"}},
+            "/api/cron/jobs/job-1?profile=coder",
+            body={"updates": {"schedule": "every 1h", "context_from": ["self"]}},
             method="PUT",
         )
         assert len(self.sent_frames) == 1
@@ -264,14 +303,58 @@ class TestCronCreateEdit(unittest.IsolatedAsyncioTestCase):
     async def test_edit_schedule_parse_error_surfaces_detail(self):
         error = _http_error(400, "Could not parse schedule: 'nonsense'")
         with patch.object(
+            self.adapter._api, "get", AsyncMock(return_value=[{"id": "job-1", "profile": "default"}])
+        ), patch.object(
             self.adapter, "_send_rpc_response", AsyncMock()
         ) as mock_response, patch.object(self.adapter._api, "post", AsyncMock(side_effect=error)):
             await self.adapter._handle_rpc(
-                _rpc_payload("cron.edit", {"id": "job-1", "schedule": "nonsense"})
+                _rpc_payload("cron.edit", {"id": "job-1", "schedule": "nonsense", "profile": "default"})
             )
         call_kwargs = mock_response.call_args.kwargs
         assert call_kwargs["ok"] is False
         assert "Could not parse schedule" in call_kwargs["error"]
+
+
+class TestCronOwnerReads(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.adapter = _make_adapter()
+
+    async def test_list_reads_each_profile_and_keeps_duplicate_ids_separate(self):
+        async def _get(path):
+            if path == "/api/profiles":
+                return {"profiles": [{"name": "default"}, {"name": "coder"}]}
+            if path == "/api/cron/jobs?profile=default":
+                return [{"id": "same-id", "profile": "default", "context_from": ["self"], "hermes_home": "/secret"}]
+            if path == "/api/cron/jobs?profile=coder":
+                return [{"id": "same-id", "profile": "coder", "context_from": ["job-x"], "hermes_home": "/secret"}]
+            raise AssertionError(path)
+
+        with patch.object(self.adapter._api, "get", _get):
+            jobs = await self.adapter._rpc_cron_list({})
+        assert {(job["id"], job["profile"]) for job in jobs} == {
+            ("same-id", "default"), ("same-id", "coder")
+        }
+        assert next(job for job in jobs if job["profile"] == "default")["context_from"] == ["self"]
+        assert "hermes_home" not in str(jobs)
+
+    async def test_run_history_uses_explicit_profile(self):
+        with patch.object(
+            self.adapter._api, "get", AsyncMock(side_effect=[[{"id": "same-id", "profile": "coder"}], {"runs": []}])
+        ) as get:
+            await self.adapter._rpc_cron_runs({
+                "job_id": "same-id", "profile": "coder", "limit": 10
+            })
+        self.assertEqual(get.await_args_list[-1].args[0],
+            "/api/cron/jobs/same-id/runs?limit=10&profile=coder"
+        )
+
+    async def test_run_history_rejects_another_owner(self):
+        with patch.object(
+            self.adapter._api, "get", AsyncMock(return_value=[{"id": "same-id", "profile": "default"}])
+        ) as get:
+            with self.assertRaisesRegex(Exception, "cron_owner_mismatch"):
+                await self.adapter._rpc_cron_runs({"job_id": "same-id", "profile": "coder"})
+        get.assert_awaited_once()
 
 
 class TestHermesRequestHttpError(unittest.IsolatedAsyncioTestCase):
