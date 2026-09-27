@@ -5,7 +5,8 @@ plugins/platforms/hermes_bridge/test_attachments.py — edit the source there, n
 Unit tests for HermesBridgeAdapter attachments (PRD_Features.md §2.3):
 outbound send_image_file/send_document (seal+upload to the relay's
 sealed-blob store) and inbound attachment fetch+decrypt into
-MessageEvent.media_urls/media_types.
+MessageEvent.media_urls/media_types. Inbound cache names keep a real
+suffix — a "Voice message" label with audio/m4a is stored as .m4a.
 
 Run:
     PYTHONPATH=<repo-root> ~/.hermes/hermes-agent/venv/bin/python plugins/platforms/hermes_bridge/test_attachments.py
@@ -205,6 +206,44 @@ class TestInboundAttachments(unittest.IsolatedAsyncioTestCase):
         # sharing a display name.
         self.assertIn("blob_xyz", os.path.basename(media_urls[0]))
         self.assertIn("cat.jpg", os.path.basename(media_urls[0]))
+        self.assertTrue(os.path.basename(media_urls[0]).endswith(".jpg"))
+
+    async def test_voice_message_label_gets_m4a_suffix(self):
+        """Issue #4: the phone's display label "Voice message" has no
+        suffix, and audio/m4a is absent from the stdlib MIME table. The
+        cache file must still end in .m4a or Hermes rejects it before STT."""
+        with patch.object(
+            self.adapter, "_download_blob", AsyncMock(return_value=b"aac bytes")
+        ), patch("hermes_bridge.adapter._INBOUND_MEDIA_DIR", self._tmpdir.name):
+            media_urls, media_types = await self.adapter._download_attachments_to_media(
+                [{"mime": "audio/m4a", "blob_id": "blob_voice", "name": "Voice message"}]
+            )
+
+        self.assertEqual(media_types, ["audio/m4a"])
+        basename = os.path.basename(media_urls[0])
+        self.assertEqual(basename, "blob_voice_Voice message.m4a")
+
+    async def test_existing_audio_suffix_is_kept(self):
+        with patch.object(
+            self.adapter, "_download_blob", AsyncMock(return_value=b"aac bytes")
+        ), patch("hermes_bridge.adapter._INBOUND_MEDIA_DIR", self._tmpdir.name):
+            media_urls, _ = await self.adapter._download_attachments_to_media(
+                [{"mime": "audio/m4a", "blob_id": "blob_voice", "name": "v.m4a"}]
+            )
+
+        self.assertEqual(os.path.basename(media_urls[0]), "blob_voice_v.m4a")
+
+    async def test_m4a_container_sniff_when_mime_is_generic(self):
+        # ISO-BMFF header: size + 'ftyp' + brand 'M4A '.
+        m4a = b"\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00"
+        with patch.object(
+            self.adapter, "_download_blob", AsyncMock(return_value=m4a)
+        ), patch("hermes_bridge.adapter._INBOUND_MEDIA_DIR", self._tmpdir.name):
+            media_urls, _ = await self.adapter._download_attachments_to_media(
+                [{"mime": "application/octet-stream", "blob_id": "blob_raw", "name": "Voice message"}]
+            )
+
+        self.assertTrue(os.path.basename(media_urls[0]).endswith(".m4a"))
 
     async def test_failed_download_is_skipped_not_fatal(self):
         with patch.object(

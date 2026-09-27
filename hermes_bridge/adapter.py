@@ -284,6 +284,90 @@ _INBOUND_MEDIA_DIR = os.path.join(
     os.path.expanduser("~"), ".hermes", "platforms", "hermes_bridge", "media"
 )
 
+# Hermes transcription rejects a file whose suffix is not in this set
+# ("Unsupported format: ."). The phone labels a voice note "Voice message"
+# and declares audio/m4a, which the stdlib mimetypes table does not know,
+# so the cache name has to grow a suffix from the MIME type or the container.
+_HERMES_AUDIO_EXTENSIONS = frozenset({
+    ".aac", ".caf", ".flac", ".m4a", ".mp3", ".mp4", ".mpeg",
+    ".mpga", ".oga", ".ogg", ".opus", ".wav", ".webm",
+})
+_MIME_TO_AUDIO_EXTENSION = {
+    "audio/m4a": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/mp4": ".m4a",
+    "audio/aac": ".aac",
+    "audio/x-aac": ".aac",
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/wave": ".wav",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".opus",
+    "audio/webm": ".webm",
+    "audio/flac": ".flac",
+    "audio/x-flac": ".flac",
+    "audio/x-caf": ".caf",
+    "audio/mpga": ".mpga",
+}
+_M4A_BRANDS = frozenset({b"M4A ", b"M4B ", b"M4P "})
+
+
+def _recognized_filename_extension(ext: str) -> bool:
+    """True when `ext` (including the dot) is already a usable storage suffix."""
+    if not ext or ext == ".":
+        return False
+    if ext in _HERMES_AUDIO_EXTENSIONS:
+        return True
+    return mimetypes.guess_type(f"file{ext}")[0] is not None
+
+
+def _sniff_audio_extension(data: bytes) -> Optional[str]:
+    """Container sniff used only when the MIME type does not name a suffix."""
+    if len(data) >= 12 and data[4:8] == b"ftyp" and data[8:12] in _M4A_BRANDS:
+        return ".m4a"
+    if data.startswith(b"ID3"):
+        return ".mp3"
+    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WAVE":
+        return ".wav"
+    if data.startswith(b"OggS"):
+        return ".ogg"
+    if data.startswith(b"fLaC"):
+        return ".flac"
+    return None
+
+
+def _extension_for_attachment(mime: str, data: bytes) -> str:
+    base = mime.split(";")[0].strip().lower()
+    mapped = _MIME_TO_AUDIO_EXTENSION.get(base)
+    if mapped:
+        return mapped
+    if base in ("", "application/octet-stream", "binary/octet-stream"):
+        return _sniff_audio_extension(data) or ".bin"
+    guessed = mimetypes.guess_extension(base)
+    if guessed:
+        return guessed
+    return _sniff_audio_extension(data) or ".bin"
+
+
+def _inbound_attachment_filename(
+    blob_id: str, name: Any, mime: str, data: bytes
+) -> str:
+    """Cache basename: `{blob_id}_{label}`. A display label with no real
+    suffix (the voice-note label "Voice message") gets one from the MIME
+    type, then from the container bytes."""
+    label = str(name).strip() if name else ""
+    if not label:
+        label = blob_id
+    ext = os.path.splitext(label)[1].lower()
+    if not _recognized_filename_extension(ext):
+        suffix = _extension_for_attachment(mime, data)
+        if not label.lower().endswith(suffix):
+            label = f"{label}{suffix}"
+    return f"{blob_id}_{label}"
+
+
 # Durable-queue reconnect cursor (#41) — the highest phone->gateway `seq` this
 # adapter has successfully dispatched, so a process restart resumes replay
 # from where it left off instead of redoing (or worse, silently skipping) the
@@ -2532,12 +2616,14 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             if plaintext is None:
                 logger.warning("[hermes_bridge] failed to fetch/decrypt attachment blob %s", blob_id)
                 continue
-            ext = mimetypes.guess_extension(mime.split(";")[0].strip()) or ".bin"
-            name = str(att.get("name") or f"{blob_id}{ext}")
             # blob_id-prefixed filename avoids collisions between attachments
             # that share a display name (mirrors lib/attachments.ts's
-            # writeAttachmentToCache on the mobile side).
-            out_path = os.path.join(_INBOUND_MEDIA_DIR, f"{blob_id}_{name}")
+            # writeAttachmentToCache on the mobile side). A label with no
+            # suffix still gets one — Hermes rejects extensionless audio.
+            filename = _inbound_attachment_filename(
+                blob_id, att.get("name"), mime, plaintext
+            )
+            out_path = os.path.join(_INBOUND_MEDIA_DIR, filename)
             try:
                 os.makedirs(_INBOUND_MEDIA_DIR, exist_ok=True)
                 with open(out_path, "wb") as f:
