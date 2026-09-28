@@ -1750,10 +1750,24 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         try:
             await self._local_rpc("mcp.servers.status", {})
         except _LocalRpcError:
-            return {"available": False, "test": False, "reason": "connector_unavailable"}
+            return {
+                "available": False,
+                "test": False,
+                "reconnect": False,
+                "reconnect_scope": None,
+                "reason": "connector_unavailable",
+            }
         except _RpcError as exc:
             reason = "offline" if str(exc) == "offline" else "connector_unavailable"
-            return {"available": False, "test": False, "reason": reason}
+            return {
+                "available": False,
+                "test": False,
+                "reconnect": False,
+                "reconnect_scope": None,
+                "reason": reason,
+            }
+        runner = getattr(self, "gateway_runner", None)
+        reconnect_supported = callable(getattr(runner, "_execute_mcp_reload", None))
         test_supported = False
         try:
             await self._local_rpc(
@@ -1764,7 +1778,16 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             # 4064 is the current method's normal "configured server not found"
             # response. JSON-RPC -32601 means this runtime predates the method.
             test_supported = exc.code != -32601
-        return {"available": True, "test": test_supported, "reason": None}
+        config = getattr(runner, "config", None)
+        return {
+            "available": True,
+            "test": test_supported,
+            "reconnect": reconnect_supported,
+            "reconnect_scope": (
+                "profile" if reconnect_supported and getattr(config, "multiplex_profiles", False) else "all"
+            ) if reconnect_supported else None,
+            "reason": None,
+        }
 
     async def _rpc_connector_test(self, p: Dict[str, Any]) -> Any:
         name = _require(p, "name", "missing_connector_name")
@@ -1803,6 +1826,45 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             "authentication_needed": auth_needed,
             "tool_count": len(tools) if isinstance(tools, list) else 0,
         }
+
+    async def _rpc_connector_reconnect(self, p: Dict[str, Any]) -> Any:
+        """Run Hermes' supported MCP reload, then return only projected live status."""
+        name = _require(p, "name", "missing_connector_name")
+        runner = getattr(self, "gateway_runner", None)
+        reload_mcp = getattr(runner, "_execute_mcp_reload", None)
+        if not callable(reload_mcp):
+            raise _RpcError("connector_reconnect_unsupported")
+
+        # Revalidate both the action and target immediately before mutation.
+        capability = await self._rpc_connector_capabilities({})
+        if capability.get("available") is not True or capability.get("reconnect") is not True:
+            raise _RpcError("connector_reconnect_unsupported")
+        before = await self._rpc_connector_health({})
+        matches = [row for row in before["connectors"] if row.get("name") == name]
+        if len(matches) != 1:
+            raise _RpcError("connector_not_found")
+        if matches[0].get("disabled") is True:
+            raise _RpcError("connector_reconnect_unsupported")
+        if matches[0].get("status") == "authentication_needed":
+            raise _RpcError("connector_authentication_needed")
+
+        event = MessageEvent(
+            text="/reload-mcp",
+            source=self.build_source(chat_id=self._profile_id, user_id="mobile"),
+        )
+        try:
+            # Core owns teardown, rediscovery, cache refresh, and profile scoping.
+            # Its human-readable result can contain private server details; discard it.
+            await reload_mcp(event)
+            health = await self._rpc_connector_health({})
+        except Exception as exc:
+            # Stable error only. Never project upstream exception text to the phone.
+            logger.warning("[hermes_bridge] connector reload failed (%s)", type(exc).__name__)
+            raise _RpcError("connector_reconnect_failed") from exc
+        connector = next(
+            (row for row in health["connectors"] if row.get("name") == name), None
+        )
+        return {"health": health, "connector": connector}
 
     def _cron_profile_query(self, p: Dict[str, Any]) -> str:
         profile = _require(p, "profile", "missing_profile")

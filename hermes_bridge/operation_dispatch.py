@@ -81,6 +81,7 @@ class OperationDispatcher:
         "connector.capabilities": "_rpc_connector_capabilities",
         "connector.health": "_rpc_connector_health",
         "connector.test": "_rpc_connector_test",
+        "connector.reconnect": "_rpc_connector_reconnect",
         "approvals.list": "_rpc_approvals_list",
         "memory.list": "_rpc_memory_list",
         "memory.delete": "_rpc_memory_delete",
