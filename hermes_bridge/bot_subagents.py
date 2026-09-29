@@ -51,7 +51,7 @@ def _method_supported(exc: Exception) -> Optional[bool]:
 
 
 async def ensure_capabilities(host: Any) -> Dict[str, Any]:
-    """Probe subagent.list/tail once per adapter lifetime (cleared on disconnect)."""
+    """Probe child read/control methods once per adapter lifetime (cleared on disconnect)."""
     cached = getattr(host, "_subagent_caps", None)
     if cached is not None:
         return cached
@@ -94,10 +94,28 @@ async def ensure_capabilities(host: Any) -> Dict[str, Any]:
     else:
         tail_reason = list_reason
 
+    controls = {}
+    for action, method, params in (
+        ("steer", "subagent.steer", {"session_id": _PROBE_SESSION, "subagent_id": _PROBE_CHILD, "text": "probe"}),
+        ("interrupt", "subagent.interrupt", {"session_id": _PROBE_SESSION, "subagent_id": _PROBE_CHILD}),
+    ):
+        try:
+            await host._local_rpc(method, params)
+            controls[action] = {"available": True, "reason": None}
+        except Exception as exc:
+            supported = _method_supported(exc)
+            if supported is True:
+                controls[action] = {"available": True, "reason": None}
+            elif supported is False:
+                controls[action] = {"available": False, "reason": "unsupported"}
+            else:
+                controls[action] = {"available": False, "reason": unavailable_reason(exc)}
+
     result = {
         "available": list_available,
         "reason": list_reason,
         "tail": {"available": tail_available, "reason": tail_reason},
+        "controls": controls,
     }
     host._subagent_caps = result
     return result
@@ -143,6 +161,7 @@ def _mint_children(
                 "ref": ref,
                 "goal": str(row.get("goal") or ""),
                 "status": str(row.get("status") or "unknown"),
+                "accepting_steer": row.get("accepting_steer") is True,
                 "started_at": row.get("started_at"),
                 "tool_count": row.get("tool_count"),
                 "last_tool": row.get("last_tool"),
@@ -198,6 +217,7 @@ async def list_children(host: Any, p: Dict[str, Any]) -> Any:
         "tail_available": tail["available"] is True,
         "tail_reason": tail["reason"],
         "subagents": children,
+        "controls": caps.get("controls", {}),
     }
 
 
@@ -243,3 +263,52 @@ async def tail_child(host: Any, p: Dict[str, Any]) -> Any:
         "text": text,
         "truncated": truncated,
     }
+
+
+async def mutate_child(host: Any, p: Dict[str, Any], action: str) -> Dict[str, Any]:
+    """Mutate only a child ref from the current Bot list and live runtime owner."""
+    token = str(p.get("chat") or "").strip()
+    ref = str(p.get("child") or "").strip()
+    unavailable = {"status": "unavailable", "reason": "child_unavailable"}
+    if not token or not ref:
+        return unavailable
+    target = host._subagent_refs.get(ref)
+    if not target or target.get("chat") != token:
+        return unavailable
+    chat = await resume_bot_for_subagents(host, token)
+    if target.get("runtime_handle") != chat.get("runtime_handle"):
+        invalidate_refs(host._subagent_refs, token)
+        return unavailable
+    method = "subagent.steer" if action == "steer" else "subagent.interrupt"
+    params = {
+        "session_id": target["runtime_handle"],
+        "subagent_id": target["subagent_id"],
+    }
+    if action == "steer":
+        text = p.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return {"status": "rejected", "reason": "text_required"}
+        params["text"] = text.strip()
+    try:
+        result = await host._local_rpc(method, params)
+    except (_LocalRpcError, _RpcError) as exc:
+        return {"status": "unavailable", "reason": unavailable_reason(exc)}
+    if not isinstance(result, dict):
+        return {"status": "unavailable", "reason": "unavailable"}
+    if action == "steer":
+        outcome = result.get("status")
+        if outcome not in ("queued", "applied", "missed", "rejected"):
+            outcome = "unavailable"
+    else:
+        found = result.get("found")
+        outcome = "interrupted" if found is True else "finished" if found is False else "unavailable"
+    reason = None if outcome not in ("unavailable", "rejected") else "child_unavailable"
+    return {"status": outcome, "reason": reason}
+
+
+async def steer_child(host: Any, p: Dict[str, Any]) -> Dict[str, Any]:
+    return await mutate_child(host, p, "steer")
+
+
+async def interrupt_child(host: Any, p: Dict[str, Any]) -> Dict[str, Any]:
+    return await mutate_child(host, p, "interrupt")

@@ -102,6 +102,8 @@ class OperationDispatcher:
         "bots.history": "_rpc_bots_history",
         "bots.subagents.list": "_rpc_bots_subagents_list",
         "bots.subagents.tail": "_rpc_bots_subagents_tail",
+        "bots.subagents.steer": "_rpc_bots_subagents_steer",
+        "bots.subagents.interrupt": "_rpc_bots_subagents_interrupt",
     }
 
     def __init__(self, host: Any):
