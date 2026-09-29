@@ -2298,6 +2298,10 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 "subagents": {
                     **disabled,
                     "tail": {"available": False, "reason": "bots_disabled"},
+                    "controls": {
+                        "steer": {"available": False, "reason": "bots_disabled"},
+                        "interrupt": {"available": False, "reason": "bots_disabled"},
+                    },
                 },
             }
         try:
@@ -2307,7 +2311,14 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             blocked = {"available": False, "reason": reason}
             return {
                 "stop": blocked,
-                "subagents": {**blocked, "tail": {"available": False, "reason": reason}},
+                "subagents": {
+                    **blocked,
+                    "tail": {"available": False, "reason": reason},
+                    "controls": {
+                        "steer": {"available": False, "reason": reason},
+                        "interrupt": {"available": False, "reason": reason},
+                    },
+                },
             }
         except _LocalRpcError:
             blocked = {"available": False, "reason": "bots_unavailable"}
@@ -2316,6 +2327,10 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 "subagents": {
                     **blocked,
                     "tail": {"available": False, "reason": "bots_unavailable"},
+                    "controls": {
+                        "steer": {"available": False, "reason": "bots_unavailable"},
+                        "interrupt": {"available": False, "reason": "bots_unavailable"},
+                    },
                 },
             }
         if not isinstance(result, dict) or not result.get("bot_mode_protocol"):
@@ -2325,6 +2340,10 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 "subagents": {
                     **blocked,
                     "tail": {"available": False, "reason": "bots_unavailable"},
+                    "controls": {
+                        "steer": {"available": False, "reason": "bots_unavailable"},
+                        "interrupt": {"available": False, "reason": "bots_unavailable"},
+                    },
                 },
             }
         subagents = await bot_subagents.ensure_capabilities(self)
@@ -2475,6 +2494,12 @@ class HermesBridgeAdapter(BasePlatformAdapter):
 
     async def _rpc_bots_subagents_tail(self, p: Dict[str, Any]) -> Any:
         return await bot_subagents.tail_child(self, p)
+
+    async def _rpc_bots_subagents_steer(self, p: Dict[str, Any]) -> Any:
+        return await bot_subagents.steer_child(self, p)
+
+    async def _rpc_bots_subagents_interrupt(self, p: Dict[str, Any]) -> Any:
+        return await bot_subagents.interrupt_child(self, p)
 
     async def _reresolve_bot_chat(self, chat: Dict[str, Any]) -> None:
         """Silent re-resolve: registry lookup → resume. At most once per op."""
