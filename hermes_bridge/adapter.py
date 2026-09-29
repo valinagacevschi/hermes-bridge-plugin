@@ -27,6 +27,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 
+from . import bot_subagents
 from .capability import CapabilityDescriptor
 from .crypto import load_psk, open_blob, open_frame, seal, seal_blob
 from .local_api import API_SERVER_PORT, SESSION_HEADER, LocalApi
@@ -574,6 +575,11 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         # Opaque chat token → {name, stored_id, runtime_handle, run_id, …}.
         # Phone never sees either Hermes session id.
         self._bot_chats: Dict[str, Dict[str, Any]] = {}
+        # Opaque child ref → {chat, runtime_handle, subagent_id}. Phone never
+        # sees recyclable upstream child ids (see bot_subagents.py).
+        self._subagent_refs: Dict[str, Dict[str, Any]] = {}
+        # Cached subagent.list/tail support; cleared on disconnect.
+        self._subagent_caps: Optional[Dict[str, Any]] = None
         self._bot_poll_tasks: Dict[str, asyncio.Task] = {}
         self._bot_idle_timeout_s: float = _BOT_IDLE_TIMEOUT_S
         self._bot_poll_fast_s: float = _BOT_POLL_FAST_S
@@ -704,6 +710,9 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             self._bot_poll_tasks.clear()
         if hasattr(self, "_bot_chats"):
             self._bot_chats.clear()
+        if hasattr(self, "_subagent_refs"):
+            self._subagent_refs.clear()
+        self._subagent_caps = None
         await self._close_local_ws()
         logger.info("[hermes_bridge] disconnected")
 
@@ -2283,16 +2292,46 @@ class HermesBridgeAdapter(BasePlatformAdapter):
     async def _rpc_bots_capabilities(self, p: Dict[str, Any]) -> Any:
         """Report Bot actions supported by this bridge and local runtime."""
         if not _bots_flag_enabled():
-            return {"stop": {"available": False, "reason": "bots_disabled"}}
+            disabled = {"available": False, "reason": "bots_disabled"}
+            return {
+                "stop": disabled,
+                "subagents": {
+                    **disabled,
+                    "tail": {"available": False, "reason": "bots_disabled"},
+                },
+            }
         try:
             result = await self._local_rpc("profiles.list", {"include_sessions": False})
         except _RpcError as exc:
-            return {"stop": {"available": False, "reason": str(exc)}}
+            reason = str(exc)
+            blocked = {"available": False, "reason": reason}
+            return {
+                "stop": blocked,
+                "subagents": {**blocked, "tail": {"available": False, "reason": reason}},
+            }
         except _LocalRpcError:
-            return {"stop": {"available": False, "reason": "bots_unavailable"}}
+            blocked = {"available": False, "reason": "bots_unavailable"}
+            return {
+                "stop": blocked,
+                "subagents": {
+                    **blocked,
+                    "tail": {"available": False, "reason": "bots_unavailable"},
+                },
+            }
         if not isinstance(result, dict) or not result.get("bot_mode_protocol"):
-            return {"stop": {"available": False, "reason": "bots_unavailable"}}
-        return {"stop": {"available": True, "reason": None}}
+            blocked = {"available": False, "reason": "bots_unavailable"}
+            return {
+                "stop": blocked,
+                "subagents": {
+                    **blocked,
+                    "tail": {"available": False, "reason": "bots_unavailable"},
+                },
+            }
+        subagents = await bot_subagents.ensure_capabilities(self)
+        return {
+            "stop": {"available": True, "reason": None},
+            "subagents": subagents,
+        }
 
     @staticmethod
     def _require_bots_enabled() -> None:
@@ -2428,7 +2467,14 @@ class HermesBridgeAdapter(BasePlatformAdapter):
 
     async def _expire_bot_chat(self, token: str) -> None:
         getattr(self, "_bot_chats", {}).pop(token, None)
+        bot_subagents.invalidate_refs(getattr(self, "_subagent_refs", {}), token)
         await self._stop_bot_poll(token)
+
+    async def _rpc_bots_subagents_list(self, p: Dict[str, Any]) -> Any:
+        return await bot_subagents.list_children(self, p)
+
+    async def _rpc_bots_subagents_tail(self, p: Dict[str, Any]) -> Any:
+        return await bot_subagents.tail_child(self, p)
 
     async def _reresolve_bot_chat(self, chat: Dict[str, Any]) -> None:
         """Silent re-resolve: registry lookup → resume. At most once per op."""
