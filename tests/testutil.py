@@ -218,6 +218,10 @@ def make_adapter(psk: bytes = PSK, profile_id: str = PROFILE):
         adapter._bots_enabled = None
         adapter._bot_chats = {}
         adapter._bot_poll_tasks = {}
+        # Opaque child refs + cached subagent.list/tail support — mirror
+        # monorepo make_adapter (bot_subagents.py). Cleared on disconnect.
+        adapter._subagent_refs = {}
+        adapter._subagent_caps = None
         adapter._bot_idle_timeout_s = 300.0
         adapter._bot_poll_fast_s = 1.0
         adapter._bot_poll_idle_s = 5.0
