@@ -50,8 +50,17 @@ def _method_supported(exc: Exception) -> Optional[bool]:
     return None
 
 
+def local_method_available(method: str) -> Optional[bool]:
+    """Read the loaded Hermes contract catalog without sending a control RPC."""
+    try:
+        from tui_gateway.contracts import METHODS
+    except Exception:
+        return None
+    return method in METHODS
+
+
 async def ensure_capabilities(host: Any) -> Dict[str, Any]:
-    """Probe child read/control methods once per adapter lifetime (cleared on disconnect)."""
+    """Probe reads and inspect control contracts once per adapter lifetime."""
     cached = getattr(host, "_subagent_caps", None)
     if cached is not None:
         return cached
@@ -95,21 +104,19 @@ async def ensure_capabilities(host: Any) -> Dict[str, Any]:
         tail_reason = list_reason
 
     controls = {}
-    for action, method, params in (
-        ("steer", "subagent.steer", {"session_id": _PROBE_SESSION, "subagent_id": _PROBE_CHILD, "text": "probe"}),
-        ("interrupt", "subagent.interrupt", {"session_id": _PROBE_SESSION, "subagent_id": _PROBE_CHILD}),
+    for action, method in (
+        ("steer", "subagent.steer"),
+        ("interrupt", "subagent.interrupt"),
     ):
-        try:
-            await host._local_rpc(method, params)
-            controls[action] = {"available": True, "reason": None}
-        except Exception as exc:
-            supported = _method_supported(exc)
-            if supported is True:
-                controls[action] = {"available": True, "reason": None}
-            elif supported is False:
-                controls[action] = {"available": False, "reason": "unsupported"}
-            else:
-                controls[action] = {"available": False, "reason": unavailable_reason(exc)}
+        supported = local_method_available(method)
+        controls[action] = {
+            "available": supported is True,
+            "reason": None
+            if supported is True
+            else "unsupported"
+            if supported is False
+            else "unavailable",
+        }
 
     result = {
         "available": list_available,
