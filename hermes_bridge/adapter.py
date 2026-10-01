@@ -1711,7 +1711,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 if isinstance(value, str):
                     value = re.sub(r"(?i)(https?://|file://|ssh://)\S+", "[redacted]", value)
                     value = re.sub(
-                        r"(?i)(token|secret|password|authorization|api[_-]?key)(\s*[:=]\s*)[^\s,;]+",
+                        r"(?i)(token|secret|password|authorization|api[_-]?key)(\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+",
                         r"\1\2[redacted]",
                         value,
                     )
@@ -1898,6 +1898,15 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         if not owner and profile != "default":
             raise _RpcError("cron_owner_unverified")
         return profile
+
+    async def _rpc_cron_notes(self, p: Dict[str, Any], *, capabilities: bool = False) -> Any:
+        from .cron_notes import read_notes
+        profile = _require(p, "profile", "missing_profile")
+        job_id = _require(p, "job_id", "missing_job_id")
+        return await asyncio.to_thread(read_notes, profile, job_id, capabilities=capabilities)
+
+    async def _rpc_cron_notes_capabilities(self, p: Dict[str, Any]) -> Any:
+        return await self._rpc_cron_notes(p, capabilities=True)
 
     async def _rpc_cron_profiles(self, p: Dict[str, Any]) -> Any:
         raw = await self._api.get("/api/profiles")
@@ -2289,63 +2298,30 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             rows = []
         return [_project_bot_row(r) for r in rows if isinstance(r, dict) and _is_bot_managed_row(r)]
 
+    @staticmethod
+    def _blocked_bot_capabilities(reason: str) -> Dict[str, Any]:
+        blocked = {"available": False, "reason": reason}
+        return {
+            "stop": dict(blocked),
+            "subagents": {
+                **blocked,
+                "tail": dict(blocked),
+                "controls": {"steer": dict(blocked), "interrupt": dict(blocked)},
+            },
+        }
+
     async def _rpc_bots_capabilities(self, p: Dict[str, Any]) -> Any:
         """Report Bot actions supported by this bridge and local runtime."""
         if not _bots_flag_enabled():
-            disabled = {"available": False, "reason": "bots_disabled"}
-            return {
-                "stop": disabled,
-                "subagents": {
-                    **disabled,
-                    "tail": {"available": False, "reason": "bots_disabled"},
-                    "controls": {
-                        "steer": {"available": False, "reason": "bots_disabled"},
-                        "interrupt": {"available": False, "reason": "bots_disabled"},
-                    },
-                },
-            }
+            return self._blocked_bot_capabilities("bots_disabled")
         try:
             result = await self._local_rpc("profiles.list", {"include_sessions": False})
         except _RpcError as exc:
-            reason = str(exc)
-            blocked = {"available": False, "reason": reason}
-            return {
-                "stop": blocked,
-                "subagents": {
-                    **blocked,
-                    "tail": {"available": False, "reason": reason},
-                    "controls": {
-                        "steer": {"available": False, "reason": reason},
-                        "interrupt": {"available": False, "reason": reason},
-                    },
-                },
-            }
+            return self._blocked_bot_capabilities(str(exc))
         except _LocalRpcError:
-            blocked = {"available": False, "reason": "bots_unavailable"}
-            return {
-                "stop": blocked,
-                "subagents": {
-                    **blocked,
-                    "tail": {"available": False, "reason": "bots_unavailable"},
-                    "controls": {
-                        "steer": {"available": False, "reason": "bots_unavailable"},
-                        "interrupt": {"available": False, "reason": "bots_unavailable"},
-                    },
-                },
-            }
+            return self._blocked_bot_capabilities("bots_unavailable")
         if not isinstance(result, dict) or not result.get("bot_mode_protocol"):
-            blocked = {"available": False, "reason": "bots_unavailable"}
-            return {
-                "stop": blocked,
-                "subagents": {
-                    **blocked,
-                    "tail": {"available": False, "reason": "bots_unavailable"},
-                    "controls": {
-                        "steer": {"available": False, "reason": "bots_unavailable"},
-                        "interrupt": {"available": False, "reason": "bots_unavailable"},
-                    },
-                },
-            }
+            return self._blocked_bot_capabilities("bots_unavailable")
         subagents = await bot_subagents.ensure_capabilities(self)
         return {
             "stop": {"available": True, "reason": None},

@@ -69,6 +69,8 @@ class OperationDispatcher:
         "agent.status": "_rpc_agent_status",
         "agent.set_model": "_rpc_agent_set_model",
         "usage.get": "_rpc_usage_get",
+        "cron.notes": "_rpc_cron_notes",
+        "cron.notes.capabilities": "_rpc_cron_notes_capabilities",
         "cron.create": "_rpc_cron_create",
         "cron.capabilities": "_rpc_cron_capabilities",
         "cron.edit": "_rpc_cron_edit",

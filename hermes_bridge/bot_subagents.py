@@ -59,49 +59,34 @@ def local_method_available(method: str) -> Optional[bool]:
     return method in METHODS
 
 
+async def _probe_read(host: Any, method: str, params: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    try:
+        await host._local_rpc(method, params)
+        return True, None
+    except (_LocalRpcError, _RpcError) as exc:
+        supported = _method_supported(exc)
+        if supported is True:
+            return True, None
+        return False, "unsupported" if supported is False else unavailable_reason(exc)
+
+
 async def ensure_capabilities(host: Any) -> Dict[str, Any]:
     """Probe reads and inspect control contracts once per adapter lifetime."""
     cached = getattr(host, "_subagent_caps", None)
     if cached is not None:
         return cached
 
-    list_available = False
-    list_reason: Optional[str] = "unavailable"
-    try:
-        await host._local_rpc("subagent.list", {"session_id": _PROBE_SESSION})
-        list_available = True
-        list_reason = None
-    except (_LocalRpcError, _RpcError) as exc:
-        supported = _method_supported(exc)
-        if supported is True:
-            list_available = True
-            list_reason = None
-        elif supported is False:
-            list_reason = "unsupported"
-        else:
-            list_reason = unavailable_reason(exc)
-
-    tail_available = False
-    tail_reason: Optional[str] = "unavailable"
+    list_available, list_reason = await _probe_read(
+        host, "subagent.list", {"session_id": _PROBE_SESSION}
+    )
     if list_available:
-        try:
-            await host._local_rpc(
-                "subagent.tail",
-                {"session_id": _PROBE_SESSION, "subagent_id": _PROBE_CHILD},
-            )
-            tail_available = True
-            tail_reason = None
-        except (_LocalRpcError, _RpcError) as exc:
-            supported = _method_supported(exc)
-            if supported is True:
-                tail_available = True
-                tail_reason = None
-            elif supported is False:
-                tail_reason = "unsupported"
-            else:
-                tail_reason = unavailable_reason(exc)
+        tail_available, tail_reason = await _probe_read(
+            host,
+            "subagent.tail",
+            {"session_id": _PROBE_SESSION, "subagent_id": _PROBE_CHILD},
+        )
     else:
-        tail_reason = list_reason
+        tail_available, tail_reason = False, list_reason
 
     controls = {}
     for action, method in (
@@ -224,28 +209,35 @@ async def list_children(host: Any, p: Dict[str, Any]) -> Any:
         "tail_available": tail["available"] is True,
         "tail_reason": tail["reason"],
         "subagents": children,
-        "controls": caps.get("controls", {}),
     }
+
+
+async def _resolve_live_child(host: Any, p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Resolve an opaque ref and revalidate its live Bot runtime owner."""
+    token = str(p.get("chat") or "").strip()
+    ref = str(p.get("child") or "").strip()
+    if not token or not ref:
+        return None
+    target = host._subagent_refs.get(ref)
+    if not target or target.get("chat") != token:
+        return None
+    chat = await resume_bot_for_subagents(host, token)
+    if target.get("runtime_handle") != chat.get("runtime_handle"):
+        invalidate_refs(host._subagent_refs, token)
+        return None
+    return target
 
 
 async def tail_child(host: Any, p: Dict[str, Any]) -> Any:
     """Read a bounded upstream tail using a ref from this Bot's latest list."""
-    token = str(p.get("chat") or "").strip()
-    ref = str(p.get("child") or "").strip()
     unavailable = {
         "available": False,
         "reason": "child_unavailable",
         "text": "",
         "truncated": False,
     }
-    if not token or not ref:
-        return unavailable
-    target = host._subagent_refs.get(ref)
-    if not target or target.get("chat") != token:
-        return unavailable
-    chat = await resume_bot_for_subagents(host, token)
-    if target.get("runtime_handle") != chat.get("runtime_handle"):
-        invalidate_refs(host._subagent_refs, token)
+    target = await _resolve_live_child(host, p)
+    if target is None:
         return unavailable
     try:
         result = await host._local_rpc(
@@ -274,17 +266,9 @@ async def tail_child(host: Any, p: Dict[str, Any]) -> Any:
 
 async def mutate_child(host: Any, p: Dict[str, Any], action: str) -> Dict[str, Any]:
     """Mutate only a child ref from the current Bot list and live runtime owner."""
-    token = str(p.get("chat") or "").strip()
-    ref = str(p.get("child") or "").strip()
     unavailable = {"status": "unavailable", "reason": "child_unavailable"}
-    if not token or not ref:
-        return unavailable
-    target = host._subagent_refs.get(ref)
-    if not target or target.get("chat") != token:
-        return unavailable
-    chat = await resume_bot_for_subagents(host, token)
-    if target.get("runtime_handle") != chat.get("runtime_handle"):
-        invalidate_refs(host._subagent_refs, token)
+    target = await _resolve_live_child(host, p)
+    if target is None:
         return unavailable
     method = "subagent.steer" if action == "steer" else "subagent.interrupt"
     params = {
