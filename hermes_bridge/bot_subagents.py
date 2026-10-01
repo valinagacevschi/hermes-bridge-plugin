@@ -1,4 +1,4 @@
-# Bot delegated-child inspection: opaque refs, capability probe, list/tail RPCs.
+# Bot subagents; #84 J: policy + lazy bot_chats (no adapter host auth duck).
 # Extracted from adapter.py so bot-chat state and phone projection stay cohesive
 # instead of growing the adapter further.
 
@@ -9,6 +9,7 @@ from __future__ import annotations
 import secrets
 from typing import Any, Dict, Optional, Tuple
 
+from .bots_policy import require_bot_profile, require_bots_enabled
 from .operation_dispatch import _LocalRpcError, _RpcError
 
 TAIL_LIMIT_BYTES = 16 * 1024
@@ -114,19 +115,22 @@ async def ensure_capabilities(host: Any) -> Dict[str, Any]:
 
 
 async def resume_bot_for_subagents(host: Any, token: str) -> Dict[str, Any]:
-    host._require_bots_enabled()
+    # Lazy import: bot_chats imports bot_subagents for invalidate_refs.
+    from . import bot_chats
+
+    require_bots_enabled()
     chat = host._bot_chats.get(token)
     if chat is None:
         raise _RpcError("chat_expired")
-    await host._require_bot_profile(str(chat.get("name") or ""))
-    snapshot = await host._resume_bot_chat(str(chat["name"]), str(chat["stored_id"]))
+    await require_bot_profile(host, str(chat.get("name") or ""))
+    snapshot = await bot_chats.resume_chat(host, str(chat["name"]), str(chat["stored_id"]))
     runtime = str(snapshot.get("session_id") or "").strip()
     if not runtime:
         raise _RpcError("chat_expired")
     if runtime != chat.get("runtime_handle"):
         invalidate_refs(host._subagent_refs, token)
         chat["runtime_handle"] = runtime
-    host._touch_bot_chat(chat)
+    bot_chats.touch_chat(host, chat)
     return chat
 
 
