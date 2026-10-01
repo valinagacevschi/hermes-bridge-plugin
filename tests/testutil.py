@@ -225,4 +225,6 @@ def make_adapter(psk: bytes = PSK, profile_id: str = PROFILE):
         adapter._bot_idle_timeout_s = 300.0
         adapter._bot_poll_fast_s = 1.0
         adapter._bot_poll_idle_s = 5.0
+        adapter._room_handles = {}
+        adapter._room_caps = None
     return adapter

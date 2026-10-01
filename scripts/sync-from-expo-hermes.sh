@@ -59,7 +59,9 @@ echo
 # never published and the plugin dies on import at the user's gateway.
 PURE_COPY_FILES=(plugin.yaml after-install.md)
 while IFS= read -r py; do
-  PURE_COPY_FILES+=("$(basename "$py")")
+  base="$(basename "$py")"
+  # bot_notify is copied below with the monorepo logger namespace rewritten.
+  [[ "$base" == "bot_notify.py" ]] || PURE_COPY_FILES+=("$base")
 done < <(find "$SRC_PLUGIN" -maxdepth 1 -name '*.py' \
   ! -name 'test_*' ! -name 'spike_*' ! -name 'testutil.py' | sort)
 
@@ -78,6 +80,21 @@ for f in "${PURE_COPY_FILES[@]}"; do
   echo "  $f"
 done
 cp "$SRC_PLUGIN/requirements.txt" "$DST_REPO/requirements.txt"
+
+# ---------------------------------------------------------------------------
+# Bucket 1b: production modules that need a namespace rewrite
+# ---------------------------------------------------------------------------
+# bot_notify uses the monorepo package name as its logger namespace. Keep its
+# source otherwise byte-for-byte aligned with the monorepo and rewrite only
+# that namespace for the public package.
+echo "Copying + transforming production files..."
+sed 's/plugins\.platforms\.hermes_bridge/hermes_bridge/g' \
+  "$SRC_PLUGIN/bot_notify.py" > "$DST_REPO/hermes_bridge/bot_notify.py"
+if grep -q "plugins\.platforms\.hermes_bridge" "$DST_REPO/hermes_bridge/bot_notify.py"; then
+  echo "ERROR: bot_notify.py still contains a monorepo-only path after transformation."
+  exit 1
+fi
+echo "  bot_notify.py"
 
 # ---------------------------------------------------------------------------
 # Bucket 2: copy + transform (tests that exercise adapter.py/crypto.py through
