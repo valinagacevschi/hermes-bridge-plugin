@@ -27,7 +27,14 @@ from gateway.platforms.base import (
     SendResult,
 )
 
-from . import bot_subagents
+from . import bot_activity, bot_chats, bot_notify, bot_rooms, bot_subagents
+from .bots_policy import (
+    blocked_bot_capabilities,
+    bots_flag_enabled,
+    fetch_profiles_snapshot,
+    list_bots,
+    require_bots_enabled,
+)
 from .capability import CapabilityDescriptor
 from .crypto import load_psk, open_blob, open_frame, seal, seal_blob
 from .local_api import API_SERVER_PORT, SESSION_HEADER, LocalApi
@@ -41,6 +48,97 @@ from .session_continue import (
 )
 
 logger = logging.getLogger(__name__)
+
+_SKILL_INVOCATION_PREFIX = "[IMPORTANT: The user has invoked the "
+_SINGLE_SKILL_MARKER = "The full skill content is loaded below.]"
+_SINGLE_SKILL_INSTRUCTION = "The user has provided the following instruction alongside the skill invocation: "
+_RUNTIME_NOTE = "\n\n[Runtime note:"
+_BUNDLE_MARKER = " skill bundle,"
+_BUNDLE_USER_INSTRUCTION = "\nUser instruction: "
+_BUNDLE_FIRST_SKILL_BLOCK = "\n\n[Loaded as part of the "
+
+
+def _describe_skill_invocation(content: str) -> Optional[str]:
+    try:
+        from agent.skill_commands import describe_skill_invocation
+        return describe_skill_invocation(content)
+    except ImportError:
+        if not content.startswith(_SKILL_INVOCATION_PREFIX):
+            return None
+        match = re.match(re.escape(_SKILL_INVOCATION_PREFIX) + r'"([^"]*)"', content)
+        if not match:
+            return None
+        name = match.group(1).strip()
+        label = name if name.startswith("/") else f"/{name}"
+        if _BUNDLE_MARKER in content:
+            marker, end = _BUNDLE_USER_INSTRUCTION, _BUNDLE_FIRST_SKILL_BLOCK
+            start = content.find(marker)
+            stop = content.find(end, start + len(marker)) if start >= 0 else -1
+        elif _SINGLE_SKILL_MARKER in content:
+            marker, end = _SINGLE_SKILL_INSTRUCTION, _RUNTIME_NOTE
+            start = content.rfind(marker)
+            stop = content.find(end, start + len(marker)) if start >= 0 else -1
+        else:
+            start, stop = -1, -1
+        instruction = content[start + len(marker):stop if stop >= 0 else None].strip() if start >= 0 else ""
+        return f"{label} — {instruction}" if instruction else label
+
+
+def _project_session_messages(data: Any) -> Any:
+    if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
+        return data
+    projected, deferred_reasoning = [], []
+    for original in data["messages"]:
+        if not isinstance(original, dict):
+            continue
+        row = dict(original)
+        role = row.get("role")
+        content = row.get("content") if isinstance(row.get("content"), str) else ""
+        if role == "user":
+            content = re.sub(
+                r"^\[HANDOFF CONTEXT —[^\n]*\]\n[\s\S]*?\n\[/HANDOFF CONTEXT\]\n*",
+                "",
+                content,
+                count=1,
+            )
+            row["content"] = content
+            display_kind = row.get("display_kind")
+            out_of_band = re.match(
+                r"^\[OUT-OF-BAND USER MESSAGE —[^\n]*\]\n([\s\S]*?)\n\[/OUT-OF-BAND USER MESSAGE\]$",
+                content,
+            )
+            if out_of_band:
+                row["content"] = out_of_band.group(1).strip()
+            elif display_kind == "steer":
+                row["content"] = row.get("display_content") or ""
+            elif display_kind is not None:
+                continue
+            else:
+                description = _describe_skill_invocation(content)
+                if description is not None:
+                    row["content"] = description
+                elif content.startswith(("[IMPORTANT:", "[System:")):
+                    continue
+            if not row.get("content"):
+                continue
+        elif role == "assistant":
+            # Compaction summaries are stored as hidden assistant rows that
+            # carry the whole prior context; they are agent-internal.
+            if row.get("_compressed_summary") or row.get("display_kind") not in (None, "steer"):
+                continue
+            if row.get("finish_reason") == "tool_calls" and not content.strip():
+                if row.get("reasoning"):
+                    deferred_reasoning.append(str(row["reasoning"]))
+                continue
+            if not content.strip():
+                continue
+            if deferred_reasoning:
+                row["reasoning"] = "\n\n".join([*deferred_reasoning, str(row.get("reasoning") or "")]).strip()
+                deferred_reasoning.clear()
+        else:
+            continue
+        projected.append(row)
+    return {**data, "messages": projected}
 
 PLATFORM_NAME = "hermes_bridge"
 
@@ -100,173 +198,8 @@ def _require(params: Dict[str, Any], key: str, error: str) -> str:
     return value
 
 
-# Recognisably truthy values for HERMES_BRIDGE_BOTS_ENABLED. Anything else
-# (including "", "0", "false", "no", "off", garbage) fails closed.
-# Read per Bot operation. Plain os.getenv, not _get_scoped_secret: this is
-# correct specifically because multiplex_profiles is never enabled in this
-# design. A scoped lookup here would be the bug it looks like.
-_BOTS_ENABLED_TRUTHY = frozenset({"1", "true", "yes", "on"})
-
-
-def _bots_flag_enabled() -> bool:
-    raw = os.getenv("HERMES_BRIDGE_BOTS_ENABLED", "1")
-    return str(raw).strip().lower() in _BOTS_ENABLED_TRUTHY
-
-
-def _is_bot_managed_row(row: Dict[str, Any]) -> bool:
-    """Authorization/display predicate: bot-managed, non-default core-profile.
-
-    There is no is_bot field. The marker is ui_meta['hermes-bots'], written
-    by the desktop at bot creation. The default core-profile is excluded —
-    normal chat already talks to it.
-    """
-    if row.get("is_default"):
-        return False
-    ui_meta = row.get("ui_meta")
-    return isinstance(ui_meta, dict) and "hermes-bots" in ui_meta
-
-
-def _project_bot_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Phone-facing roster row. Shape/color ride along from ui_meta; photos do not."""
-    ui_meta = row.get("ui_meta") if isinstance(row.get("ui_meta"), dict) else {}
-    bots_meta = ui_meta.get("hermes-bots") if isinstance(ui_meta, dict) else None
-    if not isinstance(bots_meta, dict):
-        bots_meta = {}
-    canon = row.get("canonical_session")
-    if not isinstance(canon, dict):
-        canon = None
-    display = row.get("display_name") or bots_meta.get("title") or row.get("name") or ""
-    description = row.get("description") or bots_meta.get("description") or None
-    return {
-        "name": row.get("name") or "",
-        "display_name": display,
-        "model": row.get("model") or None,
-        "description": description or None,
-        "has_avatar": bool(row.get("has_avatar")),
-        "canonical_session": (
-            {
-                "preview": canon.get("preview") or None,
-                "last_active": canon.get("last_active"),
-            }
-            if canon
-            else None
-        ),
-        "shape": bots_meta.get("shape") or None,
-        "color": bots_meta.get("color") or None,
-    }
-
-
-# Canonical forever-chat identity. Title is exact; do not fuzzy-match.
-_BOT_CHAT_TITLE = "Bot Chat"
-_BOT_KICKOFF = "Hey, tell me about yourself!"
-_BOT_HISTORY_LIMIT = 50
-_BOT_POLL_FAST_S = 1.0
-_BOT_POLL_IDLE_S = 5.0
-_BOT_IDLE_TIMEOUT_S = 300.0
-# session.resume / prompt.submit: "session_id required" / "session not found".
-_STALE_SESSION_CODES = frozenset({4006, 4007})
-
-
-def _is_stale_session(exc: BaseException) -> bool:
-    return isinstance(exc, _LocalRpcError) and exc.code in _STALE_SESSION_CODES
-
-
-def _message_text(row: Dict[str, Any]) -> str:
-    display = row.get("display_content")
-    if isinstance(display, str) and display.strip():
-        return display.strip()
-    content = row.get("content")
-    if content is None:
-        content = row.get("text") or row.get("api_content") or ""
-    if isinstance(content, list):
-        parts: List[str] = []
-        for part in content:
-            if isinstance(part, str):
-                parts.append(part)
-            elif isinstance(part, dict):
-                text = part.get("text")
-                if isinstance(text, str) and part.get("type") in (None, "text"):
-                    parts.append(text)
-        return "".join(parts).strip()
-    return str(content).strip()
-
-
-def _message_ts_ms(row: Dict[str, Any]) -> int:
-    raw = row.get("timestamp") or row.get("created_at") or 0
-    try:
-        n = float(raw)
-    except (TypeError, ValueError):
-        return 0
-    if n > 1e12:
-        return int(n)
-    return int(n * 1000)
-
-
-def _display_reasoning(row: Dict[str, Any]) -> Optional[str]:
-    """Plain reasoning text the phone can show. Skips redacted signature blobs."""
-    parts: List[str] = []
-
-    def add(value: Any) -> None:
-        if not isinstance(value, str):
-            return
-        text = value.strip()
-        if text and text not in parts:
-            parts.append(text)
-
-    add(row.get("reasoning"))
-    add(row.get("reasoning_content"))
-    details = row.get("reasoning_details")
-    if isinstance(details, list):
-        for detail in details:
-            if not isinstance(detail, dict) or detail.get("type") == "redacted_thinking":
-                continue
-            for key in ("summary", "thinking", "content", "text"):
-                if isinstance(detail.get(key), str) and str(detail.get(key)).strip():
-                    add(detail.get(key))
-                    break
-    return "\n\n".join(parts) if parts else None
-
-
-def _project_bot_messages(rows: Any, chat: str) -> List[Dict[str, Any]]:
-    """Project REST message rows down to what the phone renders.
-
-    The REST payload is much richer (tool_calls, opaque reasoning_details, …).
-    Shipping that over the relay would be a large multiple of the text.
-    Displayable reasoning summaries are the exception: the phone collapses them.
-    """
-    if not isinstance(rows, list):
-        return []
-    out: List[Dict[str, Any]] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        role = str(row.get("role") or "").strip()
-        if role not in ("user", "assistant"):
-            continue
-        if row.get("display_kind") == "hidden":
-            continue
-        text = _message_text(row)
-        reasoning = _display_reasoning(row) if role == "assistant" else None
-        row_id = row.get("id") if row.get("id") is not None else row.get("row_id")
-        if row_id is None or row_id == "":
-            continue
-        projected: Dict[str, Any] = {
-            "id": str(row_id),
-            "session_id": chat,
-            "role": role,
-            "content": text,
-            "sealed_frame": None,
-            "ts": _message_ts_ms(row),
-            "is_error": 1 if row.get("error") else 0,
-            "attachments": None,
-            "is_gap": 0,
-            "controls": None,
-            "ack_state": None,
-        }
-        if reasoning:
-            projected["reasoning"] = reasoning
-        out.append(projected)
-    return out
+# Bot policy (flag/list/auth/projection) lives in bots_policy (#84 J).
+# Forever-chat constants live in bot_chats — import there, not re-export.
 
 
 # Hermes memory files — entries separated by "\n§\n"; ids are content hashes.
@@ -503,6 +436,8 @@ class HermesBridgeAdapter(BasePlatformAdapter):
     PSK must be generated via 'hermes gateway pair' and stored at ~/.hermes/psk.
     """
 
+    supports_code_blocks = True
+
     def __init__(self, config):
         super().__init__(config, Platform(PLATFORM_NAME))
         self._ws = None
@@ -567,6 +502,14 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         # receives only the streaming id, so preserve reply correlation from
         # the initial send through every replacement/final frame.
         self._stream_reply_to: Dict[str, str] = {}
+        self._stream_session_id: Dict[str, str] = {}
+        self._message_session_id: Dict[str, str] = {}
+        self._message_reply_to: Dict[str, str] = {}
+        self._message_revisions: Dict[str, int] = {}
+        self._thread_phone_session: Dict[str, str] = {}
+        # One-shot fork context is intentionally in memory; a bridge restart drops it.
+        self._pending_handoffs: Dict[str, str] = {}
+        self._active_threads: set = set()
         # Local JSON-RPC door to Hermes' /api/ws. Isolated from the relay
         # socket and opened lazily for Bot and connector health operations.
         self._local_ws = None
@@ -580,10 +523,16 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         self._subagent_refs: Dict[str, Dict[str, Any]] = {}
         # Cached subagent.list/tail support; cleared on disconnect.
         self._subagent_caps: Optional[Dict[str, Any]] = None
+        # Opaque room handle → {room_id, name, opened_at}. Phone owns seq
+        # cursor (#84 H). Cleared on disconnect /
+        # Laptop switch so matching names on another Laptop never substitute.
+        self._room_handles: Dict[str, Dict[str, Any]] = {}
+        self._room_caps: Optional[Dict[str, Any]] = None
         self._bot_poll_tasks: Dict[str, asyncio.Task] = {}
-        self._bot_idle_timeout_s: float = _BOT_IDLE_TIMEOUT_S
-        self._bot_poll_fast_s: float = _BOT_POLL_FAST_S
-        self._bot_poll_idle_s: float = _BOT_POLL_IDLE_S
+        self._bot_notify_task: Optional[asyncio.Task] = None
+        self._bot_idle_timeout_s: float = bot_chats._BOT_IDLE_TIMEOUT_S
+        self._bot_poll_fast_s: float = bot_chats._BOT_POLL_FAST_S
+        self._bot_poll_idle_s: float = bot_chats._BOT_POLL_IDLE_S
 
     # ------------------------------------------------------------------
     # Abstract methods required by BasePlatformAdapter
@@ -603,6 +552,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         self._run_task = asyncio.ensure_future(self._run_loop())
         if self._approval_poll_task is None or self._approval_poll_task.done():
             self._approval_poll_task = asyncio.ensure_future(self._poll_pending_writes())
+        self._ensure_bot_notify_observer()
         return ok
 
     async def _connect_ws(self) -> bool:
@@ -700,19 +650,22 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             self._approval_poll_task = None
+        self._stop_bot_notify_observer()
+        if self._bot_notify_task:
+            try:
+                await self._bot_notify_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._bot_notify_task = None
         if self._ws:
             await self._ws.close()
             self._ws = None
         await self._api.stop()
-        for task in list(getattr(self, "_bot_poll_tasks", {}).values()):
-            task.cancel()
-        if hasattr(self, "_bot_poll_tasks"):
-            self._bot_poll_tasks.clear()
-        if hasattr(self, "_bot_chats"):
-            self._bot_chats.clear()
+        bot_chats.clear_chats(self)
         if hasattr(self, "_subagent_refs"):
             self._subagent_refs.clear()
         self._subagent_caps = None
+        bot_rooms.clear_handles(self)
         await self._close_local_ws()
         logger.info("[hermes_bridge] disconnected")
 
@@ -780,6 +733,11 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> SendResult:
+        # Test harnesses and older adapters may construct instances without
+        # running __init__; keep these optional correlation caches lazy-safe.
+        self._message_revisions = getattr(self, "_message_revisions", {})
+        self._message_session_id = getattr(self, "_message_session_id", {})
+        self._message_reply_to = getattr(self, "_message_reply_to", {})
         # Stable id shared by the live frame and the durable-inbox row — lets the
         # phone dedup the same message arriving via both paths (see
         # /api/relay/enqueue+api.ts, lib/pending-sync.ts).
@@ -819,6 +777,20 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             payload["edit"] = True
         if is_unsolicited:
             payload["unsolicited"] = True
+        thread_id = metadata.get("thread_id") if metadata else None
+        if not is_unsolicited and isinstance(thread_id, str) and thread_id:
+            payload["session_id"] = self._thread_phone_session.get(thread_id, thread_id)
+            self._message_session_id[msg_id] = payload["session_id"]
+        if reply_to:
+            self._message_reply_to[msg_id] = reply_to
+        while len(self._message_reply_to) > 512:
+            oldest = next(iter(self._message_reply_to))
+            self._message_revisions.pop(oldest, None)
+            self._message_session_id.pop(oldest, None)
+            self._message_reply_to.pop(oldest, None)
+        # Every routed assistant message records its session; bound it too.
+        while len(self._message_session_id) > 1024:
+            self._message_session_id.pop(next(iter(self._message_session_id)), None)
         if attachments:
             payload["attachments"] = attachments
 
@@ -840,6 +812,8 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             self._stream_pending.add(msg_id)
             if reply_to:
                 self._stream_reply_to[msg_id] = reply_to
+            if isinstance(thread_id, str) and thread_id:
+                self._stream_session_id[msg_id] = self._thread_phone_session.get(thread_id, thread_id)
         # message_id=None — ONLY when editing was requested but this relay
         # can't do it — is the signal GatewayStreamConsumer reads as
         # "edit-incapable"; it then sends the complete answer as a fresh
@@ -872,12 +846,37 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         into the existing streaming-preview bubble instead of inserting a new
         message; `final` commits it like a normal reply once the stream ends.
         """
+        self._message_revisions = getattr(self, "_message_revisions", {})
+        self._message_session_id = getattr(self, "_message_session_id", {})
+        self._message_reply_to = getattr(self, "_message_reply_to", {})
         if not self._supports("edit"):
             # send() already refused to advertise edit-capability for this
             # relay (message_id=None), so GatewayStreamConsumer shouldn't be
             # calling this — but guard it directly rather than silently
             # sending a frame the relay/phone pairing may not expect.
             return SendResult(success=False, error="edit_unsupported")
+
+        if message_id not in self._stream_pending:
+            revision = self._message_revisions.get(message_id, 0) + 1
+            self._message_revisions[message_id] = revision
+            while len(self._message_revisions) > 512:
+                oldest = next(iter(self._message_revisions))
+                self._message_revisions.pop(oldest, None)
+                self._message_session_id.pop(oldest, None)
+                self._message_reply_to.pop(oldest, None)
+            payload: Dict[str, Any] = {
+                "role": "assistant",
+                "msg_id": f"{message_id}#r{revision}",
+                "replaces": message_id,
+                "content": content,
+            }
+            reply_to = self._message_reply_to.get(message_id)
+            session_id = self._message_session_id.get(message_id)
+            if reply_to:
+                payload["reply_to"] = reply_to
+            if session_id:
+                payload["session_id"] = session_id
+            return await self._deliver(payload["msg_id"], payload, category=None, durable=True)
 
         payload: Dict[str, Any] = {
             "role": "assistant",
@@ -888,6 +887,9 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         reply_to = self._stream_reply_to.get(message_id)
         if reply_to:
             payload["reply_to"] = reply_to
+        session_id = self._stream_session_id.get(message_id)
+        if session_id:
+            payload["session_id"] = session_id
         if finalize:
             payload["final"] = True
 
@@ -899,6 +901,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         if finalize:
             self._stream_pending.discard(message_id)
             self._stream_reply_to.pop(message_id, None)
+            self._stream_session_id.pop(message_id, None)
             return result
         if result.success:
             return result
@@ -916,6 +919,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         if message_id in self._stream_pending:
             self._stream_pending.discard(message_id)
             self._stream_reply_to.pop(message_id, None)
+            self._stream_session_id.pop(message_id, None)
             logger.warning(
                 "[hermes_bridge] stream %s died before finalize — persisting "
                 "the %d chars delivered so far",
@@ -1121,6 +1125,9 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             # Absolute epoch ms — see _PROMPT_TIMEOUT_S doc comment.
             "expires_at": int((time.time() + _PROMPT_TIMEOUT_S) * 1000),
         }
+        thread_id = metadata.get("thread_id") if metadata else None
+        if isinstance(thread_id, str) and thread_id:
+            payload["session_id"] = self._thread_phone_session.get(thread_id, thread_id)
         # Durable (#41) — a prompt is a real message worth surviving an offline
         # phone, same contract as send()'s non-streamed path. `expires_at` is
         # absolute, so one that outlives its window while queued correctly
@@ -1553,12 +1560,24 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 message_type = MessageType.VIDEO
             else:
                 message_type = MessageType.DOCUMENT
+        thread_id = await self._bridge_thread_id(payload)
+        msg_id = payload.get("msg_id")
+        phone_session_id = hermes_session_to_continue(payload)
+        if thread_id and phone_session_id:
+            self._thread_phone_session[thread_id] = phone_session_id
+        if isinstance(msg_id, str) and phone_session_id:
+            self._message_session_id[msg_id] = phone_session_id
+        content = payload["content"]
+        pending_handoffs = getattr(self, "_pending_handoffs", {})
+        handoff = pending_handoffs.pop(thread_id, None) if thread_id else None
+        if handoff:
+            content = f"{handoff}{content}"
         return MessageEvent(
-            text=payload["content"],
+            text=content,
             source=self.build_source(
                 chat_id=self._profile_id,
                 user_id="mobile",
-                thread_id=await self._bridge_thread_id(payload),
+                thread_id=thread_id,
             ),
             media_urls=media_urls,
             media_types=media_types,
@@ -1569,7 +1588,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             # (see [profile_id].tsx's handleSend doc comment). Lets
             # on_processing_start/on_processing_complete address a `react` ack
             # frame back at this exact message.
-            message_id=payload.get("msg_id"),
+            message_id=msg_id,
         )
 
     async def _handle_rpc(self, payload: Dict[str, Any]) -> None:
@@ -1595,16 +1614,22 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
     async def _bridge_thread_id(self, payload: Dict[str, Any]) -> Optional[str]:
-        """Phone chat id, used as the gateway thread so each chat is its own session."""
+        """Resolve the gateway thread for a phone chat."""
         session_id = hermes_session_to_continue(payload)
         if not session_id:
             return None
         try:
             rows = await self._listed_bridge_sessions()
         except Exception:
-            logger.warning("[hermes_bridge] session list unavailable; isolating %s", session_id)
             return session_id
-        return bridge_thread_id(session_id, rows)
+        for row in rows:
+            if row.get("id") == session_id and row.get("source") != "hermes_bridge":
+                logger.warning(
+                    "[hermes_bridge] continuing foreign session %s with legacy thread behavior; use sessions.fork",
+                    session_id,
+                )
+        thread_id = bridge_thread_id(session_id, rows)
+        return thread_id
 
     async def _gateway_session_id(self, session_id: str) -> str:
         try:
@@ -1616,11 +1641,14 @@ class HermesBridgeAdapter(BasePlatformAdapter):
     async def _rpc_sessions_list(self, p: Dict[str, Any]) -> Any:
         return rewrite_listed_sessions(await self._api.get("/api/sessions?limit=100"))
 
+    async def _rpc_sessions_active(self, p: Dict[str, Any]) -> Any:
+        return {"active": sorted(self._thread_phone_session.get(t, t) for t in self._active_threads)}
+
     async def _rpc_sessions_messages(self, p: Dict[str, Any]) -> Any:
         session_id = await self._gateway_session_id(_require(p, "id", "missing_session_id"))
         path = f"/api/sessions/{quote(session_id, safe='')}/messages"
         if not any(key in p for key in ("limit", "offset", "order")):
-            return await self._api.get(path)
+            return _project_session_messages(await self._api.get(path))
         try:
             limit = int(p.get("limit", 20))
             offset = int(p.get("offset", 0))
@@ -1630,11 +1658,77 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         if not 0 <= limit <= 500 or offset < 0 or order not in {"oldest", "latest"}:
             raise _RpcError("invalid_history_page")
         query = urlencode({"limit": limit, "offset": offset, "order": order})
-        return await self._api.get(f"{path}?{query}")
+        if limit == 0:
+            return _project_session_messages(await self._api.get(f"{path}?{query}"))
+        # Pages are counted in raw rows, but tool calls/results and internal
+        # notices are projected away, so a 20-row page of a tool-heavy turn
+        # can render as one bubble. Read a wider raw window and report the raw
+        # rows consumed so the phone's offset stays raw-based.
+        raw_limit = min(500, limit * 10)
+        query = urlencode({"limit": raw_limit, "offset": offset, "order": order})
+        data = await self._api.get(f"{path}?{query}")
+        if not isinstance(data, dict):
+            return data
+        raw_rows = data.get("messages")
+        pagination = data.get("pagination") if isinstance(data.get("pagination"), dict) else {}
+        returned = pagination.get("returned")
+        if not isinstance(returned, int):
+            returned = len(raw_rows) if isinstance(raw_rows, list) else 0
+        projected = _project_session_messages(data)
+        if not isinstance(projected, dict):
+            return projected
+        return {
+            **projected,
+            "pagination": {
+                **pagination,
+                "limit": limit,
+                "offset": offset,
+                "order": pagination.get("order", order),
+                "returned": returned,
+            },
+        }
 
     async def _rpc_sessions_create(self, p: Dict[str, Any]) -> Any:
         """Id the phone keeps. The gateway row appears on the first message, keyed by this thread."""
         return {"id": new_bridge_chat_id()}
+
+    async def _rpc_sessions_fork(self, p: Dict[str, Any]) -> Any:
+        source_id = _require(p, "id", "missing_session_id")
+        rows = await self._listed_bridge_sessions()
+        source = next((row for row in rows if row.get("id") == source_id), None)
+        if not source or source.get("source") == "hermes_bridge":
+            raise _RpcError("session_not_forkable")
+        title = str(source.get("title") or source_id)
+        page = await self._api.get(
+            f"/api/sessions/{quote(source_id, safe='')}/messages?limit=40&order=latest"
+        )
+        projected = _project_session_messages(page)
+        messages = projected.get("messages", []) if isinstance(projected, dict) else []
+        visible = [m for m in messages if isinstance(m, dict) and m.get("role") in {"user", "assistant"}]
+        visible = visible[-10:]
+        lines = []
+        remaining = 4000
+        for message in visible:
+            label = "User" if message.get("role") == "user" else "Assistant"
+            text = str(message.get("content") or "")[:500]
+            line = f"{label}: {text}"
+            if len(line) > remaining:
+                line = line[:remaining]
+            if not line:
+                break
+            lines.append(line)
+            remaining -= len(line) + 1
+            if remaining <= 0:
+                break
+        handoff = "\n".join(lines)
+        thread_id = new_bridge_chat_id()
+        if not hasattr(self, "_pending_handoffs"):
+            self._pending_handoffs = {}
+        self._pending_handoffs[thread_id] = (
+            f'[HANDOFF CONTEXT — from {source.get("source")} session "{title}" ({source_id})]\n'
+            f"{handoff}\n[/HANDOFF CONTEXT]\n\n"
+        )
+        return {"id": thread_id, "title": f"↪ {title}", "forked_from": source_id}
 
     async def _rpc_sessions_switch(self, p: Dict[str, Any]) -> Any:
         # Hermes has no REST endpoint to switch active session context.
@@ -1899,11 +1993,19 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             raise _RpcError("cron_owner_unverified")
         return profile
 
-    async def _rpc_cron_notes(self, p: Dict[str, Any], *, capabilities: bool = False) -> Any:
-        from .cron_notes import read_notes
+    async def _rpc_cron_notes(self, p: Dict[str, Any], *, capabilities: bool = False,
+                              action: str = "read") -> Any:
+        from .cron_notes import access_notes
         profile = _require(p, "profile", "missing_profile")
         job_id = _require(p, "job_id", "missing_job_id")
-        return await asyncio.to_thread(read_notes, profile, job_id, capabilities=capabilities)
+        return await asyncio.to_thread(access_notes, profile, job_id, capabilities=capabilities,
+                                       action=action, key=p.get("key"), value=p.get("value"))
+
+    async def _rpc_cron_notes_set(self, p: Dict[str, Any]) -> Any:
+        return await self._rpc_cron_notes(p, action="set")
+
+    async def _rpc_cron_notes_delete(self, p: Dict[str, Any]) -> Any:
+        return await self._rpc_cron_notes(p, action="delete")
 
     async def _rpc_cron_notes_capabilities(self, p: Dict[str, Any]) -> Any:
         return await self._rpc_cron_notes(p, capabilities=True)
@@ -2286,184 +2388,52 @@ class HermesBridgeAdapter(BasePlatformAdapter):
 
     async def _rpc_bots_list(self, p: Dict[str, Any]) -> Any:
         """Roster of bot-managed core-profiles on this laptop."""
-        self._require_bots_enabled()
-        try:
-            result = await self._local_rpc("profiles.list", {"include_sessions": True})
-        except _LocalRpcError as exc:
-            raise _RpcError("bots_unavailable") from exc
-        if not isinstance(result, dict) or not result.get("bot_mode_protocol"):
-            raise _RpcError("bots_unavailable")
-        rows = result.get("profiles") or []
-        if not isinstance(rows, list):
-            rows = []
-        return [_project_bot_row(r) for r in rows if isinstance(r, dict) and _is_bot_managed_row(r)]
-
-    @staticmethod
-    def _blocked_bot_capabilities(reason: str) -> Dict[str, Any]:
-        blocked = {"available": False, "reason": reason}
-        return {
-            "stop": dict(blocked),
-            "subagents": {
-                **blocked,
-                "tail": dict(blocked),
-                "controls": {"steer": dict(blocked), "interrupt": dict(blocked)},
-            },
-        }
+        return await list_bots(self)
 
     async def _rpc_bots_capabilities(self, p: Dict[str, Any]) -> Any:
         """Report Bot actions supported by this bridge and local runtime."""
-        if not _bots_flag_enabled():
-            return self._blocked_bot_capabilities("bots_disabled")
+        if not bots_flag_enabled():
+            return blocked_bot_capabilities("bots_disabled")
         try:
-            result = await self._local_rpc("profiles.list", {"include_sessions": False})
+            await fetch_profiles_snapshot(self, include_sessions=False)
         except _RpcError as exc:
-            return self._blocked_bot_capabilities(str(exc))
-        except _LocalRpcError:
-            return self._blocked_bot_capabilities("bots_unavailable")
-        if not isinstance(result, dict) or not result.get("bot_mode_protocol"):
-            return self._blocked_bot_capabilities("bots_unavailable")
+            return blocked_bot_capabilities(str(exc))
         subagents = await bot_subagents.ensure_capabilities(self)
         return {
             "stop": {"available": True, "reason": None},
+            "activity": {"available": True, "reason": None},
+            "notify": {"available": True, "reason": None},
             "subagents": subagents,
         }
 
-    @staticmethod
-    def _require_bots_enabled() -> None:
-        if not _bots_flag_enabled():
-            raise _RpcError("bots_disabled")
+    async def _rpc_bots_activity_snapshot(self, p: Dict[str, Any]) -> Any:
+        """Read-only completed-turn cursors for Bot unread reconciliation (#80)."""
+        return await bot_activity.activity_snapshot(self, p)
 
-    async def _require_bot_profile(self, name: str) -> Dict[str, Any]:
-        """Re-validate the name. Authorization boundary, not a display filter.
+    async def _rpc_bots_notify_get(self, p: Dict[str, Any]) -> Any:
+        """Laptop-scoped Bot completion notification preference (#81)."""
+        require_bots_enabled()
+        return await bot_notify.get_preference(self, p)
 
-        Unknown name ⇒ bot_gone, never a fallback to the default core-profile.
-        Core's own adapter-set source.laptop path *does* fall back — a missing
-        laptop directory logs a warning and silently uses the default
-        (gateway/run.py). We deliberately do not copy that.
-        """
-        self._require_bots_enabled()
-        try:
-            result = await self._local_rpc("profiles.list", {"include_sessions": True})
-        except _LocalRpcError as exc:
-            raise _RpcError("bots_unavailable") from exc
-        if not isinstance(result, dict) or not result.get("bot_mode_protocol"):
-            raise _RpcError("bots_unavailable")
-        rows = result.get("profiles") or []
-        if not isinstance(rows, list):
-            rows = []
-        for row in rows:
-            if isinstance(row, dict) and row.get("name") == name:
-                if not _is_bot_managed_row(row):
-                    raise _RpcError("bot_gone")
-                return row
-        raise _RpcError("bot_gone")
+    async def _rpc_bots_notify_set(self, p: Dict[str, Any]) -> Any:
+        """Enable/disable bounded Bot completion observation (#81)."""
+        require_bots_enabled()
+        return await bot_notify.set_preference(self, p)
 
-    async def _lookup_bot_chat(self, name: str) -> Optional[str]:
-        """Registry lookup by exact title. Returns the stored id, or None."""
-        try:
-            listed = await self._local_rpc(
-                "session.list",
-                {
-                    "profile": name,
-                    "title": _BOT_CHAT_TITLE,
-                    "include_hidden": True,
-                },
-            )
-        except _LocalRpcError as exc:
-            raise _RpcError("bots_unavailable") from exc
-        sessions = listed.get("sessions") if isinstance(listed, dict) else None
-        if not isinstance(sessions, list) or not sessions:
-            return None
-        first = sessions[0] if isinstance(sessions[0], dict) else {}
-        stored = first.get("id") or first.get("resolved_id")
-        return str(stored) if stored else None
-
-    async def _resume_bot_chat(self, name: str, stored_id: str) -> Dict[str, Any]:
-        """session.resume request uses the STORED id; response session_id is runtime."""
-        try:
-            snap = await self._local_rpc(
-                "session.resume",
-                {
-                    "session_id": stored_id,
-                    "profile": name,
-                    "omit_messages": True,
-                },
-            )
-        except _LocalRpcError as exc:
-            if _is_stale_session(exc):
-                raise _RpcError("chat_expired") from exc
-            raise _RpcError("bots_unavailable") from exc
-        if not isinstance(snap, dict):
-            raise _RpcError("bots_unavailable")
-        return snap
-
-    async def _fetch_bot_history(
-        self, stored_id: str, name: str, chat: str, offset: int, limit: int
-    ) -> Dict[str, Any]:
-        # Omitting profile returns 404, not the default laptop's rows.
-        # Do not "fix" this by defaulting the param.
-        qs = urlencode(
-            {
-                "profile": name,
-                "limit": str(limit),
-                "offset": str(offset),
-                "order": "latest",
-                "include_compacted": "true",
-            }
-        )
-        path = f"/api/sessions/{quote(stored_id, safe='')}/messages?{qs}"
-        try:
-            raw = await self._api.get(path)
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                raise _RpcError("chat_expired") from exc
-            raise
-        rows = raw.get("messages") if isinstance(raw, dict) else []
-        pagination = raw.get("pagination") if isinstance(raw, dict) else {}
-        if not isinstance(pagination, dict):
-            pagination = {}
-        messages = _project_bot_messages(rows, chat)
-        returned = int(pagination.get("returned") or len(messages))
-        return {
-            "messages": messages,
-            "pagination": {
-                "limit": int(pagination.get("limit") or limit),
-                "offset": int(pagination.get("offset") or offset),
-                "returned": returned,
-                "has_more": returned >= limit,
-            },
-        }
-
-    def _mint_bot_token(self) -> str:
-        return secrets.token_urlsafe(18)
-
-    def _touch_bot_chat(self, chat: Dict[str, Any]) -> None:
-        chat["last_activity"] = time.monotonic()
-
-    def _start_bot_poll(self, token: str) -> None:
-        tasks = getattr(self, "_bot_poll_tasks", None)
-        if tasks is None:
-            self._bot_poll_tasks = {}
-            tasks = self._bot_poll_tasks
-        existing = tasks.get(token)
-        if existing is not None and not existing.done():
+    def _ensure_bot_notify_observer(self) -> None:
+        """Start the completion observer when the Laptop opt-in is on."""
+        state = bot_notify.load_state(self._profile_id)
+        if not state.get("enabled"):
             return
-        tasks[token] = asyncio.ensure_future(self._bot_poll_loop(token))
-
-    async def _stop_bot_poll(self, token: str) -> None:
-        task = getattr(self, "_bot_poll_tasks", {}).pop(token, None)
-        if task is None:
+        task = getattr(self, "_bot_notify_task", None)
+        if task is not None and not task.done():
             return
-        task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
+        self._bot_notify_task = asyncio.ensure_future(bot_notify.poll_completions(self))
 
-    async def _expire_bot_chat(self, token: str) -> None:
-        getattr(self, "_bot_chats", {}).pop(token, None)
-        bot_subagents.invalidate_refs(getattr(self, "_subagent_refs", {}), token)
-        await self._stop_bot_poll(token)
+    def _stop_bot_notify_observer(self) -> None:
+        task = getattr(self, "_bot_notify_task", None)
+        if task is not None and not task.done():
+            task.cancel()
 
     async def _rpc_bots_subagents_list(self, p: Dict[str, Any]) -> Any:
         return await bot_subagents.list_children(self, p)
@@ -2477,335 +2447,47 @@ class HermesBridgeAdapter(BasePlatformAdapter):
     async def _rpc_bots_subagents_interrupt(self, p: Dict[str, Any]) -> Any:
         return await bot_subagents.interrupt_child(self, p)
 
-    async def _reresolve_bot_chat(self, chat: Dict[str, Any]) -> None:
-        """Silent re-resolve: registry lookup → resume. At most once per op."""
-        stored = await self._lookup_bot_chat(str(chat["name"]))
-        if not stored:
-            raise _RpcError("chat_expired")
-        chat["stored_id"] = stored
-        snap = await self._resume_bot_chat(str(chat["name"]), stored)
-        runtime = str(snap.get("session_id") or "").strip()
-        if not runtime:
-            raise _RpcError("chat_expired")
-        chat["runtime_handle"] = runtime
+    async def _rpc_rooms_capabilities(self, p: Dict[str, Any]) -> Any:
+        return await bot_rooms.capabilities(self, p)
 
-    async def _prompt_bot_chat(self, chat: Dict[str, Any], text: str) -> None:
-        """prompt.submit uses the RUNTIME handle. One silent re-resolve on stale."""
-        try:
-            await self._local_rpc(
-                "prompt.submit",
-                {"session_id": chat["runtime_handle"], "text": text},
-            )
-            return
-        except _LocalRpcError as exc:
-            if not _is_stale_session(exc):
-                raise _RpcError("bots_unavailable") from exc
-        await self._reresolve_bot_chat(chat)
-        try:
-            await self._local_rpc(
-                "prompt.submit",
-                {"session_id": chat["runtime_handle"], "text": text},
-            )
-        except _LocalRpcError as exc:
-            raise _RpcError("chat_expired") from exc
+    async def _rpc_rooms_list(self, p: Dict[str, Any]) -> Any:
+        return await bot_rooms.list_rooms(self, p)
 
-    def _adopt_inflight_run(self, chat: Dict[str, Any], snap: Dict[str, Any]) -> Optional[str]:
-        running = bool(snap.get("running"))
-        inflight = snap.get("inflight") if isinstance(snap.get("inflight"), dict) else {}
-        streaming = bool(inflight.get("streaming")) if inflight else False
-        if running or streaming:
-            if not chat.get("run_id"):
-                chat["run_id"] = str(uuid.uuid4())
-            chat["was_running"] = True
-            chat["last_text"] = str((inflight or {}).get("assistant") or "")
-            return str(chat["run_id"])
-        return chat.get("run_id") if chat.get("was_running") else None
+    async def _rpc_rooms_create(self, p: Dict[str, Any]) -> Any:
+        return await bot_rooms.create_room(self, p)
 
-    async def _bot_poll_loop(self, token: str) -> None:
-        """Poll session.resume. Fast while in flight; slow when idle; stop after idle timeout."""
-        try:
-            while True:
-                chat = getattr(self, "_bot_chats", {}).get(token)
-                if chat is None:
-                    return
-                idle_s = getattr(self, "_bot_idle_timeout_s", _BOT_IDLE_TIMEOUT_S)
-                if time.monotonic() - float(chat.get("last_activity") or 0) > idle_s:
-                    await self._expire_bot_chat(token)
-                    return
-                try:
-                    snap = await self._resume_bot_chat(str(chat["name"]), str(chat["stored_id"]))
-                except _RpcError:
-                    await asyncio.sleep(getattr(self, "_bot_poll_idle_s", _BOT_POLL_IDLE_S))
-                    continue
-                runtime = str(snap.get("session_id") or "").strip()
-                if runtime:
-                    chat["runtime_handle"] = runtime
-                inflight = snap.get("inflight") if isinstance(snap.get("inflight"), dict) else {}
-                text = str((inflight or {}).get("assistant") or "")
-                running = bool(snap.get("running") or (inflight or {}).get("streaming"))
-                if chat.get("suppress_running_until_idle"):
-                    if running:
-                        await asyncio.sleep(getattr(self, "_bot_poll_fast_s", _BOT_POLL_FAST_S))
-                        continue
-                    chat["suppress_running_until_idle"] = False
-                run_id = str(chat.get("run_id") or "")
-                if running:
-                    if not run_id:
-                        run_id = str(uuid.uuid4())
-                        chat["run_id"] = run_id
-                    if text != chat.get("last_text"):
-                        chat["last_text"] = text
-                        await self._send_run_event(run_id, "message.delta", {"text": text}, done=False)
-                    chat["was_running"] = True
-                    delay = getattr(self, "_bot_poll_fast_s", _BOT_POLL_FAST_S)
-                else:
-                    if run_id and chat.get("was_running"):
-                        await self._send_run_event(
-                            run_id, "message.complete", {"text": text}, done=True
-                        )
-                        chat["was_running"] = False
-                        chat["last_text"] = text
-                    delay = getattr(self, "_bot_poll_idle_s", _BOT_POLL_IDLE_S)
-                await asyncio.sleep(delay)
-        except asyncio.CancelledError:
-            return
+    async def _rpc_rooms_open(self, p: Dict[str, Any]) -> Any:
+        return await bot_rooms.open_room(self, p)
+
+    async def _rpc_rooms_send(self, p: Dict[str, Any]) -> Any:
+        return await bot_rooms.send_message(self, p)
+
+    async def _rpc_rooms_log(self, p: Dict[str, Any]) -> Any:
+        return await bot_rooms.read_log(self, p)
+
+    async def _rpc_rooms_stop(self, p: Dict[str, Any]) -> Any:
+        return await bot_rooms.stop_room_work(self, p)
+
+    async def _rpc_rooms_approve(self, p: Dict[str, Any]) -> Any:
+        return await bot_rooms.approve_room(self, p)
+
+    async def _rpc_rooms_close(self, p: Dict[str, Any]) -> Any:
+        return await bot_rooms.close_room(self, p)
 
     async def _rpc_bots_open(self, p: Dict[str, Any]) -> Any:
-        name = str(p.get("name") or "").strip()
-        if not name:
-            raise _RpcError("bot_gone")
-        row = await self._require_bot_profile(name)
-        logger.info("[hermes_bridge] bots.open name=%s", name)
-
-        stored_id = await self._lookup_bot_chat(name)
-        minted = False
-        snap: Dict[str, Any] = {}
-        runtime_handle = ""
-        if stored_id:
-            snap = await self._resume_bot_chat(name, stored_id)
-            runtime_handle = str(snap.get("session_id") or "").strip()
-        else:
-            # Adopt-before-mint already ran (lookup empty). Create-then-prompt
-            # is one uninterrupted sequence — a live-but-unprompted session
-            # is invisible to session.resume (§4.4).
-            try:
-                created = await self._local_rpc(
-                    "session.create",
-                    {
-                        "profile": name,
-                        "title": _BOT_CHAT_TITLE,
-                        "hidden": True,
-                    },
-                )
-            except _LocalRpcError as exc:
-                raise _RpcError("bots_unavailable") from exc
-            if not isinstance(created, dict):
-                raise _RpcError("bots_unavailable")
-            # create response: session_id = runtime, stored_session_id = stored.
-            runtime_handle = str(created.get("session_id") or "").strip()
-            stored_id = str(created.get("stored_session_id") or "").strip()
-            if not runtime_handle or not stored_id:
-                raise _RpcError("bots_unavailable")
-            minted = True
-            try:
-                await self._local_rpc(
-                    "prompt.submit",
-                    {"session_id": runtime_handle, "text": _BOT_KICKOFF},
-                )
-            except _LocalRpcError as exc:
-                raise _RpcError("bots_unavailable") from exc
-            snap = {
-                "session_id": runtime_handle,
-                "running": True,
-                "inflight": {"user": _BOT_KICKOFF, "assistant": "", "streaming": True},
-            }
-
-        if not runtime_handle or not stored_id:
-            raise _RpcError("bots_unavailable")
-
-        token = self._mint_bot_token()
-        chats = getattr(self, "_bot_chats", None)
-        if chats is None:
-            self._bot_chats = {}
-            chats = self._bot_chats
-        record: Dict[str, Any] = {
-            "name": name,
-            "stored_id": stored_id,
-            "runtime_handle": runtime_handle,
-            "run_id": None,
-            "last_activity": time.monotonic(),
-            "last_text": "",
-            "was_running": False,
-        }
-        run_id = self._adopt_inflight_run(record, snap)
-        chats[token] = record
-        self._start_bot_poll(token)
-
-        try:
-            history = await self._fetch_bot_history(
-                stored_id, name, token, 0, _BOT_HISTORY_LIMIT
-            )
-        except _RpcError:
-            if minted:
-                history = {
-                    "messages": _project_bot_messages(
-                        [
-                            {
-                                "id": "kickoff",
-                                "role": "user",
-                                "content": _BOT_KICKOFF,
-                                "timestamp": time.time(),
-                            }
-                        ],
-                        token,
-                    ),
-                    "pagination": {
-                        "limit": _BOT_HISTORY_LIMIT,
-                        "offset": 0,
-                        "returned": 1,
-                        "has_more": False,
-                    },
-                }
-            else:
-                raise
-
-        display = (row.get("display_name") or name) if isinstance(row, dict) else name
-        return {
-            "chat": token,
-            "name": name,
-            "display_name": display,
-            "messages": history["messages"],
-            "pagination": history["pagination"],
-            "run_id": run_id,
-            "running": bool(record.get("was_running")),
-        }
+        return await bot_chats.open_chat(self, p)
 
     async def _rpc_bots_send(self, p: Dict[str, Any]) -> Any:
-        self._require_bots_enabled()
-        token = str(p.get("chat") or "").strip()
-        text = str(p.get("text") or "").strip()
-        if not token:
-            raise _RpcError("chat_expired")
-        if not text:
-            raise _RpcError("empty_text")
-        chat = getattr(self, "_bot_chats", {}).get(token)
-        if chat is None:
-            raise _RpcError("chat_expired")
-        logger.info("[hermes_bridge] bots.send name=%s", chat.get("name"))
-        self._touch_bot_chat(chat)
-        await self._prompt_bot_chat(chat, text)
-        run_id = str(uuid.uuid4())
-        chat["run_id"] = run_id
-        chat["was_running"] = True
-        chat["last_text"] = ""
-        chat["suppress_running_until_idle"] = False
-        self._start_bot_poll(token)
-        return {"run_id": run_id}
+        return await bot_chats.send_message(self, p)
 
     async def _rpc_bots_stop(self, p: Dict[str, Any]) -> Any:
-        """Interrupt only the Bot chat named by a live opaque token."""
-        self._require_bots_enabled()
-        token = str(p.get("chat") or "").strip()
-        if not token:
-            raise _RpcError("chat_expired")
-        chat = getattr(self, "_bot_chats", {}).get(token)
-        if chat is None:
-            raise _RpcError("chat_expired")
-        await self._require_bot_profile(str(chat.get("name") or ""))
-        self._touch_bot_chat(chat)
-
-        recovered_stale_handle = False
-        try:
-            snapshot = await self._resume_bot_chat(str(chat["name"]), str(chat["stored_id"]))
-            runtime = str(snapshot.get("session_id") or "").strip()
-            if not runtime:
-                raise _RpcError("chat_expired")
-            chat["runtime_handle"] = runtime
-        except _RpcError as exc:
-            if str(exc) == "chat_expired":
-                await self._reresolve_bot_chat(chat)
-                recovered_stale_handle = True
-                snapshot = {"running": True}
-            else:
-                raise
-
-        run_id = str(chat.get("run_id") or "")
-        inflight = snapshot.get("inflight") if isinstance(snapshot.get("inflight"), dict) else {}
-        active = bool(snapshot.get("running") or inflight.get("streaming"))
-        if not active:
-            if run_id and chat.get("was_running"):
-                final_text = str(inflight.get("assistant") or chat.get("last_text") or "")
-                await self._send_run_event(
-                    run_id, "run.completed", {"text": final_text}, done=True
-                )
-            chat["was_running"] = False
-            chat["run_id"] = None
-            return {"stopped": False, "status": "already_finished"}
-
-        try:
-            outcome = await self._local_rpc(
-                "session.interrupt", {"session_id": chat["runtime_handle"]}
-            )
-        except _LocalRpcError as exc:
-            if not _is_stale_session(exc):
-                raise _RpcError("bots_unavailable") from exc
-            if recovered_stale_handle:
-                raise _RpcError("chat_expired") from exc
-            await self._reresolve_bot_chat(chat)
-            try:
-                outcome = await self._local_rpc(
-                    "session.interrupt", {"session_id": chat["runtime_handle"]}
-                )
-            except _LocalRpcError as retry_exc:
-                raise _RpcError("chat_expired") from retry_exc
-
-        interrupted = isinstance(outcome, dict) and outcome.get("status") == "interrupted"
-        if interrupted and run_id:
-            final_text = str(inflight.get("assistant") or chat.get("last_text") or "")
-            await self._send_run_event(
-                run_id, "run.stopped", {"text": final_text}, done=True
-            )
-        elif run_id and chat.get("was_running"):
-            final_text = str(inflight.get("assistant") or chat.get("last_text") or "")
-            await self._send_run_event(
-                run_id, "run.completed", {"text": final_text}, done=True
-            )
-        chat["was_running"] = False
-        chat["run_id"] = None
-        chat["last_text"] = ""
-        chat["suppress_running_until_idle"] = interrupted
-        return {
-            "stopped": interrupted,
-            "status": "stopped" if interrupted else "already_finished",
-        }
+        return await bot_chats.stop_chat(self, p)
 
     async def _rpc_bots_close(self, p: Dict[str, Any]) -> Any:
-        token = str(p.get("chat") or "").strip()
-        if token:
-            await self._expire_bot_chat(token)
-        return {"closed": True}
+        return await bot_chats.close_chat(self, p)
 
     async def _rpc_bots_history(self, p: Dict[str, Any]) -> Any:
-        self._require_bots_enabled()
-        token = str(p.get("chat") or "").strip()
-        if not token:
-            raise _RpcError("chat_expired")
-        chat = getattr(self, "_bot_chats", {}).get(token)
-        if chat is None:
-            raise _RpcError("chat_expired")
-        self._touch_bot_chat(chat)
-        try:
-            offset = max(0, int(p.get("offset") or 0))
-        except (TypeError, ValueError):
-            offset = 0
-        try:
-            limit = int(p.get("limit") or _BOT_HISTORY_LIMIT)
-        except (TypeError, ValueError):
-            limit = _BOT_HISTORY_LIMIT
-        limit = max(1, min(limit, 500))
-        return await self._fetch_bot_history(
-            str(chat["stored_id"]), str(chat["name"]), token, offset, limit
-        )
+        return await bot_chats.history(self, p)
 
     # ── Reaction-ack lifecycle (#45): 👀 → ✅/❌ ─────────────────────────
     #
@@ -2834,6 +2516,9 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 "emoji": emoji,
                 "remove": remove,
             }
+            session_id = self._message_session_id.get(message_id)
+            if session_id:
+                payload["session_id"] = session_id
             frame = seal(self._profile_id, "out", payload, self._psk)
             await self._ws.send(frame)
             return True
@@ -2843,6 +2528,10 @@ class HermesBridgeAdapter(BasePlatformAdapter):
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add the 👀 in-progress reaction (op-gated; silent no-op otherwise)."""
+        source = getattr(event, "source", None)
+        thread_id = self._message_session_id.get(event.message_id) or getattr(source, "thread_id", None)
+        if isinstance(thread_id, str) and thread_id:
+            self._active_threads.add(thread_id)
         await self._react(event.message_id, "👀")
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
@@ -2854,12 +2543,21 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         connector implementation exactly.
         """
         if not event.message_id:
+            source = getattr(event, "source", None)
+            thread_id = getattr(source, "thread_id", None)
+            if isinstance(thread_id, str):
+                self._active_threads.discard(thread_id)
             return
+        source = getattr(event, "source", None)
+        thread_id = self._message_session_id.get(event.message_id) or getattr(source, "thread_id", None)
+        if isinstance(thread_id, str):
+            self._active_threads.discard(thread_id)
         await self._react(event.message_id, "👀", remove=True)
         if outcome == ProcessingOutcome.SUCCESS:
             await self._react(event.message_id, "✅")
         elif outcome == ProcessingOutcome.FAILURE:
             await self._react(event.message_id, "❌")
+        self._message_session_id.pop(event.message_id, None)
 
     async def _send_lifecycle_event(
         self, event_type: str, data: Optional[Dict[str, Any]] = None

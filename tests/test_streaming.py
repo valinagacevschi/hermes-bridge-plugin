@@ -13,7 +13,7 @@ or with any Python ≥3.8 that has websockets + PyNaCl installed.
 import os
 import sys
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 # Ensure repo root is on the path; testutil stubs heavy deps on import.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -56,6 +56,32 @@ class TestSendExpectEdits(unittest.IsolatedAsyncioTestCase):
         payload = _open(sent_frames[0])
         self.assertEqual(payload["content"], "hello")
         self.assertNotIn("edit", payload)
+
+    async def test_reply_frames_carry_phone_session_id_through_stream_finalize(self):
+        sent_frames = []
+        self.adapter._ws.send = AsyncMock(side_effect=lambda frame: sent_frames.append(frame))
+        result = await self.adapter.send("chat-1", "Hel", reply_to="u1", metadata={"expect_edits": True, "thread_id": "phone-a"})
+        with patch.object(self.adapter, "_enqueue_durable", AsyncMock()):
+            await self.adapter.edit_message("chat-1", result.message_id, "Hello", finalize=True)
+        self.assertEqual(_open(sent_frames[0])["session_id"], "phone-a")
+        self.assertEqual(_open(sent_frames[1])["session_id"], "phone-a")
+
+    async def test_gateway_thread_is_stamped_as_phone_session_id(self):
+        self.adapter._thread_phone_session["gateway-thread"] = "phone-session"
+        sent_frames = []
+        self.adapter._ws.send = AsyncMock(side_effect=lambda frame: sent_frames.append(frame))
+        with patch.object(self.adapter, "_enqueue_durable", AsyncMock()):
+            await self.adapter.send("chat-1", "hello", metadata={"thread_id": "gateway-thread"})
+        self.assertEqual(_open(sent_frames[0])["session_id"], "phone-session")
+
+    async def test_inbound_event_remembers_phone_id_for_its_gateway_thread(self):
+        with (
+            patch.object(self.adapter, "_bridge_thread_id", AsyncMock(return_value="gateway-thread")),
+            patch.object(self.adapter, "build_source", return_value=MagicMock(thread_id="gateway-thread")),
+        ):
+            await self.adapter._build_event({"session_id": "phone-session", "content": "hello", "msg_id": "u1"})
+        self.assertEqual(self.adapter._thread_phone_session["gateway-thread"], "phone-session")
+        self.assertEqual(self.adapter._message_session_id["u1"], "phone-session")
 
     async def test_expect_edits_send_skips_durable_enqueue(self):
         """GatewayStreamConsumer's streaming-preview send() — must return a
@@ -101,6 +127,7 @@ class TestEditMessage(unittest.IsolatedAsyncioTestCase):
         self.adapter = _make_adapter()
 
     async def test_intermediate_edit_is_live_only(self):
+        self.adapter._stream_pending.add("msg-abc")
         sent_frames = []
         self.adapter._ws.send = AsyncMock(side_effect=lambda f: sent_frames.append(f))
         with patch.object(self.adapter, "_enqueue_durable", AsyncMock()) as mock_enqueue:
@@ -116,6 +143,7 @@ class TestEditMessage(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["content"], "Hello wor")
 
     async def test_finalize_edit_enqueues_durably(self):
+        self.adapter._stream_pending.add("msg-abc")
         sent_frames = []
         self.adapter._ws.send = AsyncMock(side_effect=lambda f: sent_frames.append(f))
         with patch.object(self.adapter, "_enqueue_durable", AsyncMock()) as mock_enqueue:
@@ -136,6 +164,7 @@ class TestEditMessage(unittest.IsolatedAsyncioTestCase):
         """Each edit call carries the FULL accumulated text — verifies the
         adapter doesn't try to diff/append (that's the gateway's job)."""
         sent_frames = []
+        self.adapter._stream_pending.add("msg-1")
         self.adapter._ws.send = AsyncMock(side_effect=lambda f: sent_frames.append(f))
         with patch.object(self.adapter, "_enqueue_durable", AsyncMock()):
             await self.adapter.edit_message("chat-1", "msg-1", "Hi")
@@ -147,10 +176,10 @@ class TestEditMessage(unittest.IsolatedAsyncioTestCase):
 
     async def test_edit_without_connection_fails(self):
         """An intermediate edit is live-only, so with no socket there is
-        nothing to fall back on — and nothing was streamed through this
-        adapter instance, so no flush either."""
+        nothing to fall back on — and no socket delivery succeeds."""
         self.adapter._ws = None
-        result = await self.adapter.edit_message("chat-1", "msg-1", "text")
+        with patch.object(self.adapter, "_enqueue_durable", AsyncMock(return_value=False)):
+            result = await self.adapter.edit_message("chat-1", "msg-1", "text")
         self.assertFalse(result.success)
         self.assertEqual(result.error, "not_connected")
 
@@ -158,6 +187,7 @@ class TestEditMessage(unittest.IsolatedAsyncioTestCase):
         """The terminal edit carries the real answer. Refusing outright on a
         dead socket — as this did — lost it with no durable row and no push."""
         self.adapter._ws = None
+        self.adapter._stream_pending.add("msg-1")
         with patch.object(self.adapter, "_enqueue_durable", AsyncMock(return_value=True)) as enq:
             result = await self.adapter.edit_message(
                 "chat-1", "msg-1", "the whole answer", finalize=True
@@ -167,6 +197,23 @@ class TestEditMessage(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.retryable, "already queued — a retry would duplicate it")
         enq.assert_called_once()
         self.assertEqual(_open(enq.call_args[0][1])["content"], "the whole answer")
+
+    async def test_completed_message_revisions_are_durable_unique_and_silent(self):
+        sent_frames = []
+        self.adapter._ws.send = AsyncMock(side_effect=lambda frame: sent_frames.append(frame))
+        self.adapter._message_session_id["original"] = "phone-session"
+        self.adapter._message_reply_to = {"original": "user-1"}
+        with patch.object(self.adapter, "_enqueue_durable", AsyncMock()) as enq:
+            await self.adapter.edit_message("chat-1", "original", "first")
+            await self.adapter.edit_message("chat-1", "original", "second")
+        first, second = map(_open, sent_frames)
+        self.assertEqual(first["msg_id"], "original#r1")
+        self.assertEqual(second["msg_id"], "original#r2")
+        self.assertEqual(second["replaces"], "original")
+        self.assertEqual(second["reply_to"], "user-1")
+        self.assertEqual(second["session_id"], "phone-session")
+        self.assertEqual([call.kwargs["category"] for call in enq.call_args_list], [None, None])
+        self.assertEqual(enq.call_count, 2)
 
 
 class TestDeliveryWithoutALiveSocket(unittest.IsolatedAsyncioTestCase):
@@ -274,17 +321,16 @@ class TestStreamDiesBeforeFinalize(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["final"], "recovered frame must read as complete")
 
     async def test_flush_happens_exactly_once(self):
-        """/api/relay/enqueue returns the existing row for a known msg_id
-        without updating sealed_frame, so a second flush is a silent no-op that
-        would pin whichever partial landed first."""
+        """A later edit after the stream fallback is a durable revision."""
         with patch.object(self.adapter, "_enqueue_durable", self.fake_enqueue):
             msg_id = await self._start_stream()
             self.adapter._ws = None
             await self.adapter.edit_message("chat-1", msg_id, "first failure")
             await self.adapter.edit_message("chat-1", msg_id, "second failure")
 
-        self.assertEqual(len(self.enqueued), 1)
+        self.assertEqual(len(self.enqueued), 2)
         self.assertEqual(_open(self.enqueued[0][1])["content"], "first failure")
+        self.assertEqual(_open(self.enqueued[1][1])["replaces"], msg_id)
 
     async def test_successful_finalize_leaves_nothing_to_flush(self):
         """The normal path: finalize lands, so a later stray failed edit for
@@ -295,8 +341,9 @@ class TestStreamDiesBeforeFinalize(unittest.IsolatedAsyncioTestCase):
             self.adapter._ws = None
             await self.adapter.edit_message("chat-1", msg_id, "stray late tick")
 
-        self.assertEqual(len(self.enqueued), 1)
+        self.assertEqual(len(self.enqueued), 2)
         self.assertEqual(_open(self.enqueued[0][1])["content"], "all done")
+        self.assertEqual(_open(self.enqueued[1][1])["replaces"], msg_id)
 
 
 if __name__ == "__main__":
