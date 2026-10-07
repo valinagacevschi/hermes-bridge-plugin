@@ -227,4 +227,10 @@ def make_adapter(psk: bytes = PSK, profile_id: str = PROFILE):
         adapter._bot_poll_idle_s = 5.0
         adapter._room_handles = {}
         adapter._room_caps = None
+        # Session routing: phone-session stamping on outbound frames and the
+        # gateway-thread → phone-session map (mirrors monorepo make_adapter).
+        adapter._stream_session_id = {}
+        adapter._message_session_id = {}
+        adapter._thread_phone_session = {}
+        adapter._active_threads = set()
     return adapter

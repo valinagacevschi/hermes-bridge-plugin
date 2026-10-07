@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from testutil import make_adapter as _make_adapter
-from hermes_bridge.adapter import _diff_new_pending
+from hermes_bridge.adapter import _diff_new_pending, _project_session_messages
 from hermes_bridge.local_api import (
     API_SERVER_PORT,
     discover_dashboard_ports,
@@ -42,6 +42,57 @@ def _rpc_payload(method, params=None, rpc_id="test-id-001"):
 class TestCronWriteMethods(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.adapter = _make_adapter()
+
+    async def test_sessions_active_returns_current_phone_thread_ids(self):
+        self.adapter._thread_phone_session = {"gateway-a": "phone-a"}
+        self.adapter._active_threads = {"gateway-a", "phone-b"}
+        self.assertEqual(await self.adapter._rpc_sessions_active({}), {"active": ["phone-a", "phone-b"]})
+
+    async def test_sessions_create_returns_a_fresh_phone_thread_id(self):
+        first = await self.adapter._rpc_sessions_create({})
+        second = await self.adapter._rpc_sessions_create({})
+        self.assertRegex(first["id"], r"^\d{8}_\d{6}_[0-9a-f]{6}$")
+        self.assertNotEqual(first["id"], second["id"])
+
+    async def test_sessions_fork_validates_source_and_stores_projected_handoff(self):
+        self.adapter._listed_bridge_sessions = AsyncMock(return_value=[
+            {"id": "telegram-id", "source": "telegram", "title": "Original"},
+        ])
+        self.adapter._api.get = AsyncMock(return_value={"messages": [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer"},
+        ]})
+
+        result = await self.adapter._rpc_sessions_fork({"id": "telegram-id"})
+
+        self.assertRegex(result["id"], r"^\d{8}_\d{6}_[0-9a-f]{6}$")
+        self.assertEqual(result["title"], "↪ Original")
+        self.assertEqual(result["forked_from"], "telegram-id")
+        self.assertIn("User: question", self.adapter._pending_handoffs[result["id"]])
+        self.assertIn("Assistant: answer", self.adapter._pending_handoffs[result["id"]])
+
+    async def test_sessions_fork_rejects_a_bridge_session(self):
+        self.adapter._listed_bridge_sessions = AsyncMock(return_value=[
+            {"id": "bridge-id", "source": "hermes_bridge", "title": "Phone chat"},
+        ])
+
+        with self.assertRaisesRegex(Exception, "session_not_forkable"):
+            await self.adapter._rpc_sessions_fork({"id": "bridge-id"})
+
+    def test_sessions_messages_projection_drops_scaffolding_and_folds_tool_reasoning(self):
+        projected = _project_session_messages({"messages": [
+            {"role": "user", "content": '[IMPORTANT: The user has invoked the "x" skill, indicating they want to follow its instructions. The full skill content is loaded below.]\nBODY\nThe user has provided the following instruction alongside the skill invocation: fix it'},
+            {"role": "user", "content": "[System: model]", "display_kind": "model_switch"},
+            {"role": "user", "content": "[System: untyped]"},
+            {"role": "user", "content": "raw", "display_kind": "steer", "display_content": "own words"},
+            {"role": "user", "content": "[OUT-OF-BAND USER MESSAGE — busy]\nplease check\n[/OUT-OF-BAND USER MESSAGE]", "display_kind": "internal_notification"},
+            {"role": "user", "content": '[HANDOFF CONTEXT — from telegram session "title" (id)]\nOld context\n[/HANDOFF CONTEXT]\n\nnew words'},
+            {"role": "assistant", "content": "", "finish_reason": "tool_calls", "reasoning": "thinking"},
+            {"role": "assistant", "content": "answer", "reasoning": "visible reason"},
+        ]})
+        rows = projected["messages"]
+        self.assertEqual([row["content"] for row in rows], ["/x — fix it", "own words", "please check", "new words", "answer"])
+        self.assertIn("thinking", rows[-1]["reasoning"])
 
     async def _run(self, method, params=None, rpc_id="rid-1"):
         """Run _handle_rpc and return the first sealed WS send call's decoded payload."""
@@ -949,13 +1000,48 @@ class TestSessionHistoryPagination(unittest.IsolatedAsyncioTestCase):
                 {"id": "session/one", "limit": 20, "offset": 40, "order": "latest"}
             )
 
-        self.assertEqual(result, response)
+        self.assertEqual(
+            result,
+            {
+                "messages": [],
+                "pagination": {"returned": 0, "limit": 20, "offset": 40, "order": "latest"},
+            },
+        )
         self.assertEqual(
             [call.args for call in mock_get.await_args_list],
             [
                 ("/api/sessions?limit=100",),
-                ("/api/sessions/session%2Fone/messages?limit=20&offset=40&order=latest",),
+                ("/api/sessions/session%2Fone/messages?limit=200&offset=40&order=latest",),
             ],
+        )
+
+    async def test_messages_page_reports_raw_rows_consumed_for_tool_heavy_turns(self):
+        # 30 raw rows of which only two are visible: the phone must get both
+        # bubbles and advance its offset by the 30 raw rows read.
+        raw = [{"id": i, "role": "tool", "content": "{}"} for i in range(27)]
+        raw += [
+            {
+                "id": 99,
+                "role": "assistant",
+                "content": "[PRIOR CONTEXT — for reference only; not a new message]\nsummary",
+                "finish_reason": "tool_calls",
+                "display_kind": "hidden",
+                "_compressed_summary": True,
+            },
+            {"id": 100, "role": "user", "content": "question"},
+            {"id": 101, "role": "assistant", "content": "answer", "finish_reason": "stop"},
+        ]
+        response = {
+            "messages": raw,
+            "pagination": {"limit": 200, "offset": 0, "order": "latest", "returned": 30},
+        }
+        with patch.object(self.adapter._api, "get", AsyncMock(return_value=response)):
+            result = await self.adapter._rpc_sessions_messages(
+                {"id": "s", "limit": 20, "offset": 0, "order": "latest"}
+            )
+        self.assertEqual([m["content"] for m in result["messages"]], ["question", "answer"])
+        self.assertEqual(
+            result["pagination"], {"limit": 20, "offset": 0, "order": "latest", "returned": 30}
         )
 
     async def test_messages_without_page_parameters_preserves_legacy_path(self):
