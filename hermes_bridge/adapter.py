@@ -12,6 +12,7 @@ import threading
 import time
 import urllib.request
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode
 
@@ -198,6 +199,18 @@ def _require(params: Dict[str, Any], key: str, error: str) -> str:
     return value
 
 
+def _redact_sensitive_text(value: str, *, connector: bool = False) -> str:
+    if connector:
+        value = re.sub(r"(?i)(https?://|file://|ssh://)\S+", "[redacted]", value)
+        return re.sub(
+            r"(?i)(token|secret|password|authorization|api[_-]?key)(\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+",
+            r"\1\2[redacted]", value,
+        )
+    value = re.sub(r"(?i)https?://[^\s/@:]+:[^\s/@]+@\S+", "[redacted-url]", value)
+    value = re.sub(r"(?i)(https?://)\S+", r"\1[redacted-url]", value)
+    return re.sub(r"(?i)(bearer\s+|(?:api[_-]?key|token|secret|password)\s*[:=]\s*)[^\s,;]+", r"\1[redacted]", value)
+
+
 # Bot policy (flag/list/auth/projection) lives in bots_policy (#84 J).
 # Forever-chat constants live in bot_chats — import there, not re-export.
 
@@ -208,6 +221,7 @@ def _require(params: Dict[str, Any], key: str, error: str) -> str:
 # section within MEMORY.md. #49's memory view merges both (tagged by source).
 _MEMORY_PATH = os.path.join(os.path.expanduser("~"), ".hermes", "memories", "MEMORY.md")
 _USER_MD_PATH = os.path.join(os.path.expanduser("~"), ".hermes", "memories", "USER.md")
+_AGENTS_SUBCALL_TIMEOUT = 3.0
 
 # Local cache for decrypted inbound attachments (PRD_Features.md §2.3) — same
 # "platforms/<name>/media" convention other adapters use for downloaded media
@@ -507,6 +521,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         self._message_reply_to: Dict[str, str] = {}
         self._message_revisions: Dict[str, int] = {}
         self._thread_phone_session: Dict[str, str] = {}
+        self._thread_core_profile: Dict[str, str] = {}
         # One-shot fork context is intentionally in memory; a bridge restart drops it.
         self._pending_handoffs: Dict[str, str] = {}
         self._active_threads: set = set()
@@ -749,6 +764,25 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         # only reliable signal. The phone uses this to route the message to a
         # dedicated "Agent" inbox session instead of whatever chat is open.
         is_unsolicited = bool(metadata and "job_id" in metadata)
+        core_profile = None
+        if is_unsolicited:
+            owner = metadata.get("profile") or metadata.get("profile_name")
+            if isinstance(owner, str) and owner.strip():
+                core_profile = owner.strip()
+            else:
+                job_id = metadata.get("job_id")
+                if isinstance(job_id, str) and job_id:
+                    try:
+                        jobs = await self._rpc_cron_list({})
+                        job = next(
+                            (row for row in jobs if isinstance(row, dict) and str(row.get("id")) == job_id),
+                            None,
+                        )
+                        owner = (job or {}).get("profile") or (job or {}).get("profile_name")
+                        if isinstance(owner, str) and owner.strip():
+                            core_profile = owner.strip()
+                    except Exception as exc:
+                        logger.debug("Failed to look up cron owner for job %s: %s", job_id, exc)
         # GatewayStreamConsumer tags the FIRST message of a streamed reply
         # with metadata["expect_edits"]=True (gateway/stream_consumer.py
         # _send_new_chunk) — it's a live preview that will be progressively
@@ -777,6 +811,8 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             payload["edit"] = True
         if is_unsolicited:
             payload["unsolicited"] = True
+            if core_profile:
+                payload["core_profile"] = core_profile
         thread_id = metadata.get("thread_id") if metadata else None
         if not is_unsolicited and isinstance(thread_id, str) and thread_id:
             payload["session_id"] = self._thread_phone_session.get(thread_id, thread_id)
@@ -1513,7 +1549,8 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                     asyncio.ensure_future(self._consume_prompt_response(payload))
                 else:
                     event = await self._build_event(payload)
-                    await self.handle_message(event)
+                    if event is not None:
+                        await self.handle_message(event)
             except Exception as exc:
                 logger.error(
                     "[hermes_bridge] dispatch failed at seq=%s: %s — dropping the "
@@ -1534,7 +1571,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 self._inbound_cursor = seq
                 _write_inbound_cursor(self._profile_id, seq)
 
-    async def _build_event(self, payload: Dict[str, Any]) -> MessageEvent:
+    async def _build_event(self, payload: Dict[str, Any]) -> Optional[MessageEvent]:
         """Turn a decrypted inbound payload into a MessageEvent, fetching any
         sealed attachments into the local media cache first."""
         media_urls: List[str] = []
@@ -1563,8 +1600,30 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         thread_id = await self._bridge_thread_id(payload)
         msg_id = payload.get("msg_id")
         phone_session_id = hermes_session_to_continue(payload)
+        requested_core_profile = payload.get("core_profile")
+        source_profile = None
+        if isinstance(requested_core_profile, str) and requested_core_profile.strip():
+            try:
+                source_profile = await self._resolve_core_profile(requested_core_profile.strip())
+            except _RpcError as exc:
+                code = str(exc)
+                logger.warning("[hermes_bridge] rejected core profile: %s", code)
+                await self._deliver(
+                    str(uuid.uuid4()),
+                    {
+                        "role": "error",
+                        "content": "This profile isn't available on the Laptop.",
+                        "error_code": code,
+                        "session_id": phone_session_id,
+                    },
+                )
+                return None
+        elif thread_id:
+            source_profile = getattr(self, "_thread_core_profile", {}).get(thread_id)
         if thread_id and phone_session_id:
             self._thread_phone_session[thread_id] = phone_session_id
+        if thread_id and source_profile:
+            getattr(self, "_thread_core_profile", {})[thread_id] = source_profile
         if isinstance(msg_id, str) and phone_session_id:
             self._message_session_id[msg_id] = phone_session_id
         content = payload["content"]
@@ -1572,13 +1631,12 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         handoff = pending_handoffs.pop(thread_id, None) if thread_id else None
         if handoff:
             content = f"{handoff}{content}"
+        source = self.build_source(chat_id=self._profile_id, user_id="mobile", thread_id=thread_id)
+        if source_profile:
+            source.profile = source_profile
         return MessageEvent(
             text=content,
-            source=self.build_source(
-                chat_id=self._profile_id,
-                user_id="mobile",
-                thread_id=thread_id,
-            ),
+            source=source,
             media_urls=media_urls,
             media_types=media_types,
             message_type=message_type,
@@ -1753,28 +1811,133 @@ class HermesBridgeAdapter(BasePlatformAdapter):
     async def _rpc_skills_toggle(self, p: Dict[str, Any]) -> Any:
         name = _require(p, "name", "missing_skill_name")
         body = {"name": name, "enabled": bool(p.get("enabled"))}
-        return await self._api.post("/api/skills/toggle", body=body, method="PUT")
+        profile_body = await self._profile_body(p)
+        return await self._api.post(await self._profiled_url("/api/skills/toggle", p), body={**body, **profile_body}, method="PUT")
+
+    async def _profile_scoping_supported(self) -> bool:
+        cached = getattr(self, "_profile_scoping_cache", None)
+        if cached is not None:
+            return bool(cached)
+        try:
+            await self._local_rpc("mcp.servers.status", {"profile": "hermlink-probe-profile-does-not-exist"})
+        except _LocalRpcError as exc:
+            cached = exc.code == 4064 and "profile" in exc.message.lower() and "not found" in exc.message.lower()
+        except Exception:
+            return False
+        else:
+            cached = False
+        self._profile_scoping_cache = bool(cached)
+        return bool(cached)
+
+    async def _profile_body(self, p: Dict[str, Any]) -> Dict[str, str]:
+        profile = str(p.get("profile") or "").strip()
+        if not profile:
+            return {}
+        profiles = await self._api.get("/api/profiles")
+        rows = profiles.get("profiles", []) if isinstance(profiles, dict) else []
+        match = next((r for r in rows if isinstance(r, dict) and r.get("name") == profile), None)
+        if match is None:
+            raise _RpcError("profile_not_found")
+        is_default = bool(match.get("is_default") or profile == "default")
+        if not is_default and not await self._profile_scoping_supported():
+            raise _RpcError("profile_scoping_unavailable")
+        return {"profile": profile}
+
+    async def _profiled_url(self, path: str, p: Dict[str, Any]) -> str:
+        body = await self._profile_body(p)
+        return f"{path}?{urlencode(body)}" if body else path
+
+    def _mcp_profile_is_served(self, profile: Optional[str]) -> bool:
+        if not profile:
+            return True
+        try:
+            from hermes_constants import get_hermes_home, profile_name_for_home
+            current = profile_name_for_home(get_hermes_home()) or "default"
+        except Exception:
+            current = "default"
+        if profile == current:
+            return True
+        try:
+            from hermes_cli.gateway_multiplex_served import recorded_served_profiles
+            return profile in (recorded_served_profiles() or [])
+        except Exception:
+            return False
+
+    async def _resolve_core_profile(
+        self, name: Optional[str], snapshot: Any = None, served: Any = None
+    ) -> Optional[str]:
+        """Resolve a non-default served Profile; reject unknown and Bot profiles."""
+        if not isinstance(name, str) or not name.strip():
+            return None
+        name = name.strip()
+        try:
+            from hermes_constants import get_hermes_home, profile_name_for_home
+            current = profile_name_for_home(get_hermes_home()) or "default"
+        except Exception:
+            current = "default"
+        if name in ("default", current):
+            return None
+        try:
+            if snapshot is None:
+                snapshot = await fetch_profiles_snapshot(self, include_sessions=False)
+            if served is None:
+                from hermes_cli.gateway_multiplex_served import recorded_served_profiles
+
+                served = recorded_served_profiles()
+            if not isinstance(served, (list, tuple, set)):
+                raise RuntimeError("served profile snapshot unavailable")
+        except Exception as exc:
+            raise _RpcError("profiles_unavailable") from exc
+        try:
+            row = next((row for row in snapshot.rows if row.get("name") == name), None)
+        except Exception as exc:
+            raise _RpcError("profiles_unavailable") from exc
+        if not self._core_profile_row_is_served(row, served) or row.get("is_default"):
+            raise _RpcError("profile_not_served")
+        return name
+
+    @staticmethod
+    def _core_profile_row_is_served(row: Optional[Dict[str, Any]], served: Any) -> bool:
+        return bool(
+            row
+            and isinstance(row.get("name"), str)
+            and row.get("name")
+            and not (isinstance(row.get("ui_meta"), dict) and "hermes-bots" in row["ui_meta"])
+            and (row.get("is_default") or row.get("name") == "default" or row["name"] in served)
+        )
 
     async def _rpc_skills_content(self, p: Dict[str, Any]) -> Any:
         name = _require(p, "name", "missing_skill_name")
-        return await self._api.get(f"/api/skills/content?name={name}")
+        profile_body = await self._profile_body(p)
+        query = {"name": name, **profile_body}
+        if isinstance(p.get("content"), str):
+            return await self._api.post("/api/skills/content", body={"name": name, "content": p["content"], **profile_body}, method="PUT")
+        if not profile_body:
+            return await self._api.get(f"/api/skills/content?name={name}")
+        return await self._api.get(f"/api/skills/content?{urlencode(query)}")
 
     async def _rpc_skills_hub_search(self, p: Dict[str, Any]) -> Any:
         q = str(p.get("q", "")).strip()
         limit = int(p.get("limit", 20))
         source = str(p.get("source", "all")).strip() or "all"
-        return await self._api.get(f"/api/skills/hub/search?q={q}&limit={limit}&source={source}")
+        profile_body = await self._profile_body(p)
+        if not profile_body:
+            return await self._api.get(f"/api/skills/hub/search?q={q}&limit={limit}&source={source}")
+        query = {"q": q, "limit": limit, "source": source, **profile_body}
+        return await self._api.get(f"/api/skills/hub/search?{urlencode(query)}")
 
     async def _rpc_skills_hub_install(self, p: Dict[str, Any]) -> Any:
         identifier = _require(p, "identifier", "missing_identifier")
-        return await self._api.post("/api/skills/hub/install", body={"identifier": identifier})
+        profile_body = await self._profile_body(p)
+        return await self._api.post(await self._profiled_url("/api/skills/hub/install", p), body={"identifier": identifier, **profile_body})
 
     async def _rpc_skills_hub_uninstall(self, p: Dict[str, Any]) -> Any:
         name = _require(p, "name", "missing_skill_name")
-        return await self._api.post("/api/skills/hub/uninstall", body={"name": name})
+        profile_body = await self._profile_body(p)
+        return await self._api.post(await self._profiled_url("/api/skills/hub/uninstall", p), body={"name": name, **profile_body})
 
     async def _rpc_agent_status(self, p: Dict[str, Any]) -> Any:
-        data = await self._api.get("/api/status")
+        data = await self._api.get(await self._profiled_url("/api/status", p))
         try:
             stats = await self._api.get("/api/system/stats")
             if isinstance(data, dict) and isinstance(stats, dict):
@@ -1787,13 +1950,120 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         model = _require(p, "model", "missing_model")
         scope = str(p.get("scope", "main")).strip() or "main"
         provider = str(p.get("provider", "")).strip()
+        profile_body = await self._profile_body(p)
         return await self._api.post(
-            "/api/model/set", body={"scope": scope, "provider": provider, "model": model}
+            await self._profiled_url("/api/model/set", p), body={"scope": scope, "provider": provider, "model": model, **profile_body}
         )
 
     async def _rpc_usage_get(self, p: Dict[str, Any]) -> Any:
         days = p.get("days", 7)
-        return await self._api.get(f"/api/analytics/usage?days={days}")
+        query = {"days": days, **await self._profile_body(p)}
+        return await self._api.get(f"/api/analytics/usage?{urlencode(query)}")
+
+    async def _rpc_agents_list(self, p: Dict[str, Any]) -> Any:
+        deadline = asyncio.get_running_loop().time() + _AGENTS_SUBCALL_TIMEOUT
+
+        async def bounded(awaitable):
+            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+            return await asyncio.wait_for(awaitable, timeout=remaining)
+
+        from .bots_policy import fetch_profiles_snapshot, project_bot_row
+
+        async def profiles_snapshot():
+            if not bots_flag_enabled():
+                return None
+            try:
+                return await bounded(fetch_profiles_snapshot(self, include_sessions=False))
+            except Exception:
+                return None
+
+        async def cron_snapshot():
+            try:
+                value = await bounded(self._rpc_cron_list({}))
+                return value if isinstance(value, list) else []
+            except Exception:
+                return None
+
+        status, snapshot, live, cron_rows, profile_scoping = await asyncio.gather(
+            bounded(self._api.get("/api/status")), profiles_snapshot(),
+            bounded(self._local_rpc("session.active_list", {})), cron_snapshot(),
+            bounded(self._profile_scoping_supported()),
+            return_exceptions=True,
+        )
+        if isinstance(status, BaseException):
+            status = None
+        if isinstance(profile_scoping, BaseException):
+            profile_scoping = False
+        busy_ok = not isinstance(live, BaseException)
+        live_rows = live.get("sessions", live.get("active", [])) if busy_ok and isinstance(live, dict) else []
+        live_rows = [r for r in live_rows if isinstance(r, dict)]
+        default = snapshot.default_row if snapshot else None
+        bot_rows = list(snapshot.bots.values()) if snapshot else []
+        cron_has_unowned = isinstance(cron_rows, list) and any(
+            isinstance(job, dict) and not job.get("profile") for job in cron_rows
+        )
+
+        async def lookup(name):
+            try:
+                return name, await bounded(bot_chats.lookup_chat(self, name)), False
+            except Exception:
+                return name, None, True
+
+        lookups = await asyncio.gather(*(lookup(str(row.get("name") or "")) for row in bot_rows))
+        bot_sessions: Dict[str, Optional[str]] = {name: str(chat) if chat else None for name, chat, _ in lookups}
+        lookup_failed = {name for name, _chat, failed in lookups if failed}
+
+        def state_for(row: Dict[str, Any]) -> str:
+            value = row.get("status")
+            return "running" if value in ("working", "starting") else "needs_you" if value == "waiting" else "idle"
+
+        matched_keys = {key for key in bot_sessions.values() if key}
+        bot_state = {name: ("unknown" if name in lookup_failed else "idle") for name in bot_sessions}
+        default_busy = "idle"
+        if busy_ok:
+            for live in live_rows:
+                key = str(live.get("session_key") or "")
+                state = state_for(live)
+                for name, chat in bot_sessions.items():
+                    if chat and key == chat and state != "idle":
+                        bot_state[name] = state
+                if key not in matched_keys:
+                    if state == "running":
+                        default_busy = "running"
+                    elif state == "needs_you" and default_busy == "idle":
+                        default_busy = "needs_you"
+        if isinstance(status, dict) and status.get("gateway_busy"):
+            default_busy = "running"
+
+        default_name = str((default or {}).get("name") or "default")
+        agents: List[Dict[str, Any]] = []
+        for row, is_default in [(default or {"name": default_name, "display_name": default_name}, True)] + [(r, False) for r in bot_rows]:
+            name = str(row.get("name") or "")
+            busy = (default_busy if is_default else bot_state.get(name, "idle")) if busy_ok else "unknown"
+            owned = [job for job in (cron_rows or []) if isinstance(job, dict) and job.get("profile") == name]
+            if is_default and cron_rows is not None:
+                failures = [job for job in owned if job.get("last_status") == "error"]
+                latest = max(failures, key=lambda j: str(j.get("last_run_at") or ""), default=None)
+                cron = {"failed_count": len(failures), "last_failed_job": latest.get("name") if latest else None,
+                        "last_failed_at": latest.get("last_run_at") if latest else None}
+            elif not is_default and cron_rows is not None and not cron_has_unowned:
+                failures = [job for job in owned if job.get("last_status") == "error"]
+                latest = max(failures, key=lambda j: str(j.get("last_run_at") or ""), default=None)
+                cron = {"failed_count": len(failures), "last_failed_job": latest.get("name") if latest else None,
+                        "last_failed_at": latest.get("last_run_at") if latest else None}
+            else:
+                cron = None
+            bot = project_bot_row(row) if not is_default else None
+            agents.append({"name": name, "display_name": (bot or {}).get("display_name") or row.get("display_name") or name, "is_default": is_default,
+                           "model": (bot or {}).get("model") if bot else row.get("model"),
+                           "face": ({"shape": bot["shape"], "color": bot["color"], "has_avatar": bot["has_avatar"]} if bot else None),
+                           "busy": busy, "cron": cron})
+        manifest = Path(__file__).with_name("plugin.yaml").read_text(encoding="utf-8")
+        version_match = re.search(r"(?m)^version:\s*['\"]?([^\s'\"]+)", manifest)
+        return {"hermes_version": status.get("version") if isinstance(status, dict) else None,
+                "can_update_hermes": status.get("can_update_hermes") if isinstance(status, dict) else None,
+                "plugin_version": version_match.group(1) if version_match else None,
+                "profile_scoping": profile_scoping, "agents": agents}
 
     @staticmethod
     def _project_connector_status(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -1803,13 +2073,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             value = row.get(key)
             if key in ("name", "plugin"):
                 if isinstance(value, str):
-                    value = re.sub(r"(?i)(https?://|file://|ssh://)\S+", "[redacted]", value)
-                    value = re.sub(
-                        r"(?i)(token|secret|password|authorization|api[_-]?key)(\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+",
-                        r"\1\2[redacted]",
-                        value,
-                    )
-                    projected[key] = value[:160]
+                    projected[key] = _redact_sensitive_text(value, connector=True)[:160]
             elif key == "transport":
                 if value in ("stdio", "http", "sse"):
                     projected[key] = value
@@ -1834,7 +2098,8 @@ class HermesBridgeAdapter(BasePlatformAdapter):
 
     async def _rpc_connector_health(self, p: Dict[str, Any]) -> Any:
         try:
-            raw = await self._local_rpc("mcp.servers.status", {})
+            profile = await self._profile_body(p)
+            raw = await self._local_rpc("mcp.servers.status", profile)
         except _LocalRpcError as exc:
             raise _RpcError("connector_unavailable") from exc
         if not isinstance(raw, dict) or not isinstance(raw.get("servers"), list):
@@ -1844,6 +2109,10 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             for row in raw["servers"]
             if isinstance(row, dict) and isinstance(row.get("name"), str)
         ]
+        if not self._mcp_profile_is_served(profile.get("profile")):
+            for server in servers:
+                server.pop("connected", None)
+                server["status"] = "unavailable"
         return {
             "connectors": servers,
             "checked_at": raw.get("checked_at") if isinstance(raw.get("checked_at"), int) else None,
@@ -1851,7 +2120,8 @@ class HermesBridgeAdapter(BasePlatformAdapter):
 
     async def _rpc_connector_capabilities(self, p: Dict[str, Any]) -> Any:
         try:
-            await self._local_rpc("mcp.servers.status", {})
+            profile = await self._profile_body(p)
+            await self._local_rpc("mcp.servers.status", profile)
         except _LocalRpcError:
             return {
                 "available": False,
@@ -1870,6 +2140,9 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 "reason": reason,
             }
         runner = getattr(self, "gateway_runner", None)
+        if not self._mcp_profile_is_served(profile.get("profile")):
+            return {"available": True, "test": False, "reconnect": False, "reconnect_scope": None,
+                    "reason": "status_unavailable"}
         reconnect_supported = callable(getattr(runner, "_execute_mcp_reload", None))
         test_supported = False
         try:
@@ -2039,8 +2312,11 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         allowed = (
             "id", "name", "schedule", "schedule_display", "next_run_at", "last_run_at",
             "enabled", "state", "paused_at", "prompt", "skills", "deliver", "context_from",
+            "last_status", "last_error",
         )
         projected = {key: row[key] for key in allowed if key in row}
+        if isinstance(projected.get("last_error"), str):
+            projected["last_error"] = _redact_sensitive_text(projected["last_error"])[:200]
         owner = row.get("profile") or row.get("profile_name")
         if not owner and row.get("is_default_profile"):
             owner = "default"
@@ -2059,8 +2335,10 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             rows = raw.get("jobs", []) if isinstance(raw, dict) else raw
             return [self._project_cron_job(row) for row in rows if isinstance(row, dict)]
         jobs: List[Dict[str, Any]] = []
-        for profile in profiles:
-            raw = await self._api.get(f"/api/cron/jobs?{urlencode({'profile': profile})}")
+        responses = await asyncio.gather(*(
+            self._api.get(f"/api/cron/jobs?{urlencode({'profile': profile})}") for profile in profiles
+        ))
+        for profile, raw in zip(profiles, responses):
             rows = raw.get("jobs", []) if isinstance(raw, dict) else raw
             if not isinstance(rows, list):
                 continue
@@ -2171,7 +2449,17 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         Either file missing is not an error — a fresh install may have
         neither yet."""
         out: List[Dict[str, Any]] = []
-        for path, source in ((_MEMORY_PATH, "memory"), (_USER_MD_PATH, "user")):
+        paths = (_MEMORY_PATH, _USER_MD_PATH)
+        if p.get("profile"):
+            profile = _require(p, "profile", "profile_not_found")
+            await self._profile_body(p)
+            try:
+                from hermes_cli.profiles import get_profile_dir
+                memories = Path(get_profile_dir(profile)) / "memories"
+            except (ImportError, ValueError, FileNotFoundError) as exc:
+                raise _RpcError("profile_not_found") from exc
+            paths = (str(memories / "MEMORY.md"), str(memories / "USER.md"))
+        for path, source in zip(paths, ("memory", "user")):
             try:
                 entries = _read_entries(path)
             except FileNotFoundError:
@@ -2184,7 +2472,17 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         contains the id — the phone doesn't know (or need to know) which
         file an entry came from beyond the `source` tag memory.list returned."""
         entry_id = _require(p, "id", "missing_id")
-        for path in (_MEMORY_PATH, _USER_MD_PATH):
+        paths = (_MEMORY_PATH, _USER_MD_PATH)
+        if p.get("profile"):
+            profile = _require(p, "profile", "profile_not_found")
+            await self._profile_body(p)
+            try:
+                from hermes_cli.profiles import get_profile_dir
+                memories = Path(get_profile_dir(profile)) / "memories"
+            except (ImportError, ValueError, FileNotFoundError) as exc:
+                raise _RpcError("profile_not_found") from exc
+            paths = (str(memories / "MEMORY.md"), str(memories / "USER.md"))
+        for path in paths:
             try:
                 entries = _read_entries(path)
             except FileNotFoundError:
@@ -2297,6 +2595,17 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             text="/stop",
             source=self.build_source(chat_id=self._profile_id, user_id="mobile"),
         )
+        thread_id = p.get("thread_id")
+        mapped_core_profile = (
+            getattr(self, "_thread_core_profile", {}).get(thread_id)
+            if isinstance(thread_id, str)
+            else None
+        )
+        core_profile = mapped_core_profile
+        if core_profile is None:
+            core_profile = await self._resolve_core_profile(p.get("core_profile"))
+        if core_profile:
+            event.source.profile = core_profile
         await self.handle_message(event)
         return {"stopped": True}
 
@@ -2389,6 +2698,42 @@ class HermesBridgeAdapter(BasePlatformAdapter):
     async def _rpc_bots_list(self, p: Dict[str, Any]) -> Any:
         """Roster of bot-managed core-profiles on this laptop."""
         return await list_bots(self)
+
+    async def _rpc_profiles_list(self, p: Dict[str, Any]) -> Any:
+        try:
+            snap = await fetch_profiles_snapshot(self, include_sessions=False)
+            from hermes_cli.gateway_multiplex_served import recorded_served_profiles
+
+            served = recorded_served_profiles()
+            if not isinstance(served, (list, tuple, set)):
+                raise RuntimeError("served profile snapshot unavailable")
+            profiles = []
+            for row in snap.rows:
+                name = row.get("name")
+                if not isinstance(name, str) or not name:
+                    continue
+                try:
+                    resolved = await self._resolve_core_profile(name, snap, served)
+                except _RpcError:
+                    continue
+                if resolved is None and not (
+                    self._core_profile_row_is_served(row, served)
+                    and (row.get("is_default") or name == "default")
+                ):
+                    continue
+                if not self._core_profile_row_is_served(row, served):
+                    continue
+                profiles.append(
+                    {
+                        "name": name,
+                        "display_name": row.get("display_name") or name,
+                        "is_default": bool(row.get("is_default") or name == "default"),
+                    }
+                )
+            profiles.sort(key=lambda row: (not row["is_default"], row["name"]))
+            return {"available": True, "reason": None, "profiles": profiles}
+        except Exception as exc:
+            return {"available": False, "reason": str(exc) or "profiles_unavailable", "profiles": []}
 
     async def _rpc_bots_capabilities(self, p: Dict[str, Any]) -> Any:
         """Report Bot actions supported by this bridge and local runtime."""

@@ -69,6 +69,7 @@ class OperationDispatcher:
         "skills.hub.install": "_rpc_skills_hub_install",
         "skills.hub.uninstall": "_rpc_skills_hub_uninstall",
         "agent.status": "_rpc_agent_status",
+        "agents.list": "_rpc_agents_list",
         "agent.set_model": "_rpc_agent_set_model",
         "usage.get": "_rpc_usage_get",
         "cron.notes": "_rpc_cron_notes",
@@ -100,6 +101,7 @@ class OperationDispatcher:
         "skills.diff": "_rpc_skills_pending_diff",
         "chat.stop": "_rpc_chat_stop",
         "bots.list": "_rpc_bots_list",
+        "profiles.list": "_rpc_profiles_list",
         "bots.capabilities": "_rpc_bots_capabilities",
         "bots.activity.snapshot": "_rpc_bots_activity_snapshot",
         "bots.notify.get": "_rpc_bots_notify_get",
@@ -180,10 +182,17 @@ class OperationDispatcher:
         if direct_name:
             return getattr(host, direct_name, None)
 
+        async def profiled_get(path: str, p: Dict[str, Any]) -> Any:
+            return await host._api.get(await host._profiled_url(path, p))
+
+        async def hub_update(p: Dict[str, Any]) -> Any:
+            body = await host._profile_body(p)
+            return await host._api.post("/api/skills/hub/update", body=body)
+
         simple = {
-            "skills.list": lambda p: host._api.get("/api/skills"),
-            "skills.hub.update": lambda p: host._api.post("/api/skills/hub/update", body={}),
-            "model.options": lambda p: host._api.get("/api/model/options"),
+            "skills.list": lambda p: profiled_get("/api/skills", p),
+            "skills.hub.update": hub_update,
+            "model.options": lambda p: profiled_get("/api/model/options", p),
             "cron.list": lambda p: host._rpc_cron_list(p),
             "cron.pause": lambda p: host._rpc_cron_action(p, "pause"),
             "cron.resume": lambda p: host._rpc_cron_action(p, "resume"),

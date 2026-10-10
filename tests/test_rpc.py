@@ -702,6 +702,24 @@ class TestChatStop(unittest.IsolatedAsyncioTestCase):
         assert event.text == "/stop"
         assert len(self.sent_frames) == 1
 
+    async def test_stop_stamps_profile_for_profile_thread(self):
+        self.adapter._thread_core_profile = {"gateway-a": "work"}
+        with patch.object(self.adapter, "build_source", return_value=MagicMock()), patch.object(self.adapter, "handle_message", AsyncMock()) as mock_handle:
+            await self.adapter._rpc_chat_stop({"thread_id": "gateway-a"})
+        self.assertEqual(mock_handle.call_args.args[0].source.profile, "work")
+
+    async def test_stop_validates_and_stamps_payload_profile_without_thread_mapping(self):
+        from hermes_bridge.bots_policy import ProfilesSnapshot
+        with patch("hermes_bridge.adapter.fetch_profiles_snapshot", AsyncMock(return_value=ProfilesSnapshot({}, None, [{"name": "work"}]))), patch.dict(sys.modules, {"hermes_cli.gateway_multiplex_served": MagicMock(recorded_served_profiles=MagicMock(return_value=["work"]))}), patch.object(self.adapter, "build_source", return_value=MagicMock()), patch.object(self.adapter, "handle_message", AsyncMock()) as mock_handle:
+            await self.adapter._rpc_chat_stop({"thread_id": "gateway-b", "core_profile": "work"})
+        self.assertEqual(mock_handle.call_args.args[0].source.profile, "work")
+
+    async def test_stop_thread_mapping_wins_over_payload_profile(self):
+        self.adapter._thread_core_profile = {"gateway-a": "work"}
+        with patch.object(self.adapter, "build_source", return_value=MagicMock()), patch.object(self.adapter, "handle_message", AsyncMock()) as mock_handle:
+            await self.adapter._rpc_chat_stop({"thread_id": "gateway-a", "core_profile": "other"})
+        self.assertEqual(mock_handle.call_args.args[0].source.profile, "work")
+
     async def test_stop_acks_even_with_no_active_turn(self):
         """_handle_stop_command is documented safe to call with nothing
         running — handle_message() itself must not raise either way."""

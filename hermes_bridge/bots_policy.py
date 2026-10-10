@@ -85,6 +85,7 @@ class ProfilesSnapshot(NamedTuple):
 
     bots: Dict[str, Dict[str, Any]]
     default_row: Optional[Dict[str, Any]]
+    rows: List[Dict[str, Any]]
 
 
 def parse_profiles_snapshot(result: Dict[str, Any]) -> ProfilesSnapshot:
@@ -102,7 +103,7 @@ def parse_profiles_snapshot(result: Dict[str, Any]) -> ProfilesSnapshot:
             name = str(row.get("name") or "").strip()
             if name:
                 bots[name] = row
-    return ProfilesSnapshot(bots=bots, default_row=default_row)
+    return ProfilesSnapshot(bots=bots, default_row=default_row, rows=[r for r in rows if isinstance(r, dict)])
 
 
 async def fetch_profiles_snapshot(
