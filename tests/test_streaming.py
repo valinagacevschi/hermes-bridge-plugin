@@ -113,6 +113,19 @@ class TestSendExpectEdits(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(event)
         self.assertEqual(deliver.await_args.args[1]["error_code"], "profile_not_served")
 
+    async def test_invalid_profile_is_rejected_before_thread_resolution(self):
+        from hermes_bridge.bots_policy import ProfilesSnapshot
+        with (
+            patch.object(self.adapter, "_bridge_thread_id", AsyncMock(return_value="gateway-thread")) as bridge_thread_id,
+            patch("hermes_bridge.adapter.fetch_profiles_snapshot", AsyncMock(return_value=ProfilesSnapshot({}, None, []))),
+            patch.dict(sys.modules, {"hermes_cli.gateway_multiplex_served": MagicMock(recorded_served_profiles=MagicMock(return_value=[]))}),
+            patch.object(self.adapter, "_deliver", AsyncMock()) as deliver,
+        ):
+            event = await self.adapter._build_event({"session_id": "phone-session", "content": "hello", "core_profile": "missing"})
+        self.assertIsNone(event)
+        bridge_thread_id.assert_not_awaited()
+        self.assertEqual(deliver.await_args.args[1]["error_code"], "profile_not_served")
+
     async def test_unserved_profile_replies_without_running_turn(self):
         from hermes_bridge.bots_policy import ProfilesSnapshot
         with (

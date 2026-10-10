@@ -1009,6 +1009,47 @@ class TestSessionHistoryPagination(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.adapter = _make_adapter()
 
+    async def test_messages_passes_profile_to_both_rest_calls(self):
+        with patch.object(self.adapter, "_resolve_core_profile", AsyncMock(return_value="work")), patch.object(
+            self.adapter._api, "get", AsyncMock(side_effect=[{"sessions": [{"id": "s"}]}, {"messages": [], "pagination": {"returned": 0}}])
+        ) as mock_get:
+            await self.adapter._rpc_sessions_messages({"id": "s", "core_profile": "work", "limit": 20})
+        self.assertEqual([call.args[0] for call in mock_get.await_args_list], [
+            "/api/sessions?limit=100&profile=work",
+            "/api/sessions/s/messages?limit=200&offset=0&order=latest&profile=work",
+        ])
+
+    async def test_history_page_resolves_profile_once(self):
+        with patch.object(self.adapter, "_resolve_core_profile", AsyncMock(return_value="work")) as resolve, patch.object(
+            self.adapter._api, "get", AsyncMock(side_effect=[{"sessions": [{"id": "s"}]}, {"messages": [], "pagination": {"returned": 0}}])
+        ):
+            await self.adapter._rpc_sessions_messages({"id": "s", "core_profile": "work", "limit": 20})
+        resolve.assert_awaited_once_with("work")
+
+    async def test_messages_rejects_invalid_profile(self):
+        with patch.object(self.adapter, "_resolve_core_profile", AsyncMock(side_effect=Exception("profile_not_served"))):
+            with self.assertRaisesRegex(Exception, "profile_not_served"):
+                await self.adapter._rpc_sessions_messages({"id": "s", "core_profile": "missing"})
+
+    async def test_messages_without_profile_keeps_existing_paths(self):
+        with patch.object(self.adapter._api, "get", AsyncMock(return_value={"messages": []})) as mock_get:
+            await self.adapter._rpc_sessions_messages({"id": "s"})
+        self.assertEqual([call.args[0] for call in mock_get.await_args_list], [
+            "/api/sessions?limit=100", "/api/sessions/s/messages"
+        ])
+
+    async def test_list_and_delete_are_profile_scoped(self):
+        with patch.object(self.adapter, "_resolve_core_profile", AsyncMock(return_value="work")), patch.object(
+            self.adapter._api, "get", AsyncMock(return_value={"sessions": []})
+        ) as mock_get:
+            await self.adapter._rpc_sessions_list({"core_profile": "work"})
+        mock_get.assert_awaited_once_with("/api/sessions?limit=100&profile=work")
+        with patch.object(self.adapter, "_resolve_core_profile", AsyncMock(return_value="work")), patch.object(
+            self.adapter._api, "get", AsyncMock(return_value={"sessions": [{"id": "s"}]})
+        ), patch.object(self.adapter._api, "request", AsyncMock()) as mock_request:
+            await self.adapter._rpc_sessions_delete({"id": "s", "core_profile": "work"})
+        mock_request.assert_awaited_once_with("/api/sessions/s?profile=work", method="DELETE")
+
     async def test_messages_forwards_latest_page_parameters(self):
         response = {"messages": [], "pagination": {"returned": 0}}
         with patch.object(
