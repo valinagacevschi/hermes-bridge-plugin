@@ -1791,6 +1791,24 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         return {"id": new_bridge_chat_id()}
 
     async def _rpc_sessions_fork(self, p: Dict[str, Any]) -> Any:
+        if "handoff_text" in p:
+            handoff = p.get("handoff_text")
+            title = p.get("title")
+            profile = p.get("core_profile")
+            if (
+                not isinstance(handoff, str) or not handoff.strip() or len(handoff) > 4000
+                or not isinstance(title, str) or len(title) > 200
+                or not isinstance(profile, str) or not profile
+            ):
+                raise _RpcError("invalid_handoff")
+            thread_id = new_bridge_chat_id()
+            if not hasattr(self, "_pending_handoffs"):
+                self._pending_handoffs = {}
+            self._pending_handoffs[thread_id] = (
+                f'[HANDOFF CONTEXT — from removed profile "{profile}" session "{title}"]\n'
+                f"{handoff}\n[/HANDOFF CONTEXT]\n\n"
+            )
+            return {"id": thread_id, "title": f"↪ {title}", "forked_from": None}
         source_id = _require(p, "id", "missing_session_id")
         rows = await self._listed_bridge_sessions()
         source = next((row for row in rows if row.get("id") == source_id), None)
