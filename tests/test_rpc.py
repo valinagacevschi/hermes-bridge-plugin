@@ -79,6 +79,17 @@ class TestCronWriteMethods(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(Exception, "session_not_forkable"):
             await self.adapter._rpc_sessions_fork({"id": "bridge-id"})
 
+    async def test_sessions_fork_from_handoff_validates_and_stores_context(self):
+        result = await self.adapter._rpc_sessions_fork({
+            "handoff_text": "User: cached question", "title": "Old title", "core_profile": "work"
+        })
+        self.assertRegex(result["id"], r"^\d{8}_\d{6}_[0-9a-f]{6}$")
+        self.assertEqual(result, {"id": result["id"], "title": "↪ Old title", "forked_from": None})
+        self.assertIn('[HANDOFF CONTEXT — from removed profile "work" session "Old title"]', self.adapter._pending_handoffs[result["id"]])
+        for params in ({"handoff_text": "", "title": "x"}, {"handoff_text": "x" * 4001, "title": "x"}, {"handoff_text": "x", "title": "x" * 201}):
+            with self.assertRaisesRegex(Exception, "invalid_handoff"):
+                await self.adapter._rpc_sessions_fork(params)
+
     def test_sessions_messages_projection_drops_scaffolding_and_folds_tool_reasoning(self):
         projected = _project_session_messages({"messages": [
             {"role": "user", "content": '[IMPORTANT: The user has invoked the "x" skill, indicating they want to follow its instructions. The full skill content is loaded below.]\nBODY\nThe user has provided the following instruction alongside the skill invocation: fix it'},
