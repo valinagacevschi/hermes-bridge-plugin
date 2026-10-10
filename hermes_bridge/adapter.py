@@ -1597,7 +1597,6 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 message_type = MessageType.VIDEO
             else:
                 message_type = MessageType.DOCUMENT
-        thread_id = await self._bridge_thread_id(payload)
         msg_id = payload.get("msg_id")
         phone_session_id = hermes_session_to_continue(payload)
         requested_core_profile = payload.get("core_profile")
@@ -1618,7 +1617,8 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                     },
                 )
                 return None
-        elif thread_id:
+        thread_id = await self._bridge_thread_id(payload, source_profile, profile_resolved=True)
+        if not requested_core_profile and thread_id:
             source_profile = getattr(self, "_thread_core_profile", {}).get(thread_id)
         if thread_id and phone_session_id:
             self._thread_phone_session[thread_id] = phone_session_id
@@ -1664,20 +1664,40 @@ class HermesBridgeAdapter(BasePlatformAdapter):
     # connection errors propagate — _handle_rpc classifies them uniformly.
     # ------------------------------------------------------------------
 
-    async def _listed_bridge_sessions(self) -> List[dict]:
-        data = await self._api.get("/api/sessions?limit=100")
+    async def _listed_bridge_sessions(
+        self,
+        core_profile: Optional[str] = None,
+        *,
+        resolved_core_profile: Optional[str] = None,
+        profile_resolved: bool = False,
+    ) -> List[dict]:
+        profile = resolved_core_profile if profile_resolved else await self._resolve_core_profile(core_profile)
+        query = {"limit": 100}
+        if profile:
+            query["profile"] = profile
+        data = await self._api.get(f"/api/sessions?{urlencode(query)}")
         if not isinstance(data, dict):
             return []
         rows = data.get("sessions")
         return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
-    async def _bridge_thread_id(self, payload: Dict[str, Any]) -> Optional[str]:
+    async def _bridge_thread_id(
+        self,
+        payload: Dict[str, Any],
+        resolved_core_profile: Optional[str] = None,
+        *,
+        profile_resolved: bool = False,
+    ) -> Optional[str]:
         """Resolve the gateway thread for a phone chat."""
         session_id = hermes_session_to_continue(payload)
         if not session_id:
             return None
         try:
-            rows = await self._listed_bridge_sessions()
+            rows = await self._listed_bridge_sessions(
+                payload.get("core_profile"),
+                resolved_core_profile=resolved_core_profile,
+                profile_resolved=profile_resolved,
+            )
         except Exception:
             return session_id
         for row in rows:
@@ -1689,24 +1709,40 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         thread_id = bridge_thread_id(session_id, rows)
         return thread_id
 
-    async def _gateway_session_id(self, session_id: str) -> str:
+    async def _gateway_session_id(
+        self,
+        session_id: str,
+        core_profile: Optional[str] = None,
+        *,
+        profile_resolved: bool = False,
+    ) -> str:
         try:
-            rows = await self._listed_bridge_sessions()
+            rows = await self._listed_bridge_sessions(
+                core_profile, resolved_core_profile=core_profile, profile_resolved=profile_resolved
+            )
         except Exception:
             return session_id
         return resolve_message_session_id(session_id, rows)
 
     async def _rpc_sessions_list(self, p: Dict[str, Any]) -> Any:
-        return rewrite_listed_sessions(await self._api.get("/api/sessions?limit=100"))
+        profile = await self._resolve_core_profile(p.get("core_profile"))
+        query = {"limit": 100}
+        if profile:
+            query["profile"] = profile
+        return rewrite_listed_sessions(await self._api.get(f"/api/sessions?{urlencode(query)}"))
 
     async def _rpc_sessions_active(self, p: Dict[str, Any]) -> Any:
         return {"active": sorted(self._thread_phone_session.get(t, t) for t in self._active_threads)}
 
     async def _rpc_sessions_messages(self, p: Dict[str, Any]) -> Any:
-        session_id = await self._gateway_session_id(_require(p, "id", "missing_session_id"))
+        profile = await self._resolve_core_profile(p.get("core_profile"))
+        session_id = await self._gateway_session_id(
+            _require(p, "id", "missing_session_id"), profile, profile_resolved=True
+        )
         path = f"/api/sessions/{quote(session_id, safe='')}/messages"
         if not any(key in p for key in ("limit", "offset", "order")):
-            return _project_session_messages(await self._api.get(path))
+            query = urlencode({"profile": profile}) if profile else ""
+            return _project_session_messages(await self._api.get(f"{path}?{query}" if query else path))
         try:
             limit = int(p.get("limit", 20))
             offset = int(p.get("offset", 0))
@@ -1715,7 +1751,10 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         order = str(p.get("order", "latest"))
         if not 0 <= limit <= 500 or offset < 0 or order not in {"oldest", "latest"}:
             raise _RpcError("invalid_history_page")
-        query = urlencode({"limit": limit, "offset": offset, "order": order})
+        params = {"limit": limit, "offset": offset, "order": order}
+        if profile:
+            params["profile"] = profile
+        query = urlencode(params)
         if limit == 0:
             return _project_session_messages(await self._api.get(f"{path}?{query}"))
         # Pages are counted in raw rows, but tool calls/results and internal
@@ -1723,7 +1762,8 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         # can render as one bubble. Read a wider raw window and report the raw
         # rows consumed so the phone's offset stays raw-based.
         raw_limit = min(500, limit * 10)
-        query = urlencode({"limit": raw_limit, "offset": offset, "order": order})
+        params["limit"] = raw_limit
+        query = urlencode(params)
         data = await self._api.get(f"{path}?{query}")
         if not isinstance(data, dict):
             return data
@@ -1794,8 +1834,14 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         return {"switched": True}
 
     async def _rpc_sessions_delete(self, p: Dict[str, Any]) -> Any:
-        session_id = await self._gateway_session_id(_require(p, "id", "missing_session_id"))
-        await self._api.request(f"/api/sessions/{session_id}", method="DELETE")
+        profile = await self._resolve_core_profile(p.get("core_profile"))
+        session_id = await self._gateway_session_id(
+            _require(p, "id", "missing_session_id"), profile, profile_resolved=True
+        )
+        path = f"/api/sessions/{session_id}"
+        if profile:
+            path += "?" + urlencode({"profile": profile})
+        await self._api.request(path, method="DELETE")
         return {"deleted": True}
 
     async def _rpc_sessions_search(self, p: Dict[str, Any]) -> Any:
