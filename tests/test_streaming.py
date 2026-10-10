@@ -83,6 +83,58 @@ class TestSendExpectEdits(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.adapter._thread_phone_session["gateway-thread"], "phone-session")
         self.assertEqual(self.adapter._message_session_id["u1"], "phone-session")
 
+    async def test_inbound_event_stamps_valid_core_profile(self):
+        from unittest.mock import MagicMock
+        from hermes_bridge.bots_policy import ProfilesSnapshot
+        with (
+            patch.object(self.adapter, "_bridge_thread_id", AsyncMock(return_value="gateway-thread")),
+            patch.object(self.adapter, "build_source", return_value=MagicMock(thread_id="gateway-thread")),
+            patch("hermes_bridge.adapter.fetch_profiles_snapshot", AsyncMock(return_value=ProfilesSnapshot({}, None, [{"name": "work", "display_name": "Work", "is_default": False}]))),
+            patch.dict(sys.modules, {"hermes_cli.gateway_multiplex_served": MagicMock(recorded_served_profiles=MagicMock(return_value=["work"]))}),
+        ):
+            event = await self.adapter._build_event({"session_id": "phone-session", "content": "hello", "core_profile": "work"})
+        self.assertEqual(event.source.profile, "work")
+
+    async def test_inbound_event_without_core_profile_keeps_source_unchanged(self):
+        source = MagicMock(thread_id="gateway-thread")
+        with patch.object(self.adapter, "_bridge_thread_id", AsyncMock(return_value="gateway-thread")), patch.object(self.adapter, "build_source", return_value=source):
+            event = await self.adapter._build_event({"session_id": "phone-session", "content": "hello"})
+        self.assertIs(event.source, source)
+
+    async def test_unknown_profile_replies_without_running_turn(self):
+        from hermes_bridge.bots_policy import ProfilesSnapshot
+        with (
+            patch.object(self.adapter, "_bridge_thread_id", AsyncMock(return_value="gateway-thread")),
+            patch("hermes_bridge.adapter.fetch_profiles_snapshot", AsyncMock(return_value=ProfilesSnapshot({}, None, []))),
+            patch.dict(sys.modules, {"hermes_cli.gateway_multiplex_served": MagicMock(recorded_served_profiles=MagicMock(return_value=[]))}),
+            patch.object(self.adapter, "_deliver", AsyncMock()) as deliver,
+        ):
+            event = await self.adapter._build_event({"session_id": "phone-session", "content": "hello", "core_profile": "missing"})
+        self.assertIsNone(event)
+        self.assertEqual(deliver.await_args.args[1]["error_code"], "profile_not_served")
+
+    async def test_unserved_profile_replies_without_running_turn(self):
+        from hermes_bridge.bots_policy import ProfilesSnapshot
+        with (
+            patch.object(self.adapter, "_bridge_thread_id", AsyncMock(return_value="gateway-thread")),
+            patch("hermes_bridge.adapter.fetch_profiles_snapshot", AsyncMock(return_value=ProfilesSnapshot({}, None, [{"name": "work"}]))),
+            patch.dict(sys.modules, {"hermes_cli.gateway_multiplex_served": MagicMock(recorded_served_profiles=MagicMock(return_value=[]))}),
+            patch.object(self.adapter, "_deliver", AsyncMock()) as deliver,
+        ):
+            event = await self.adapter._build_event({"session_id": "phone-session", "content": "hello", "core_profile": "work"})
+        self.assertIsNone(event)
+        self.assertEqual(deliver.await_args.args[1]["error_code"], "profile_not_served")
+
+    async def test_snapshot_failure_replies_profiles_unavailable(self):
+        with (
+            patch.object(self.adapter, "_bridge_thread_id", AsyncMock(return_value="gateway-thread")),
+            patch("hermes_bridge.adapter.fetch_profiles_snapshot", AsyncMock(side_effect=RuntimeError("offline"))),
+            patch.object(self.adapter, "_deliver", AsyncMock()) as deliver,
+        ):
+            event = await self.adapter._build_event({"session_id": "phone-session", "content": "hello", "core_profile": "work"})
+        self.assertIsNone(event)
+        self.assertEqual(deliver.await_args.args[1]["error_code"], "profiles_unavailable")
+
     async def test_expect_edits_send_skips_durable_enqueue(self):
         """GatewayStreamConsumer's streaming-preview send() — must return a
         message_id (so the consumer knows we support editing) but must NOT
@@ -120,6 +172,49 @@ class TestSendExpectEdits(unittest.IsolatedAsyncioTestCase):
         mock_enqueue.assert_called_once_with(result.message_id, sent_frames[0], category=None)
         payload = _open(sent_frames[0])
         self.assertTrue(payload["unsolicited"])
+
+    async def test_unsolicited_cron_send_seals_owning_profile(self):
+        sent_frames = []
+        self.adapter._ws.send = AsyncMock(side_effect=lambda frame: sent_frames.append(frame))
+        with (
+            patch.object(self.adapter, "_enqueue_durable", AsyncMock()),
+            patch.object(
+                self.adapter,
+                "_rpc_cron_list",
+                AsyncMock(return_value=[{"id": "abc", "profile": "coder"}]),
+            ),
+        ):
+            await self.adapter.send("chat-1", "job done", metadata={"job_id": "abc"})
+
+        payload = _open(sent_frames[0])
+        self.assertTrue(payload["unsolicited"])
+        self.assertEqual(payload["core_profile"], "coder")
+
+    async def test_unsolicited_cron_send_omits_profile_when_lookup_fails(self):
+        sent_frames = []
+        self.adapter._ws.send = AsyncMock(side_effect=lambda frame: sent_frames.append(frame))
+        with (
+            patch.object(self.adapter, "_enqueue_durable", AsyncMock()),
+            patch.object(self.adapter, "_rpc_cron_list", AsyncMock(side_effect=RuntimeError("offline"))),
+        ):
+            await self.adapter.send("chat-1", "job done", metadata={"job_id": "abc"})
+
+        payload = _open(sent_frames[0])
+        self.assertTrue(payload["unsolicited"])
+        self.assertNotIn("core_profile", payload)
+
+    async def test_unsolicited_cron_send_omits_profile_when_job_is_not_found(self):
+        sent_frames = []
+        self.adapter._ws.send = AsyncMock(side_effect=lambda frame: sent_frames.append(frame))
+        with (
+            patch.object(self.adapter, "_enqueue_durable", AsyncMock()),
+            patch.object(self.adapter, "_rpc_cron_list", AsyncMock(return_value=[])),
+        ):
+            await self.adapter.send("chat-1", "job done", metadata={"job_id": "abc"})
+
+        payload = _open(sent_frames[0])
+        self.assertTrue(payload["unsolicited"])
+        self.assertNotIn("core_profile", payload)
 
 
 class TestEditMessage(unittest.IsolatedAsyncioTestCase):
