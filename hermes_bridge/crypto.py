@@ -205,10 +205,19 @@ def load_psk(path: Optional[str] = None) -> bytes:
     """
     Load the 32-byte PSK from disk.
 
-    Reads from the given path, or from ~/.hermes/psk by default.
+    Reads from the given path, or from the active Hermes home's psk file.
     Raises RuntimeError if the file is absent or the key is not 32 bytes.
     """
-    psk_path = path or os.path.join(os.path.expanduser("~/.hermes"), "psk")
+    if path is not None:
+        psk_path = os.fspath(path)
+    else:
+        try:
+            from hermes_constants import get_hermes_home
+
+            hermes_home = get_hermes_home()
+        except (ImportError, RuntimeError):
+            hermes_home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+        psk_path = os.path.join(os.fspath(hermes_home), "psk")
     try:
         with open(psk_path, "rb") as f:
             key = f.read()
