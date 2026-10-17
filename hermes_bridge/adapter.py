@@ -1734,6 +1734,29 @@ class HermesBridgeAdapter(BasePlatformAdapter):
     async def _rpc_sessions_active(self, p: Dict[str, Any]) -> Any:
         return {"active": sorted(self._thread_phone_session.get(t, t) for t in self._active_threads)}
 
+    async def _rpc_session_control_read(self, p: Dict[str, Any]) -> Any:
+        """Read an allowlisted goal/loop/heartbeat snapshot for one Session."""
+        try:
+            session_id = _require(p, "id", "missing_session_id")
+            profile = await self._resolve_core_profile(p.get("core_profile"))
+            session_id = await self._gateway_session_id(session_id, profile, profile_resolved=True)
+            from tui_gateway.methods_session_control import _snapshot_control
+
+            home_token = None
+            if profile:
+                from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+                from hermes_cli.profiles import get_profile_dir
+
+                home_token = set_hermes_home_override(str(get_profile_dir(profile)))
+            try:
+                return {"available": True, "control": _snapshot_control(session_id)}
+            finally:
+                if home_token is not None:
+                    reset_hermes_home_override(home_token)
+        except Exception as exc:
+            logger.debug("[hermes_bridge] session control snapshot unavailable: %s", type(exc).__name__)
+            return {"available": False}
+
     async def _rpc_sessions_messages(self, p: Dict[str, Any]) -> Any:
         profile = await self._resolve_core_profile(p.get("core_profile"))
         session_id = await self._gateway_session_id(
@@ -1845,6 +1868,96 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             f"{handoff}\n[/HANDOFF CONTEXT]\n\n"
         )
         return {"id": thread_id, "title": f"↪ {title}", "forked_from": source_id}
+
+    async def _rpc_sessions_branch(self, p: Dict[str, Any]) -> Any:
+        source_id = _require(p, "id", "missing_session_id")
+        message_id = _require(p, "through_message_id", "missing_message_id")
+        profile = await self._resolve_core_profile(p.get("core_profile"))
+        stored_id = await self._gateway_session_id(source_id, profile, profile_resolved=True)
+        query = {"limit": 100, "profile": profile} if profile else {"limit": 100}
+        sessions = await self._api.get(f"/api/sessions?{urlencode(query)}")
+        session_rows = sessions.get("sessions", []) if isinstance(sessions, dict) else []
+        source = next((row for row in session_rows if isinstance(row, dict) and row.get("id") == stored_id), None)
+        title = str((source or {}).get("title") or source_id)
+        origin_source = (source or {}).get("source")
+
+        path = f"/api/sessions/{quote(stored_id, safe='')}/messages"
+        count = 0
+        found = False
+        offset = 0
+        while not found:
+            params = {"limit": 500, "offset": offset, "order": "oldest"}
+            if profile:
+                params["profile"] = profile
+            page = await self._api.get(f"{path}?{urlencode(params)}")
+            rows = page.get("messages", []) if isinstance(page, dict) else []
+            if not isinstance(rows, list) or not rows:
+                break
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                role = row.get("role")
+                if role not in {"user", "assistant"} or not self._branch_message_text(row.get("content")).strip():
+                    continue
+                count += 1
+                if str(row.get("id")) == str(message_id):
+                    found = True
+                    break
+            if found or len(rows) < 500:
+                break
+            offset += len(rows)
+        if not found:
+            raise _RpcError("message_not_found")
+
+        resume_params = {"session_id": stored_id, "omit_messages": True}
+        if profile:
+            resume_params["profile"] = profile
+        resumed = await self._local_rpc("session.resume", resume_params)
+        live_id = resumed.get("session_id") if isinstance(resumed, dict) else None
+        if not isinstance(live_id, str) or not live_id:
+            raise _RpcError("session_resume_failed")
+        try:
+            branch = await self._local_rpc("session.branch", {
+                "session_id": live_id,
+                "count": count,
+                "idempotency_key": f"{source_id}:{message_id}",
+                **({"profile": profile} if profile else {}),
+            })
+        finally:
+            await self._local_rpc("session.close", {
+                "session_id": live_id,
+                **({"profile": profile} if profile else {}),
+            })
+        child_id = branch.get("stored_session_id") if isinstance(branch, dict) else None
+        if not isinstance(child_id, str) or not child_id:
+            raise _RpcError("invalid_branch_response")
+        branch_title = branch.get("title") if isinstance(branch, dict) else None
+        info = branch.get("info") if isinstance(branch, dict) else None
+        if isinstance(info, dict) and isinstance(info.get("source"), str):
+            origin_source = info["source"]
+        return {
+            "id": child_id,
+            "title": branch_title if isinstance(branch_title, str) and branch_title else title,
+            "forked_from": source_id,
+            "origin_source": origin_source,
+        }
+
+    @staticmethod
+    def _branch_message_text(content: Any) -> str:
+        if isinstance(content, list):
+            chunks = []
+            for part in content:
+                if isinstance(part, str):
+                    chunks.append(part)
+                elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                    chunks.append(part["text"])
+                elif isinstance(part, dict) and part.get("type"):
+                    chunks.append("\n[image]" if part.get("type") == "image" else "\n")
+            return "".join(chunks)
+        if isinstance(content, dict):
+            text = content.get("text")
+            return text if isinstance(text, str) else "[image]" if content.get("type") == "image" else ""
+        return "" if content is None else str(content)
 
     async def _rpc_sessions_switch(self, p: Dict[str, Any]) -> Any:
         # Hermes has no REST endpoint to switch active session context.
@@ -2015,8 +2128,18 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         scope = str(p.get("scope", "main")).strip() or "main"
         provider = str(p.get("provider", "")).strip()
         profile_body = await self._profile_body(p)
+        body = {"scope": scope, "provider": provider, "model": model, **profile_body}
+        if "reasoning_effort" in p:
+            effort = p["reasoning_effort"]
+            if effort is not None and (not isinstance(effort, str) or effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}):
+                raise _RpcError("invalid_reasoning_effort")
+            body["reasoning_effort"] = effort
+        if "confirm_expensive_model" in p:
+            if not isinstance(p["confirm_expensive_model"], bool):
+                raise _RpcError("invalid_confirm_expensive_model")
+            body["confirm_expensive_model"] = p["confirm_expensive_model"]
         return await self._api.post(
-            await self._profiled_url("/api/model/set", p), body={"scope": scope, "provider": provider, "model": model, **profile_body}
+            await self._profiled_url("/api/model/set", p), body=body
         )
 
     async def _rpc_usage_get(self, p: Dict[str, Any]) -> Any:
