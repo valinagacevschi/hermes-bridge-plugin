@@ -43,10 +43,191 @@ class TestCronWriteMethods(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.adapter = _make_adapter()
 
+    async def test_agent_set_model_forwards_optional_effort_and_confirm_unchanged(self):
+        expected = {"ok": False, "confirm_required": True, "confirm_message": "costly"}
+        self.adapter._api.post = AsyncMock(return_value=expected)
+        with patch.object(self.adapter, "_profile_body", AsyncMock(return_value={})), patch.object(
+            self.adapter, "_profiled_url", AsyncMock(return_value="/api/model/set")
+        ):
+            result = await self.adapter._rpc_agent_set_model({"model": "m", "provider": "p", "reasoning_effort": "xhigh", "confirm_expensive_model": True})
+            self.assertIs(result, expected)
+            self.assertEqual(self.adapter._api.post.await_args.kwargs["body"]["reasoning_effort"], "xhigh")
+            self.assertTrue(self.adapter._api.post.await_args.kwargs["body"]["confirm_expensive_model"])
+            await self.adapter._rpc_agent_set_model({"model": "m", "provider": "p"})
+            self.assertNotIn("reasoning_effort", self.adapter._api.post.await_args.kwargs["body"])
+
+    async def test_agent_set_model_rejects_invalid_effort(self):
+        from hermes_bridge.adapter import _RpcError
+        with self.assertRaises(_RpcError) as caught:
+            await self.adapter._rpc_agent_set_model({"model": "m", "reasoning_effort": "bogus"})
+        self.assertEqual(str(caught.exception), "invalid_reasoning_effort")
+
     async def test_sessions_active_returns_current_phone_thread_ids(self):
         self.adapter._thread_phone_session = {"gateway-a": "phone-a"}
         self.adapter._active_threads = {"gateway-a", "phone-b"}
         self.assertEqual(await self.adapter._rpc_sessions_active({}), {"active": ["phone-a", "phone-b"]})
+
+    async def test_sessions_branch_counts_visible_rows_and_closes_live_session(self):
+        from hermes_bridge.adapter import _RpcError
+
+        self.adapter._resolve_core_profile = AsyncMock(return_value="work")
+        self.adapter._gateway_session_id = AsyncMock(return_value="stored-source")
+        self.adapter._api.get = AsyncMock(side_effect=[
+            {"sessions": [{"id": "stored-source", "title": "Original", "source": "telegram"}]},
+            {"messages": [
+                {"id": "u1", "role": "user", "content": "hello"},
+                {"id": "tool1", "role": "tool"},
+                {"id": "empty", "role": "assistant", "content": [{"type": "text", "text": "  "}]},
+                {"id": "sys", "role": "system", "content": "hidden"},
+                {"id": 42, "role": "assistant", "content": [{"type": "text", "text": " answer "}]},
+            ]},
+            {"sessions": [{"id": "stored-source", "title": "Original", "source": "telegram"}]},
+            {"messages": [
+                {"id": "u1", "role": "user", "content": "hello"},
+                {"id": "tool1", "role": "tool"},
+                {"id": "empty", "role": "assistant", "content": [{"type": "text", "text": "  "}]},
+                {"id": "sys", "role": "system", "content": "hidden"},
+                {"id": 42, "role": "assistant", "content": [{"type": "text", "text": " answer "}]},
+            ]},
+        ])
+        self.adapter._local_rpc = AsyncMock(side_effect=[
+            {"session_id": "live-source"},
+            {"stored_session_id": "child"},
+            {"closed": True},
+            {"session_id": "live-source"},
+            {"stored_session_id": "child"},
+            {"closed": True},
+        ])
+        result = await self.adapter._rpc_sessions_branch({
+            "id": "phone-source", "through_message_id": "42", "core_profile": "work",
+        })
+        self.assertEqual(result, {"id": "child", "title": "Original", "forked_from": "phone-source", "origin_source": "telegram"})
+        self.assertEqual(self.adapter._local_rpc.await_args_list[1].args, ("session.branch", {
+            "session_id": "live-source", "count": 2, "idempotency_key": "phone-source:42", "profile": "work",
+        }))
+        self.assertEqual(self.adapter._local_rpc.await_args_list[-1].args, (
+            "session.close", {"session_id": "live-source", "profile": "work"}
+        ))
+        retried = await self.adapter._rpc_sessions_branch({
+            "id": "phone-source", "through_message_id": "42", "core_profile": "work",
+        })
+        self.assertEqual(retried["id"], result["id"])
+        self.assertEqual(
+            self.adapter._local_rpc.await_args_list[4].args[1]["idempotency_key"],
+            "phone-source:42",
+        )
+
+    async def test_sessions_branch_closes_after_branch_error_and_missing_message_is_reported(self):
+        from hermes_bridge.adapter import _RpcError
+
+        self.adapter._resolve_core_profile = AsyncMock(return_value=None)
+        self.adapter._gateway_session_id = AsyncMock(return_value="source")
+        self.adapter._api.get = AsyncMock(side_effect=[
+            {"sessions": [{"id": "source", "title": "Title"}]},
+            {"messages": [{"id": "known", "role": "assistant", "content": "known"}]},
+        ])
+        self.adapter._local_rpc = AsyncMock(side_effect=[{"session_id": "live"}, RuntimeError("branch failed"), {"closed": True}])
+        with self.assertRaisesRegex(RuntimeError, "branch failed"):
+            await self.adapter._rpc_sessions_branch({"id": "source", "through_message_id": "known"})
+        self.assertEqual(self.adapter._local_rpc.await_args_list[-1].args[0], "session.close")
+
+        self.adapter._api.get = AsyncMock(side_effect=[
+            {"sessions": [{"id": "source", "title": "Title"}]}, {"messages": [{"id": "known", "role": "assistant", "content": "known"}]},
+        ])
+        with self.assertRaises(_RpcError) as caught:
+            await self.adapter._rpc_sessions_branch({"id": "source", "through_message_id": "missing"})
+        self.assertEqual(str(caught.exception), "message_not_found")
+
+    async def test_session_control_read_passes_snapshot_through(self):
+        from types import ModuleType
+
+        expected = {"goal": {"title": "ship"}, "loop": None, "heartbeat": None, "revision": "r1"}
+        module = ModuleType("tui_gateway.methods_session_control")
+        module._snapshot_control = MagicMock(return_value=expected)
+        with patch.object(self.adapter, "_resolve_core_profile", AsyncMock(return_value=None)), patch.dict(
+            sys.modules, {"tui_gateway.methods_session_control": module}
+        ):
+            self.assertEqual(
+                await self.adapter._rpc_session_control_read({"id": "session-1"}),
+                {"available": True, "control": expected},
+            )
+        module._snapshot_control.assert_called_once_with("session-1")
+
+    async def test_session_control_read_resolves_phone_thread_to_stored_session(self):
+        from types import ModuleType
+
+        expected = {"goal": None, "loop": None, "heartbeat": None, "revision": "r1"}
+        module = ModuleType("tui_gateway.methods_session_control")
+        module._snapshot_control = MagicMock(return_value=expected)
+        self.adapter._gateway_session_id = AsyncMock(side_effect=lambda session_id, *args, **kwargs: {
+            "phone-thread": "S"
+        }.get(session_id, session_id))
+        with patch.object(self.adapter, "_resolve_core_profile", AsyncMock(return_value=None)), patch.dict(
+            sys.modules, {"tui_gateway.methods_session_control": module}
+        ):
+            self.assertEqual(
+                await self.adapter._rpc_session_control_read({"id": "phone-thread"}),
+                {"available": True, "control": expected},
+            )
+            self.assertEqual(
+                await self.adapter._rpc_session_control_read({"id": "unmapped"}),
+                {"available": True, "control": expected},
+            )
+        self.assertEqual(
+            [call.args[0] for call in module._snapshot_control.call_args_list], ["S", "unmapped"]
+        )
+        self.assertEqual(
+            [call.args[0] for call in self.adapter._gateway_session_id.await_args_list],
+            ["phone-thread", "unmapped"],
+        )
+
+    async def test_session_control_read_import_error_is_unavailable(self):
+        import builtins
+
+        original = builtins.__import__
+
+        def import_without_snapshot(name, *args, **kwargs):
+            if name == "tui_gateway.methods_session_control":
+                raise ImportError("missing")
+            return original(name, *args, **kwargs)
+
+        with patch.object(self.adapter, "_resolve_core_profile", AsyncMock(return_value=None)), patch(
+            "builtins.__import__", side_effect=import_without_snapshot
+        ):
+            self.assertEqual(await self.adapter._rpc_session_control_read({"id": "s"}), {"available": False})
+
+    async def test_session_control_read_builder_failure_is_unavailable(self):
+        from types import ModuleType
+
+        module = ModuleType("tui_gateway.methods_session_control")
+        module._snapshot_control = MagicMock(side_effect=RuntimeError("private detail"))
+        with patch.object(self.adapter, "_resolve_core_profile", AsyncMock(return_value=None)), patch.dict(
+            sys.modules, {"tui_gateway.methods_session_control": module}
+        ):
+            self.assertEqual(await self.adapter._rpc_session_control_read({"id": "s"}), {"available": False})
+
+    async def test_session_control_read_sets_and_resets_non_default_profile_home(self):
+        from types import ModuleType
+
+        control_module = ModuleType("tui_gateway.methods_session_control")
+        control_module._snapshot_control = MagicMock(side_effect=RuntimeError("snapshot failure"))
+        constants = ModuleType("hermes_constants")
+        constants.set_hermes_home_override = MagicMock(return_value="token")
+        constants.reset_hermes_home_override = MagicMock()
+        profiles = ModuleType("hermes_cli.profiles")
+        profiles.get_profile_dir = MagicMock(return_value="/hermes/profiles/work")
+        with patch.object(self.adapter, "_resolve_core_profile", AsyncMock(return_value="work")), patch.dict(
+            sys.modules,
+            {
+                "tui_gateway.methods_session_control": control_module,
+                "hermes_constants": constants,
+                "hermes_cli.profiles": profiles,
+            },
+        ):
+            result = await self.adapter._rpc_session_control_read({"id": "s", "core_profile": "work"})
+        self.assertEqual(result, {"available": False})
+        constants.set_hermes_home_override.assert_called_once_with("/hermes/profiles/work")
+        constants.reset_hermes_home_override.assert_called_once_with("token")
 
     async def test_sessions_create_returns_a_fresh_phone_thread_id(self):
         first = await self.adapter._rpc_sessions_create({})

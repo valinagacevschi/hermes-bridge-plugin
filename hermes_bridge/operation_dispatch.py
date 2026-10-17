@@ -56,6 +56,7 @@ class OperationDispatcher:
     _HANDLER_NAMES = {
         "sessions.messages": "_rpc_sessions_messages",
         "sessions.fork": "_rpc_sessions_fork",
+        "sessions.branch": "_rpc_sessions_branch",
         "sessions.list": "_rpc_sessions_list",
         "sessions.active": "_rpc_sessions_active",
         "sessions.create": "_rpc_sessions_create",
@@ -63,6 +64,7 @@ class OperationDispatcher:
         "sessions.delete": "_rpc_sessions_delete",
         "sessions.search": "_rpc_sessions_search",
         "sessions.export": "_rpc_sessions_export",
+        "session.control.read": "_rpc_session_control_read",
         "skills.toggle": "_rpc_skills_toggle",
         "skills.content": "_rpc_skills_content",
         "skills.hub.search": "_rpc_skills_hub_search",
