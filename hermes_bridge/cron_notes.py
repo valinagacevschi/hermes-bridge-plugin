@@ -1,11 +1,16 @@
 """Access Hermes's notepad in the explicitly selected job's storage context."""
 import importlib
+import logging
 
 from .operation_dispatch import _RpcError
+
+logger = logging.getLogger(__name__)
+_IMPORT_WARNED = False
 
 
 def access_notes(profile: str, job_id: str, *, capabilities: bool = False,
                  action: str = "read", key=None, value=None):
+    global _IMPORT_WARNED
     try:
         profiles = importlib.import_module("hermes_cli.profiles")
         jobs = importlib.import_module("cron.jobs")
@@ -13,13 +18,21 @@ def access_notes(profile: str, job_id: str, *, capabilities: bool = False,
         homes = importlib.import_module("hermes_constants")
         required = (
             (profiles, "validate_profile_name"), (profiles, "profile_exists"),
+            (profiles, "get_profile_dir"),
             (profiles, "get_profile_dir"), (jobs, "use_cron_store"), (jobs, "get_job"),
             (notepad, "list_notes"), (notepad, "_current_notepad_file"), (homes, "set_hermes_home_override"),
             (homes, "reset_hermes_home_override"),
         )
-        if any(not callable(getattr(module, name, None)) for module, name in required):
+        missing = next(((module, name) for module, name in required if not callable(getattr(module, name, None))), None)
+        if missing:
+            if not _IMPORT_WARNED:
+                _IMPORT_WARNED = True
+                logger.warning("[hermes_bridge] cron note helper %s.%s unavailable", missing[0].__name__, missing[1])
             return {"available": False, "reason": "notes_unsupported"}
-    except Exception:
+    except Exception as exc:
+        if not _IMPORT_WARNED:
+            _IMPORT_WARNED = True
+            logger.warning("[hermes_bridge] cron note helpers unavailable: %s", type(exc).__name__)
         return {"available": False, "reason": "notes_unsupported"}
 
     try:

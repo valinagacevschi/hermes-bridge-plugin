@@ -13,7 +13,7 @@ import time
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode
 
 import websockets
@@ -49,6 +49,19 @@ from .session_continue import (
 )
 
 logger = logging.getLogger(__name__)
+_PRIVATE_IMPORT_WARNED: set[str] = set()
+
+
+def _warn_private_import_once(module: str, exc: Exception) -> None:
+    if not isinstance(exc, (ImportError, AttributeError)):
+        return
+    if module not in _PRIVATE_IMPORT_WARNED:
+        _PRIVATE_IMPORT_WARNED.add(module)
+        logger.warning(
+            "[hermes_bridge] private Hermes helper %s unavailable: %s",
+            module,
+            type(exc).__name__,
+        )
 
 _SKILL_INVOCATION_PREFIX = "[IMPORTANT: The user has invoked the "
 _SINGLE_SKILL_MARKER = "The full skill content is loaded below.]"
@@ -57,13 +70,59 @@ _RUNTIME_NOTE = "\n\n[Runtime note:"
 _BUNDLE_MARKER = " skill bundle,"
 _BUNDLE_USER_INSTRUCTION = "\nUser instruction: "
 _BUNDLE_FIRST_SKILL_BLOCK = "\n\n[Loaded as part of the "
+_THREAD_CORE_PROFILE_LIMIT = 2000
+
+
+def _thread_core_profile_path(profile_id: str) -> str:
+    return os.path.join(bot_notify._STATE_DIR, f"thread_core_profile_{profile_id}.json")
+
+
+def _load_thread_core_profiles(profile_id: str) -> Dict[str, str]:
+    path = _thread_core_profile_path(profile_id)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+        if not isinstance(raw, dict):
+            raise ValueError("expected an object")
+        valid = [
+            (thread_id, core_profile)
+            for thread_id, core_profile in raw.items()
+            if isinstance(thread_id, str)
+            and thread_id
+            and isinstance(core_profile, str)
+            and core_profile
+        ]
+        return dict(valid[-_THREAD_CORE_PROFILE_LIMIT:])
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        logger.debug("[hermes_bridge] thread profile map unavailable: %s", exc)
+        return {}
+
+
+def _save_thread_core_profiles(profile_id: str, mapping: Dict[str, str]) -> None:
+    target = _thread_core_profile_path(profile_id)
+    temporary = f"{target}.tmp"
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        bounded = dict(list(mapping.items())[-_THREAD_CORE_PROFILE_LIMIT:])
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(bounded, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    except OSError as exc:
+        logger.debug("[hermes_bridge] failed to persist thread profile map: %s", exc)
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
 
 
 def _describe_skill_invocation(content: str) -> Optional[str]:
     try:
         from agent.skill_commands import describe_skill_invocation
         return describe_skill_invocation(content)
-    except ImportError:
+    except ImportError as exc:
+        _warn_private_import_once("agent.skill_commands.describe_skill_invocation", exc)
         if not content.startswith(_SKILL_INVOCATION_PREFIX):
             return None
         match = re.match(re.escape(_SKILL_INVOCATION_PREFIX) + r'"([^"]*)"', content)
@@ -521,7 +580,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         self._message_reply_to: Dict[str, str] = {}
         self._message_revisions: Dict[str, int] = {}
         self._thread_phone_session: Dict[str, str] = {}
-        self._thread_core_profile: Dict[str, str] = {}
+        self._thread_core_profile: Dict[str, str] = _load_thread_core_profiles(self._profile_id)
         # One-shot fork context is intentionally in memory; a bridge restart drops it.
         self._pending_handoffs: Dict[str, str] = {}
         self._active_threads: set = set()
@@ -1113,10 +1172,11 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         )
 
     # ------------------------------------------------------------------
-    # Interactive controls (#42) — tool-approval / slash-confirm / clarify
+    # Interactive controls (#42) — tool-approval / slash-confirm / clarify / choice-picker
     # rendered as native buttons instead of text, mirroring Hermes core's own
-    # experimental relay-connector `prompt` op. Three overrides, not two as
-    # originally scoped — send_exec_approval has NO base-class default at
+    # experimental relay-connector `prompt` op. Four hooks cover approvals,
+    # slash confirmations, clarify prompts, and model choice pickers.
+    # send_exec_approval has NO base-class default at
     # all (gateway/run.py:5827 checks `getattr(type(adapter),
     # "send_exec_approval", None)` directly, independent of supported_ops),
     # while send_slash_confirm/send_clarify do — see each method's own
@@ -1279,6 +1339,39 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         prompt_id = self._mint_prompt("clarify", clarify_id=clarify_id)
         return await self._send_prompt(chat_id, "clarify", fallback, options, prompt_id, metadata)
 
+    async def send_choice_picker(
+        self,
+        chat_id: str,
+        title: str,
+        choices: List[Dict[str, Any]],
+        session_key: str,
+        on_choice_selected: Callable[[str, str], Awaitable[str]],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Model choice prompt as native buttons, with a text fallback body."""
+        if not self._supports("prompt"):
+            return SendResult(success=False, error="prompt_unsupported")
+        if not choices:
+            return SendResult(success=False, error="no_choices")
+        options = [
+            {
+                "id": str(i),
+                "label": ("✓ " if choice.get("is_current") else "")
+                + str(choice.get("label") or choice.get("value") or ""),
+            }
+            for i, choice in enumerate(choices)
+        ]
+        lines = [title, ""]
+        lines.extend(f"  {i + 1}. {option['label']}" for i, option in enumerate(options))
+        content = "\n".join(lines)
+        prompt_id = self._mint_prompt(
+            "choice_picker",
+            choices=choices,
+            on_choice_selected=on_choice_selected,
+            chat_id=chat_id,
+        )
+        return await self._send_prompt(chat_id, "choice", content, options, prompt_id, metadata)
+
     def _pop_prompt(self, prompt_id: str) -> Optional[Dict[str, Any]]:
         return self._pending_prompts.pop(prompt_id, None)
 
@@ -1311,7 +1404,11 @@ class HermesBridgeAdapter(BasePlatformAdapter):
 
                 resolve_gateway_approval(entry["session_key"], option_id)
             elif kind == "slash_confirm":
-                from tools.slash_confirm import resolve as resolve_slash_confirm
+                try:
+                    from tools.slash_confirm import resolve as resolve_slash_confirm
+                except (ImportError, AttributeError) as exc:
+                    _warn_private_import_once("tools.slash_confirm.resolve", exc)
+                    return
 
                 # Unlike resolve_gateway_approval/resolve_gateway_clarify
                 # (both unblock an already-running waiter; the ongoing turn
@@ -1334,9 +1431,38 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                     mark_awaiting_text(entry["clarify_id"])
                 else:
                     resolve_gateway_clarify(entry["clarify_id"], str(payload.get("content", "")))
+            elif kind == "choice_picker":
+                try:
+                    choice_index = int(option_id)
+                except ValueError:
+                    logger.info("[hermes_bridge] invalid choice-picker option_id=%s", option_id)
+                    return
+                choices = entry["choices"]
+                if choice_index < 0 or choice_index >= len(choices):
+                    logger.info("[hermes_bridge] choice-picker option_id out of range=%s", option_id)
+                    return
+                try:
+                    result_text = await entry["on_choice_selected"](
+                        entry["chat_id"], str(choices[choice_index].get("value") or "")
+                    )
+                except Exception as exc:
+                    await self.send(
+                        chat_id=entry["chat_id"], content=f"Couldn't apply that choice: {exc}"
+                    )
+                    return
+                if isinstance(result_text, str) and result_text:
+                    await self.send(chat_id=entry["chat_id"], content=result_text)
             else:
                 logger.warning("[hermes_bridge] unknown pending-prompt kind=%s", kind)
         except Exception as exc:
+            if isinstance(exc, (ImportError, AttributeError)):
+                module = {
+                    "approval": "tools.approval.resolve_gateway_approval",
+                    "clarify": "tools.clarify_gateway",
+                }.get(kind)
+                if module:
+                    _warn_private_import_once(module, exc)
+                    return
             logger.warning("[hermes_bridge] prompt resolution failed (kind=%s): %s", kind, exc)
 
     # ------------------------------------------------------------------
@@ -1623,7 +1749,13 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         if thread_id and phone_session_id:
             self._thread_phone_session[thread_id] = phone_session_id
         if thread_id and source_profile:
-            getattr(self, "_thread_core_profile", {})[thread_id] = source_profile
+            thread_profiles = getattr(self, "_thread_core_profile", {})
+            if thread_profiles.get(thread_id) != source_profile:
+                thread_profiles.pop(thread_id, None)
+                thread_profiles[thread_id] = source_profile
+                while len(thread_profiles) > _THREAD_CORE_PROFILE_LIMIT:
+                    thread_profiles.pop(next(iter(thread_profiles)))
+                _save_thread_core_profiles(self._profile_id, thread_profiles)
         if isinstance(msg_id, str) and phone_session_id:
             self._message_session_id[msg_id] = phone_session_id
         content = payload["content"]
@@ -1740,12 +1872,20 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             session_id = _require(p, "id", "missing_session_id")
             profile = await self._resolve_core_profile(p.get("core_profile"))
             session_id = await self._gateway_session_id(session_id, profile, profile_resolved=True)
-            from tui_gateway.methods_session_control import _snapshot_control
+            try:
+                from tui_gateway.methods_session_control import _snapshot_control
+            except (ImportError, AttributeError) as exc:
+                _warn_private_import_once("tui_gateway.methods_session_control._snapshot_control", exc)
+                return {"available": False}
 
             home_token = None
             if profile:
                 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-                from hermes_cli.profiles import get_profile_dir
+                try:
+                    from hermes_cli.profiles import get_profile_dir
+                except (ImportError, AttributeError) as exc:
+                    _warn_private_import_once("hermes_cli.profiles.get_profile_dir", exc)
+                    return {"available": False}
 
                 home_token = set_hermes_home_override(str(get_profile_dir(profile)))
             try:
@@ -2037,7 +2177,8 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         try:
             from hermes_cli.gateway_multiplex_served import recorded_served_profiles
             return profile in (recorded_served_profiles() or [])
-        except Exception:
+        except Exception as exc:
+            _warn_private_import_once("hermes_cli.gateway_multiplex_served.recorded_served_profiles", exc)
             return False
 
     async def _resolve_core_profile(
@@ -2064,6 +2205,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             if not isinstance(served, (list, tuple, set)):
                 raise RuntimeError("served profile snapshot unavailable")
         except Exception as exc:
+            _warn_private_import_once("hermes_cli.gateway_multiplex_served.recorded_served_profiles", exc)
             raise _RpcError("profiles_unavailable") from exc
         try:
             row = next((row for row in snapshot.rows if row.get("name") == name), None)
@@ -2644,6 +2786,8 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 from hermes_cli.profiles import get_profile_dir
                 memories = Path(get_profile_dir(profile)) / "memories"
             except (ImportError, ValueError, FileNotFoundError) as exc:
+                if isinstance(exc, ImportError):
+                    _warn_private_import_once("hermes_cli.profiles.get_profile_dir", exc)
                 raise _RpcError("profile_not_found") from exc
             paths = (str(memories / "MEMORY.md"), str(memories / "USER.md"))
         for path, source in zip(paths, ("memory", "user")):
@@ -2667,6 +2811,8 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 from hermes_cli.profiles import get_profile_dir
                 memories = Path(get_profile_dir(profile)) / "memories"
             except (ImportError, ValueError, FileNotFoundError) as exc:
+                if isinstance(exc, ImportError):
+                    _warn_private_import_once("hermes_cli.profiles.get_profile_dir", exc)
                 raise _RpcError("profile_not_found") from exc
             paths = (str(memories / "MEMORY.md"), str(memories / "USER.md"))
         for path in paths:
@@ -2920,6 +3066,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             profiles.sort(key=lambda row: (not row["is_default"], row["name"]))
             return {"available": True, "reason": None, "profiles": profiles}
         except Exception as exc:
+            _warn_private_import_once("hermes_cli.gateway_multiplex_served.recorded_served_profiles", exc)
             return {"available": False, "reason": str(exc) or "profiles_unavailable", "profiles": []}
 
     async def _rpc_bots_capabilities(self, p: Dict[str, Any]) -> Any:
@@ -3167,13 +3314,13 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         leave ``seen`` empty, and the next successful tick would treat every
         already-pending write as "new" and fire a push per item.
         """
-        from tools import write_approval as wa
-
         seen: set = set()
         seeded = False
 
         while self._should_run:
             try:
+                from tools import write_approval as wa
+
                 for subsystem in (wa.MEMORY, wa.SKILLS):
                     new_records = _diff_new_pending(wa.list_pending(subsystem), subsystem, seen)
                     if not seeded:
@@ -3187,6 +3334,9 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                             )
                         )
                 seeded = True
+            except (ImportError, AttributeError) as exc:
+                _warn_private_import_once("tools.write_approval", exc)
+                return
             except Exception as exc:
                 logger.warning("[hermes_bridge] pending-write poll failed: %s", exc)
             # Seed attempt failed — retry almost immediately rather than

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 import secrets
 from typing import Any, Dict, Optional, Tuple
 
@@ -15,6 +16,8 @@ from .operation_dispatch import _LocalRpcError, _RpcError
 TAIL_LIMIT_BYTES = 16 * 1024
 _PROBE_SESSION = "hermlink-capability-probe"
 _PROBE_CHILD = "hermlink-capability-probe-child"
+logger = logging.getLogger(__name__)
+_IMPORT_WARNED = False
 
 
 def invalidate_refs(refs: Dict[str, Dict[str, Any]], token: str) -> None:
@@ -53,9 +56,16 @@ def _method_supported(exc: Exception) -> Optional[bool]:
 
 def local_method_available(method: str) -> Optional[bool]:
     """Read the loaded Hermes contract catalog without sending a control RPC."""
+    global _IMPORT_WARNED
     try:
         from tui_gateway.contracts import METHODS
-    except Exception:
+    except Exception as exc:
+        if not _IMPORT_WARNED:
+            _IMPORT_WARNED = True
+            logger.warning(
+                "[hermes_bridge] tui_gateway.contracts.METHODS unavailable: %s",
+                type(exc).__name__,
+            )
         return None
     return method in METHODS
 
