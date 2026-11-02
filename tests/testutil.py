@@ -232,5 +232,6 @@ def make_adapter(psk: bytes = PSK, profile_id: str = PROFILE):
         adapter._stream_session_id = {}
         adapter._message_session_id = {}
         adapter._thread_phone_session = {}
+        adapter._bare_key_phone_session = None
         adapter._active_threads = set()
     return adapter
