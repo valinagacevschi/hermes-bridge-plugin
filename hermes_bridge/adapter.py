@@ -1,3 +1,10 @@
+"""Phone bridge to a Hermes gateway.
+
+Laptop-app sessions are clients of their canonical owner, never switch_session
+bindings. The owner admits the phone turn into its existing FIFO and persists
+both transcript rows; the bridge delivers the final reply on the phone chat.
+"""
+
 import asyncio
 import hashlib
 import hmac
@@ -28,7 +35,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 
-from . import bot_activity, bot_chats, bot_notify, bot_rooms, bot_subagents
+from . import bot_activity, bot_chats, bot_notify, bot_rooms, bot_subagents, local_owner
 from .bots_policy import (
     blocked_bot_capabilities,
     bots_flag_enabled,
@@ -41,11 +48,22 @@ from .crypto import load_psk, open_blob, open_frame, seal, seal_blob
 from .local_api import API_SERVER_PORT, SESSION_HEADER, LocalApi
 from .operation_dispatch import OperationDispatcher, _LocalRpcError, _RpcError
 from .session_continue import (
+    bare_key_phone_session_from_payload,
     bridge_thread_id,
+    continuation_switch_target,
+    continuation_thread_id,
     hermes_session_to_continue,
+    is_continuation_thread,
+    is_continued_row,
+    is_local_owned_session,
+    is_local_platform_id,
+    local_owned_continue_result,
     new_bridge_chat_id,
+    phone_session_from_continuation_thread,
     resolve_message_session_id,
     rewrite_listed_sessions,
+    stamp_bare_key_session_id,
+    stamp_phone_session_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -111,6 +129,44 @@ def _save_thread_core_profiles(profile_id: str, mapping: Dict[str, str]) -> None
         os.replace(temporary, target)
     except OSError as exc:
         logger.debug("[hermes_bridge] failed to persist thread profile map: %s", exc)
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+
+
+def _bare_key_phone_session_path(profile_id: str) -> str:
+    return os.path.join(bot_notify._STATE_DIR, f"bare_key_phone_session_{profile_id}.json")
+
+
+def _load_bare_key_phone_session(profile_id: str) -> Optional[str]:
+    path = _bare_key_phone_session_path(profile_id)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+        if raw is None:
+            return None
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+        raise ValueError("expected a string or null")
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        logger.debug("[hermes_bridge] bare-key phone session unavailable: %s", exc)
+        return None
+
+
+def _save_bare_key_phone_session(profile_id: str, session_id: Optional[str]) -> None:
+    target = _bare_key_phone_session_path(profile_id)
+    temporary = f"{target}.tmp"
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        value = session_id.strip() if isinstance(session_id, str) and session_id.strip() else None
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(value, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    except OSError as exc:
+        logger.debug("[hermes_bridge] failed to persist bare-key phone session: %s", exc)
         try:
             os.unlink(temporary)
         except OSError:
@@ -581,6 +637,10 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         self._message_revisions: Dict[str, int] = {}
         self._thread_phone_session: Dict[str, str] = {}
         self._thread_core_profile: Dict[str, str] = _load_thread_core_profiles(self._profile_id)
+        # Phone chat that last drove the legacy bare DM key (no thread_id). Persisted so
+        # goal continuations after a gateway restart still route to that chat — never stamp
+        # Agent inbox ids (agent:…).
+        self._bare_key_phone_session: Optional[str] = _load_bare_key_phone_session(self._profile_id)
         # One-shot fork context is intentionally in memory; a bridge restart drops it.
         self._pending_handoffs: Dict[str, str] = {}
         self._active_threads: set = set()
@@ -710,6 +770,12 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         for task in list(self._active_run_tasks.values()):
             task.cancel()
         self._active_run_tasks.clear()
+        owner_tasks = list(getattr(self, "_local_owner_tasks", {}).values())
+        for task in owner_tasks:
+            if not task.done():
+                task.cancel()
+        if owner_tasks:
+            await asyncio.gather(*owner_tasks, return_exceptions=True)
         if self._run_task:
             self._run_task.cancel()
             try:
@@ -873,9 +939,19 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             if core_profile:
                 payload["core_profile"] = core_profile
         thread_id = metadata.get("thread_id") if metadata else None
-        if not is_unsolicited and isinstance(thread_id, str) and thread_id:
-            payload["session_id"] = self._thread_phone_session.get(thread_id, thread_id)
-            self._message_session_id[msg_id] = payload["session_id"]
+        outbound_session_id = self._outbound_phone_session_id(
+            thread_id, is_unsolicited=is_unsolicited
+        )
+        if outbound_session_id:
+            payload["session_id"] = outbound_session_id
+            self._message_session_id[msg_id] = outbound_session_id
+            if (
+                isinstance(thread_id, str)
+                and thread_id
+                and is_continuation_thread(thread_id)
+                and thread_id not in self._thread_phone_session
+            ):
+                self._thread_phone_session[thread_id] = outbound_session_id
         if reply_to:
             self._message_reply_to[msg_id] = reply_to
         while len(self._message_reply_to) > 512:
@@ -907,8 +983,8 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             self._stream_pending.add(msg_id)
             if reply_to:
                 self._stream_reply_to[msg_id] = reply_to
-            if isinstance(thread_id, str) and thread_id:
-                self._stream_session_id[msg_id] = self._thread_phone_session.get(thread_id, thread_id)
+            if outbound_session_id:
+                self._stream_session_id[msg_id] = outbound_session_id
         # message_id=None — ONLY when editing was requested but this relay
         # can't do it — is the signal GatewayStreamConsumer reads as
         # "edit-incapable"; it then sends the complete answer as a fresh
@@ -1222,8 +1298,9 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             "expires_at": int((time.time() + _PROMPT_TIMEOUT_S) * 1000),
         }
         thread_id = metadata.get("thread_id") if metadata else None
-        if isinstance(thread_id, str) and thread_id:
-            payload["session_id"] = self._thread_phone_session.get(thread_id, thread_id)
+        outbound_session_id = self._outbound_phone_session_id(thread_id)
+        if outbound_session_id:
+            payload["session_id"] = outbound_session_id
         # Durable (#41) — a prompt is a real message worth surviving an offline
         # phone, same contract as send()'s non-streamed path. `expires_at` is
         # absolute, so one that outlives its window while queued correctly
@@ -1703,26 +1780,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         media_urls: List[str] = []
         media_types: List[str] = []
         attachments = payload.get("attachments") or []
-        if attachments:
-            media_urls, media_types = await self._download_attachments_to_media(attachments)
-        # message_type: per-attachment media_types already drives
-        # image/audio/video/document classification everywhere else in Hermes
-        # core (_event_media_is_image/_is_audio/... check the mime first,
-        # message_type only as a fallback) — EXCEPT auto-TTS's voice_only
-        # mode, which keys directly off message_type == MessageType.VOICE
-        # (gateway/run.py _should_auto_voice_reply). Priority mirrors
-        # signal.py's real inbound classification: audio > image > video >
-        # else document.
         message_type = MessageType.TEXT
-        if media_types:
-            if any(mt.startswith("audio/") for mt in media_types):
-                message_type = MessageType.VOICE
-            elif any(mt.startswith("image/") for mt in media_types):
-                message_type = MessageType.PHOTO
-            elif any(mt.startswith("video/") for mt in media_types):
-                message_type = MessageType.VIDEO
-            else:
-                message_type = MessageType.DOCUMENT
         msg_id = payload.get("msg_id")
         phone_session_id = hermes_session_to_continue(payload)
         requested_core_profile = payload.get("core_profile")
@@ -1743,11 +1801,41 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                     },
                 )
                 return None
-        thread_id = await self._bridge_thread_id(payload, source_profile, profile_resolved=True)
+        try:
+            thread_id = await self._bridge_thread_id(payload, source_profile, profile_resolved=True)
+        except _RpcError as exc:
+            code = str(exc)
+            frame: Dict[str, Any] = {
+                "role": "error",
+                "content": "Couldn't continue this session",
+                "session_id": phone_session_id,
+            }
+            if code == "local_owned":
+                await self._forward_local_owned(payload, source_profile)
+                return None
+            await self._deliver(str(uuid.uuid4()), frame)
+            return None
+        if attachments:
+            media_urls, media_types = await self._download_attachments_to_media(attachments)
+            if any(mt.startswith("audio/") for mt in media_types):
+                message_type = MessageType.VOICE
+            elif any(mt.startswith("image/") for mt in media_types):
+                message_type = MessageType.PHOTO
+            elif any(mt.startswith("video/") for mt in media_types):
+                message_type = MessageType.VIDEO
+            elif media_types:
+                message_type = MessageType.DOCUMENT
         if not requested_core_profile and thread_id:
             source_profile = getattr(self, "_thread_core_profile", {}).get(thread_id)
+        if not thread_id:
+            self._remember_bare_key_phone_session(bare_key_phone_session_from_payload(payload))
         if thread_id and phone_session_id:
             self._thread_phone_session[thread_id] = phone_session_id
+        elif thread_id and is_continuation_thread(thread_id):
+            derived = phone_session_from_continuation_thread(thread_id)
+            if derived:
+                self._thread_phone_session[thread_id] = derived
+                phone_session_id = phone_session_id or derived
         if thread_id and source_profile:
             thread_profiles = getattr(self, "_thread_core_profile", {})
             if thread_profiles.get(thread_id) != source_profile:
@@ -1766,6 +1854,18 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         source = self.build_source(chat_id=self._profile_id, user_id="mobile", thread_id=thread_id)
         if source_profile:
             source.profile = source_profile
+        if is_continuation_thread(thread_id) and phone_session_id:
+            bound = await self._bind_foreign_continuation(source, phone_session_id)
+            if not bound:
+                await self._deliver(
+                    str(uuid.uuid4()),
+                    {
+                        "role": "error",
+                        "content": "Couldn't continue this session",
+                        "session_id": phone_session_id,
+                    },
+                )
+                return None
         return MessageEvent(
             text=content,
             source=source,
@@ -1813,6 +1913,63 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         rows = data.get("sessions")
         return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
+    async def _fetch_session_row(
+        self,
+        session_id: str,
+        profile: Optional[str] = None,
+    ) -> Optional[dict]:
+        """GET /api/sessions/{id} for a row outside the limit=100 list.
+
+        Uses ``get_on_working_port`` so a dashboard 404 (unknown / new phone
+        chat) is authoritative: return None without clearing the proven port
+        or probing api_server. Raises on other errors so callers fail closed
+        instead of treating a foreign id as a thread.
+        """
+        query = f"?{urlencode({'profile': profile})}" if profile else ""
+        data = await self._api.get_on_working_port(
+            f"/api/sessions/{quote(session_id, safe='')}{query}"
+        )
+        return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _session_known_in_listed_rows(session_id: str, rows: List[dict]) -> bool:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if row.get("id") == session_id:
+                return True
+            if row.get("source") == "hermes_bridge" and row.get("thread_id") == session_id:
+                return True
+        return False
+
+    def _remember_bare_key_phone_session(self, session_id: Optional[str]) -> None:
+        """Persist which phone chat last drove the legacy bare DM key."""
+        remembered = session_id.strip() if isinstance(session_id, str) and session_id.strip() else None
+        current = getattr(self, "_bare_key_phone_session", None)
+        if current == remembered:
+            return
+        self._bare_key_phone_session = remembered
+        _save_bare_key_phone_session(self._profile_id, remembered)
+
+    def _outbound_phone_session_id(
+        self,
+        thread_id: Any,
+        *,
+        is_unsolicited: bool = False,
+    ) -> Optional[str]:
+        """Phone session_id to stamp on an outbound frame, or None to leave unstamped.
+
+        Threaded replies use the thread→phone map. Bare-key (no thread) replies use the
+        remembered phone session when it is a real chat id — never Agent inbox (agent:…).
+        No session-store fallback: guessing the gateway row bound to the bare key risks
+        filing Agent-inbox turns into a listed session.
+        """
+        if is_unsolicited:
+            return None
+        if isinstance(thread_id, str) and thread_id:
+            return stamp_phone_session_id(thread_id, getattr(self, "_thread_phone_session", {}))
+        return stamp_bare_key_session_id(getattr(self, "_bare_key_phone_session", None))
+
     async def _bridge_thread_id(
         self,
         payload: Dict[str, Any],
@@ -1824,22 +1981,46 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         session_id = hermes_session_to_continue(payload)
         if not session_id:
             return None
+        # Prefix is decisive even when the session list is down: never fall
+        # through to the bare key or to thread id ``cont_<local-id>``.
+        if is_local_platform_id(session_id):
+            raise _RpcError("local_owned")
+        profile = (
+            resolved_core_profile
+            if profile_resolved
+            else await self._resolve_core_profile(payload.get("core_profile"))
+        )
         try:
             rows = await self._listed_bridge_sessions(
                 payload.get("core_profile"),
-                resolved_core_profile=resolved_core_profile,
-                profile_resolved=profile_resolved,
+                resolved_core_profile=profile,
+                profile_resolved=True,
             )
         except Exception:
             return session_id
-        for row in rows:
-            if row.get("id") == session_id and row.get("source") != "hermes_bridge":
-                logger.warning(
-                    "[hermes_bridge] continuing foreign session %s with legacy thread behavior; use sessions.fork",
-                    session_id,
-                )
-        thread_id = bridge_thread_id(session_id, rows)
-        return thread_id
+        if self._session_known_in_listed_rows(session_id, rows):
+            matched = next(
+                (row for row in rows if isinstance(row, dict) and row.get("id") == session_id),
+                None,
+            )
+            if is_local_owned_session(session_id, matched):
+                raise _RpcError("local_owned")
+            return bridge_thread_id(session_id, rows)
+        # Outside the limit=100 window: detail lookup so foreign ids get cont_.
+        try:
+            detail = await self._fetch_session_row(session_id, profile)
+        except Exception as exc:
+            logger.warning(
+                "[hermes_bridge] session detail lookup failed for %s: %s",
+                session_id,
+                type(exc).__name__,
+            )
+            raise _RpcError("session_not_continuable") from exc
+        if is_local_owned_session(session_id, detail):
+            raise _RpcError("local_owned")
+        if detail is None:
+            return session_id  # new phone chat not yet listed
+        return bridge_thread_id(session_id, [detail])
 
     async def _gateway_session_id(
         self,
@@ -1864,7 +2045,281 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         return rewrite_listed_sessions(await self._api.get(f"/api/sessions?{urlencode(query)}"))
 
     async def _rpc_sessions_active(self, p: Dict[str, Any]) -> Any:
-        return {"active": sorted(self._thread_phone_session.get(t, t) for t in self._active_threads)}
+        return {
+            "active": sorted(
+                stamp_phone_session_id(t, self._thread_phone_session) for t in self._active_threads
+            )
+        }
+
+    def _session_db_for_continue(self) -> Any:
+        """Session DB used to resolve compression tips. Prefer the runner's handle."""
+        runner = getattr(self, "gateway_runner", None)
+        db = getattr(runner, "_session_db", None) if runner is not None else None
+        if db is not None:
+            return db
+        store = getattr(self, "_session_store", None)
+        if store is None:
+            return None
+        # PRIVATE: SessionStore keeps the SQLite handle as `_db` (see PRIVATE_IMPORTS.md).
+        try:
+            return getattr(store, "_db", None)
+        except Exception as exc:
+            _warn_private_import_once("gateway.session.SessionStore._db", exc)
+            return None
+
+    def _canonicalize_for_continue(self, source: Any) -> None:
+        """Pin RoutingIdentity the same way core ingress does before key derivation.
+
+        Guarded: old cores / ``__new__`` test rigs may lack ``_canonicalize``.
+        """
+        canonicalize = getattr(self, "_canonicalize", None)
+        if not callable(canonicalize):
+            return
+        try:
+            canonicalize(source)
+        except Exception as exc:
+            logger.debug(
+                "[hermes_bridge] _canonicalize before continue bind failed: %s",
+                type(exc).__name__,
+            )
+
+    async def _bind_foreign_continuation(self, source: Any, listed_id: str) -> bool:
+        """Point the bridge routing key at ``listed_id`` (or its compression tip).
+
+        Returns False when a switch was required and failed — caller must drop
+        the message. Returns True when already bound, switched, or the store is
+        unavailable (old core / test harness: fall through without crashing).
+        Laptop-app ids return False before get_or_create or switch_session.
+        """
+        if is_local_platform_id(listed_id):
+            logger.warning("[hermes_bridge] refused to bind laptop session %s", listed_id)
+            return False
+        runner = getattr(self, "gateway_runner", None)
+        async_store = getattr(runner, "async_session_store", None) if runner is not None else None
+        store = getattr(self, "_session_store", None)
+        if async_store is None and store is None:
+            return True
+
+        try:
+            # Core pins identity on ingress before deriving keys; bind under the
+            # same key or the turn runs in a fresh context-less session.
+            self._canonicalize_for_continue(source)
+            if async_store is not None:
+                entry = await async_store.get_or_create_session(source)
+            else:
+                entry = await asyncio.to_thread(store.get_or_create_session, source)
+
+            resolved_tip: Optional[str] = None
+            lineage_ids: Optional[List[str]] = None
+            db = self._session_db_for_continue()
+            if db is not None:
+                resolve = getattr(db, "resolve_resume_session_id", None)
+                if callable(resolve):
+                    try:
+                        if asyncio.iscoroutinefunction(resolve):
+                            tip = await resolve(listed_id)
+                        else:
+                            tip = await asyncio.to_thread(resolve, listed_id)
+                        if isinstance(tip, str) and tip:
+                            resolved_tip = tip
+                    except Exception as exc:
+                        logger.debug(
+                            "[hermes_bridge] resolve_resume_session_id failed for %s: %s",
+                            listed_id,
+                            type(exc).__name__,
+                        )
+                lineage_fn = getattr(db, "get_compression_lineage", None)
+                if callable(lineage_fn):
+                    try:
+                        tip_id = resolved_tip or listed_id
+                        if asyncio.iscoroutinefunction(lineage_fn):
+                            lineage = await lineage_fn(tip_id)
+                        else:
+                            lineage = await asyncio.to_thread(lineage_fn, tip_id)
+                        if isinstance(lineage, list):
+                            lineage_ids = [sid for sid in lineage if isinstance(sid, str)]
+                    except Exception as exc:
+                        logger.debug(
+                            "[hermes_bridge] get_compression_lineage failed for %s: %s",
+                            listed_id,
+                            type(exc).__name__,
+                        )
+
+            target = continuation_switch_target(
+                entry.session_id,
+                listed_id,
+                resolved_tip=resolved_tip,
+                lineage_ids=lineage_ids,
+            )
+            if target is None:
+                return True
+
+            if async_store is not None:
+                switched = await async_store.switch_session(
+                    entry.session_key, target, preserve_prompt_pin=False
+                )
+            else:
+                switched = await asyncio.to_thread(
+                    store.switch_session,
+                    entry.session_key,
+                    target,
+                    preserve_prompt_pin=False,
+                )
+            return switched is not None
+        except Exception as exc:
+            logger.warning(
+                "[hermes_bridge] continue bind failed for %s: %s",
+                listed_id,
+                type(exc).__name__,
+            )
+            return False
+
+    def _connect_local_owner(self, profile):
+        return local_owner.connect(profile, _warn_private_import_once)
+
+    async def _continue_local_owned(self, session_id, profile):
+        try:
+            async with self._connect_local_owner(profile) as client:
+                attached = await client.rpc("session.resume", session_id=session_id)
+                if not isinstance(attached.get("session_id"), str) or not attached["session_id"]:
+                    raise ValueError("Owner returned no runtime session id")
+        except Exception as exc:
+            logger.debug("[hermes_bridge] local owner unavailable: %s", type(exc).__name__)
+            return local_owned_continue_result(session_id)
+        return {"id": session_id, "continued": True, "owner": "local"}
+
+    async def _local_owner_error(self, payload, code, message):
+        await self._deliver(str(uuid.uuid4()), {
+            "role": "error", "content": message, "error_code": code,
+            "session_id": payload.get("session_id"), "reply_to": payload.get("msg_id"),
+        })
+
+    async def _forward_local_owned(self, payload, profile):
+        if payload.get("attachments"):
+            await self._local_owner_error(payload, "local_attachments_unsupported",
+                "Attachments aren't supported when continuing a Local chat. Send text from the phone or attach files on the Laptop.")
+            return
+        msg_id = payload.get("msg_id")
+        if not isinstance(msg_id, str) or not msg_id:
+            await self._local_owner_error(payload, "missing_msg_id", "A message id is required to continue a Local chat.")
+            return
+        request_id = local_owner.submission_id(self._profile_id, payload["session_id"], msg_id)
+        tasks = getattr(self, "_local_owner_tasks", None)
+        if tasks is None:
+            tasks = self._local_owner_tasks = {}
+        previous = tasks.get(request_id)
+        if previous is not None:
+            if (previous.done() and not previous.cancelled()
+                    and previous.exception() is None and previous.result() is False):
+                del tasks[request_id]  # A definite pre-commit refusal may be retried.
+            else:
+                return  # Includes unconfirmed submits: never submit those again.
+        # Retain uncertain outcomes for this adapter's lifetime; completed replies
+        # may leave the cache because the owner's submission id is durable.
+        for key, task in list(tasks.items()):
+            if len(tasks) < 512:
+                break
+            if task.done() and not task.cancelled() and task.exception() is None and task.result() is True:
+                del tasks[key]
+        ready = asyncio.Event()
+        tasks[request_id] = asyncio.create_task(self._run_local_owner(payload, profile, request_id, ready))
+        # Admission answers promptly; do not block the inbound FIFO on the whole model turn.
+        await ready.wait()
+
+    async def _run_local_owner(self, payload, profile, request_id, ready):
+        admitted = False
+        try:
+            async with self._connect_local_owner(profile) as client:
+                attached = await client.rpc("session.resume", session_id=payload["session_id"])
+                target = attached.get("session_id")
+                if not isinstance(target, str) or not target:
+                    raise ValueError("Owner returned no runtime session id")
+                receipt = await local_owner.submit(client, target, payload["content"],
+                                                   request_id, _warn_private_import_once)
+                admission = receipt["admission_id"]
+                admitted = True
+                ready.set()
+                if receipt["status"] == "terminal":
+                    saved = await client.rpc("prompt.receipt", session_id=target,
+                                             admission_id=admission, include_result=True)
+                    result = saved.get("result")
+                    content = result.get("final_response") if isinstance(result, dict) else None
+                    await self._deliver_local_owner_reply(payload, request_id, content)
+                    return True
+                async with asyncio.timeout(6 * 3600):
+                    while True:
+                        frame = await client.events.get()
+                        if isinstance(frame, BaseException):
+                            raise local_owner.OwnerUnconfirmed("The Laptop disconnected. Check its transcript before sending again.")
+                        params = frame.get("params") if isinstance(frame, dict) else None
+                        if not isinstance(params, dict) or params.get("admission_id") != admission:
+                            continue
+                        if params.get("type") != "message.complete":
+                            continue
+                        content = (params.get("payload") or {}).get("text")
+                        await self._deliver_local_owner_reply(payload, request_id, content)
+                        return True
+        except local_owner.OwnerUnconfirmed as exc:
+            await self._local_owner_error(payload, "owner_unconfirmed", str(exc))
+        except Exception as exc:
+            logger.warning("[hermes_bridge] local owner turn failed: %s", type(exc).__name__)
+            await self._local_owner_error(payload,
+                "owner_unconfirmed" if admitted else "owner_unavailable",
+                "Couldn't receive the Laptop reply. Check its transcript before sending again." if admitted
+                else "Couldn't submit to the Local chat owner. Continue it on the Laptop or try again later.")
+            return None if admitted else False
+        finally:
+            ready.set()
+
+    async def _deliver_local_owner_reply(self, payload, request_id, content):
+        if not isinstance(content, str):
+            raise local_owner.OwnerUnconfirmed("The Laptop completed without reply text. Check its transcript.")
+        reply_id = request_id + "-reply"
+        result = await self._deliver(reply_id, {
+            "role": "assistant", "content": content, "msg_id": reply_id,
+            "reply_to": payload["msg_id"], "session_id": payload["session_id"],
+        }, category="turn_complete", durable=True)
+        if not result.success:
+            raise local_owner.OwnerUnconfirmed("Couldn't deliver the Laptop reply. Check its transcript before sending again.")
+
+    async def _rpc_sessions_continue(self, p: Dict[str, Any]) -> Any:
+        """Eagerly bind a bridge continuation thread to a listed foreign session.
+
+        Local sessions attach to the owner; only an unavailable owner requests a fork.
+        """
+        source_id = _require(p, "id", "missing_session_id")
+        profile = await self._resolve_core_profile(p.get("core_profile"))
+        if is_local_platform_id(source_id):
+            return await self._continue_local_owned(source_id, profile)
+        rows = await self._listed_bridge_sessions(
+            profile, resolved_core_profile=profile, profile_resolved=True
+        )
+        source_row = next((row for row in rows if row.get("id") == source_id), None)
+        if source_row is None:
+            try:
+                source_row = await self._fetch_session_row(source_id, profile)
+            except Exception as exc:
+                logger.warning(
+                    "[hermes_bridge] sessions.continue detail lookup failed for %s: %s",
+                    source_id,
+                    type(exc).__name__,
+                )
+                raise _RpcError("session_not_continuable") from exc
+        if is_local_owned_session(source_id, source_row):
+            return await self._continue_local_owned(source_id, profile)
+        if not source_row or (
+            source_row.get("source") == "hermes_bridge" and not is_continued_row(source_row)
+        ):
+            raise _RpcError("session_not_continuable")
+        thread_id = continuation_thread_id(source_id)
+        source = self.build_source(chat_id=self._profile_id, user_id="mobile", thread_id=thread_id)
+        if profile:
+            source.profile = profile
+        bound = await self._bind_foreign_continuation(source, source_id)
+        if not bound:
+            raise _RpcError("session_continue_failed")
+        self._thread_phone_session[thread_id] = source_id
+        return {"id": source_id, "continued": True}
 
     async def _rpc_session_control_read(self, p: Dict[str, Any]) -> Any:
         """Read an allowlisted goal/loop/heartbeat snapshot for one Session."""
@@ -1975,7 +2430,19 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         source_id = _require(p, "id", "missing_session_id")
         rows = await self._listed_bridge_sessions()
         source = next((row for row in rows if row.get("id") == source_id), None)
-        if not source or source.get("source") == "hermes_bridge":
+        if source is None and is_local_platform_id(source_id):
+            try:
+                source = await self._fetch_session_row(source_id)
+            except Exception as exc:
+                logger.warning(
+                    "[hermes_bridge] sessions.fork detail lookup failed for %s: %s",
+                    source_id,
+                    type(exc).__name__,
+                )
+                raise _RpcError("session_not_forkable") from exc
+        if not source or (
+            source.get("source") == "hermes_bridge" and not is_local_owned_session(source_id, source)
+        ):
             raise _RpcError("session_not_forkable")
         title = str(source.get("title") or source_id)
         page = await self._api.get(
@@ -2003,8 +2470,9 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         thread_id = new_bridge_chat_id()
         if not hasattr(self, "_pending_handoffs"):
             self._pending_handoffs = {}
+        origin = "local" if is_local_owned_session(source_id, source) else source.get("source")
         self._pending_handoffs[thread_id] = (
-            f'[HANDOFF CONTEXT — from {source.get("source")} session "{title}" ({source_id})]\n'
+            f'[HANDOFF CONTEXT — from {origin} session "{title}" ({source_id})]\n'
             f"{handoff}\n[/HANDOFF CONTEXT]\n\n"
         )
         return {"id": thread_id, "title": f"↪ {title}", "forked_from": source_id}
@@ -2283,6 +2751,58 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         return await self._api.post(
             await self._profiled_url("/api/model/set", p), body=body
         )
+
+    async def _rpc_model_options(self, p: Dict[str, Any]) -> Any:
+        options_url = await self._profiled_url("/api/model/options", p)
+        oauth_url = await self._profiled_url("/api/providers/oauth", p)
+        options_result, oauth_result = await asyncio.gather(
+            self._api.get(options_url),
+            self._api.get(oauth_url),
+            return_exceptions=True,
+        )
+        if isinstance(options_result, BaseException):
+            raise options_result
+        if isinstance(oauth_result, BaseException):
+            logger.debug(
+                "[hermes_bridge] model.options oauth overlay skipped: %s",
+                type(oauth_result).__name__,
+            )
+            return options_result
+        if not isinstance(oauth_result, dict) or not isinstance(oauth_result.get("providers"), list):
+            logger.debug("[hermes_bridge] model.options oauth overlay skipped: malformed catalog")
+            return options_result
+        if not isinstance(options_result, dict) or not isinstance(options_result.get("providers"), list):
+            return options_result
+        stale_ids = set()
+        for entry in oauth_result["providers"]:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("flow") != "device_code":
+                continue
+            status = entry.get("status")
+            if not isinstance(status, dict) or status.get("logged_in") is not False:
+                continue
+            provider_id = entry.get("id")
+            if isinstance(provider_id, str):
+                stale_ids.add(provider_id)
+        for row in options_result["providers"]:
+            if not isinstance(row, dict):
+                continue
+            if row.get("authenticated") is not True:
+                continue
+            slug = row.get("slug")
+            if slug not in stale_ids:
+                continue
+            if row.get("free_tier_row"):
+                continue
+            row["authenticated"] = False
+            row["relogin_required"] = True
+            if not row.get("warning"):
+                row["warning"] = (
+                    f"{row.get('name') or slug} login expired. "
+                    f"Run `hermes auth add {slug}` on the laptop."
+                )
+        return options_result
 
     async def _rpc_usage_get(self, p: Dict[str, Any]) -> Any:
         days = p.get("days", 7)
