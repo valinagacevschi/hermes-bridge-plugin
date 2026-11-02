@@ -56,6 +56,7 @@ class OperationDispatcher:
     _HANDLER_NAMES = {
         "sessions.messages": "_rpc_sessions_messages",
         "sessions.fork": "_rpc_sessions_fork",
+        "sessions.continue": "_rpc_sessions_continue",
         "sessions.branch": "_rpc_sessions_branch",
         "sessions.list": "_rpc_sessions_list",
         "sessions.active": "_rpc_sessions_active",
@@ -73,6 +74,7 @@ class OperationDispatcher:
         "agent.status": "_rpc_agent_status",
         "agents.list": "_rpc_agents_list",
         "agent.set_model": "_rpc_agent_set_model",
+        "model.options": "_rpc_model_options",
         "usage.get": "_rpc_usage_get",
         "cron.notes": "_rpc_cron_notes",
         "cron.notes.capabilities": "_rpc_cron_notes_capabilities",
@@ -194,7 +196,6 @@ class OperationDispatcher:
         simple = {
             "skills.list": lambda p: profiled_get("/api/skills", p),
             "skills.hub.update": hub_update,
-            "model.options": lambda p: profiled_get("/api/model/options", p),
             "cron.list": lambda p: host._rpc_cron_list(p),
             "cron.pause": lambda p: host._rpc_cron_action(p, "pause"),
             "cron.resume": lambda p: host._rpc_cron_action(p, "resume"),

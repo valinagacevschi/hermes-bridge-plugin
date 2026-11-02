@@ -417,6 +417,62 @@ class LocalApi:
     async def get(self, path: str) -> Any:
         return await self.request(path, method="GET")
 
+    async def get_on_working_port(self, path: str) -> Any:
+        """GET ``path`` on the already-proven dashboard port only.
+
+        ``request``/``get`` treat 404 as "wrong service, keep probing" because
+        api_server on 8642 404s every ``/api/*`` route. That is correct for
+        discovery, but wrong for ``GET /api/sessions/{id}`` after a list has
+        already pinned the dashboard: a real dashboard 404 means the id is
+        unknown (new phone chat), not that we should clear ``self.port`` and
+        fall through to connection-refused noise on 9120/8642.
+
+        Returns None on 404 from the proven port without clearing the cache.
+        Other HTTP errors and connection failures re-raise (fail closed).
+        When no port is cached yet, fall back to ``get()`` to discover one,
+        then retry once on the discovered port.
+        """
+        if self.port is None:
+            try:
+                return await self.get(path)
+            except Exception:
+                if self.port is None:
+                    raise
+                # A non-404 answer pinned the port while raising; retry with
+                # authoritative single-port semantics below.
+
+        port = self.port
+        if port is None:
+            raise RuntimeError("no hermes api port reachable")
+
+        loop = asyncio.get_event_loop()
+        url = f"http://localhost:{port}{path}"
+        token = await self.token(port)
+
+        try:
+            return await loop.run_in_executor(None, _send, url, token, "GET", None)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return None
+            if exc.code == 401:
+                self._tokens.pop(port, None)
+                fresh = await self.token(port)
+                if fresh and fresh != token:
+                    try:
+                        return await loop.run_in_executor(
+                            None, _send, url, fresh, "GET", None
+                        )
+                    except urllib.error.HTTPError as exc2:
+                        if exc2.code == 404:
+                            return None
+                        raise
+                raise
+            raise
+        except Exception:
+            if self.port == port:
+                self.port = None
+            raise
+
     async def post(
         self, path: str, body: Optional[Dict[str, Any]] = None, method: str = "POST"
     ) -> Any:

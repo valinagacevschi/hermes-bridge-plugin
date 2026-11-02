@@ -22,6 +22,7 @@ from testutil import make_adapter as _make_adapter
 from hermes_bridge.adapter import _diff_new_pending, _project_session_messages
 from hermes_bridge.local_api import (
     API_SERVER_PORT,
+    LocalApi,
     discover_dashboard_ports,
 )
 
@@ -677,6 +678,42 @@ class TestHermesRequestPortSelection(unittest.IsolatedAsyncioTestCase):
                 await adapter._api.request("/api/sessions")
 
         assert adapter._api.port is None, "a 404 must not leave the wrong port pinned"
+
+    async def test_get_on_working_port_session_detail_404_keeps_proven_port(self):
+        """New phone chats 404 on GET /api/sessions/{id}; that must not clear
+        the dashboard port that just answered the sessions list, or probe
+        9120/8642 into ConnectionRefusedError / wrong-service noise."""
+        import urllib.error
+
+        api = LocalApi()
+        api.port = None
+        api._tokens = {9119: "tok"}
+        new_id = "20261027_094600_abcdef"
+        attempted = []
+
+        def fake_send(url, token, method, body):
+            attempted.append(url)
+            if ":9119" in url and f"/api/sessions/{new_id}" in url:
+                raise urllib.error.HTTPError(
+                    url, 404, "Not Found", None, __import__("io").BytesIO(b"")
+                )
+            if ":9119" in url and "/api/sessions" in url:
+                return {"sessions": [{"id": "other", "source": "hermes_bridge"}]}
+            raise ConnectionRefusedError(f"refused: {url}")
+
+        with patch(
+            "hermes_bridge.local_api.discover_dashboard_ports",
+            return_value=[],
+        ), patch(
+            "hermes_bridge.local_api._send", side_effect=fake_send
+        ), patch.object(api, "token", AsyncMock(return_value="tok")):
+            listed = await api.get("/api/sessions?limit=100")
+            detail = await api.get_on_working_port(f"/api/sessions/{new_id}")
+
+        assert listed["sessions"][0]["id"] == "other"
+        assert detail is None
+        assert api.port == 9119, f"proven dashboard port must stay pinned: {api.port}"
+        assert not any(":9120" in u or ":8642" in u for u in attempted), attempted
 
     async def test_api_port_override_is_tried_first(self):
         """psutil discovery is the only thing that finds a --port 0 dashboard.
