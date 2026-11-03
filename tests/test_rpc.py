@@ -1456,6 +1456,66 @@ class TestSessionHistoryPagination(unittest.IsolatedAsyncioTestCase):
             await self.adapter._rpc_sessions_delete({"id": "s", "core_profile": "work"})
         mock_request.assert_awaited_once_with("/api/sessions/s?profile=work", method="DELETE")
 
+    async def test_sessions_list_refuses_foreign_profile_rows(self):
+        from hermes_bridge.adapter import _RpcError
+
+        payload = {
+            "sessions": [
+                {"id": "e2e-1", "profile": "e2e", "is_default_profile": False},
+            ]
+        }
+        with patch.object(self.adapter, "_resolve_core_profile", AsyncMock(return_value=None)), patch.object(
+            self.adapter, "_own_core_profile_name", return_value="default"
+        ), patch.object(self.adapter._api, "get", AsyncMock(return_value=payload)):
+            with self.assertRaises(_RpcError) as caught:
+                await self.adapter._rpc_sessions_list({})
+        self.assertEqual(str(caught.exception), "profile_mismatch")
+
+    async def test_sessions_list_accepts_own_profile_rows(self):
+        payload = {
+            "sessions": [
+                {"id": "live-1", "profile": "default", "is_default_profile": True},
+            ]
+        }
+        with patch.object(self.adapter, "_resolve_core_profile", AsyncMock(return_value=None)), patch.object(
+            self.adapter, "_own_core_profile_name", return_value="default"
+        ), patch.object(self.adapter._api, "get", AsyncMock(return_value=payload)):
+            result = await self.adapter._rpc_sessions_list({})
+        self.assertEqual(result, {"sessions": payload["sessions"]})
+
+    async def test_sessions_list_expected_matches_resolved_core_profile(self):
+        from hermes_bridge.adapter import _RpcError
+
+        ok_payload = {
+            "sessions": [
+                {"id": "work-1", "profile": "work", "is_default_profile": False},
+            ]
+        }
+        bad_payload = {
+            "sessions": [
+                {"id": "default-1", "profile": "default", "is_default_profile": True},
+            ]
+        }
+        with patch.object(self.adapter, "_resolve_core_profile", AsyncMock(return_value="work")), patch.object(
+            self.adapter, "_own_core_profile_name", return_value="default"
+        ), patch.object(self.adapter._api, "get", AsyncMock(return_value=ok_payload)):
+            result = await self.adapter._rpc_sessions_list({"core_profile": "work"})
+        self.assertEqual(result, {"sessions": ok_payload["sessions"]})
+        with patch.object(self.adapter, "_resolve_core_profile", AsyncMock(return_value="work")), patch.object(
+            self.adapter, "_own_core_profile_name", return_value="default"
+        ), patch.object(self.adapter._api, "get", AsyncMock(return_value=bad_payload)):
+            with self.assertRaises(_RpcError) as caught:
+                await self.adapter._rpc_sessions_list({"core_profile": "work"})
+        self.assertEqual(str(caught.exception), "profile_mismatch")
+
+    async def test_sessions_list_allows_legacy_rows_without_profile(self):
+        payload = {"sessions": [{"id": "legacy-1", "title": "old"}]}
+        with patch.object(self.adapter, "_resolve_core_profile", AsyncMock(return_value=None)), patch.object(
+            self.adapter, "_own_core_profile_name", return_value="default"
+        ), patch.object(self.adapter._api, "get", AsyncMock(return_value=payload)):
+            result = await self.adapter._rpc_sessions_list({})
+        self.assertEqual(result, {"sessions": payload["sessions"]})
+
     async def test_messages_forwards_latest_page_parameters(self):
         response = {"messages": [], "pagination": {"returned": 0}}
         with patch.object(
