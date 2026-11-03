@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 # Ensure repo root is on the path; testutil stubs heavy deps on import.
@@ -320,6 +321,74 @@ class TestCronWriteMethods(unittest.IsolatedAsyncioTestCase):
         mock_post.assert_called_once_with("/api/cron/jobs/job-123/trigger?profile=default")
         assert len(frames) == 1
 
+    async def test_cron_cancel_calls_correct_path(self):
+        frames, mock_post = await self._run("cron.cancel", {"id": "job-run", "profile": "default"})
+        mock_post.assert_called_once_with("/api/cron/jobs/job-run/cancel?profile=default")
+        assert len(frames) == 1
+
+    async def test_cron_cancel_maps_missing_route_404_to_unsupported(self):
+        """Starlette's unmatched-route 404 (no cancel endpoint on old Hermes)."""
+        error = _http_error(404, "Not Found")
+        with patch.object(
+            self.adapter._api, "get", AsyncMock(return_value=[{"id": "job-run", "profile": "default"}])
+        ), patch.object(
+            self.adapter, "_send_rpc_response", AsyncMock()
+        ) as mock_response, patch.object(
+            self.adapter._api, "post", AsyncMock(side_effect=error)
+        ):
+            await self.adapter._handle_rpc(
+                _rpc_payload("cron.cancel", {"id": "job-run", "profile": "default"})
+            )
+        self.assertEqual(mock_response.await_args.kwargs["ok"], False)
+        self.assertEqual(mock_response.await_args.kwargs["error"], "unsupported")
+
+    async def test_cron_cancel_maps_405_to_unsupported(self):
+        error = _http_error(405, "Method Not Allowed")
+        with patch.object(
+            self.adapter._api, "get", AsyncMock(return_value=[{"id": "job-run", "profile": "default"}])
+        ), patch.object(
+            self.adapter, "_send_rpc_response", AsyncMock()
+        ) as mock_response, patch.object(
+            self.adapter._api, "post", AsyncMock(side_effect=error)
+        ):
+            await self.adapter._handle_rpc(
+                _rpc_payload("cron.cancel", {"id": "job-run", "profile": "default"})
+            )
+        self.assertEqual(mock_response.await_args.kwargs["ok"], False)
+        self.assertEqual(mock_response.await_args.kwargs["error"], "unsupported")
+
+    async def test_cron_cancel_keeps_job_not_found_404(self):
+        """Hermes >=0.22.6 cancel route returns Job not found for an unknown id."""
+        error = _http_error(404, "Job not found")
+        with patch.object(
+            self.adapter._api, "get", AsyncMock(return_value=[{"id": "job-run", "profile": "default"}])
+        ), patch.object(
+            self.adapter, "_send_rpc_response", AsyncMock()
+        ) as mock_response, patch.object(
+            self.adapter._api, "post", AsyncMock(side_effect=error)
+        ):
+            await self.adapter._handle_rpc(
+                _rpc_payload("cron.cancel", {"id": "job-run", "profile": "default"})
+            )
+        self.assertEqual(mock_response.await_args.kwargs["ok"], False)
+        self.assertEqual(mock_response.await_args.kwargs["error"], "Job not found")
+
+    async def test_cron_pause_404_still_surfaces_detail(self):
+        """Non-cancel actions keep FastAPI detail — only cancel remaps missing-route 404/405."""
+        error = _http_error(404, "Job not found")
+        with patch.object(
+            self.adapter._api, "get", AsyncMock(return_value=[{"id": "job-abc", "profile": "default"}])
+        ), patch.object(
+            self.adapter, "_send_rpc_response", AsyncMock()
+        ) as mock_response, patch.object(
+            self.adapter._api, "post", AsyncMock(side_effect=error)
+        ):
+            await self.adapter._handle_rpc(
+                _rpc_payload("cron.pause", {"id": "job-abc", "profile": "default"})
+            )
+        self.assertEqual(mock_response.await_args.kwargs["ok"], False)
+        self.assertIn("Job not found", mock_response.await_args.kwargs["error"])
+
     async def test_cron_delete_calls_correct_path_and_method(self):
         """DELETE on the bare job resource (#46) — not a pause/resume/trigger-
         style POST to an action sub-path, since upstream's real route is
@@ -544,6 +613,27 @@ class TestCronCreateEdit(unittest.IsolatedAsyncioTestCase):
         )
         assert len(self.sent_frames) == 1
 
+    async def test_edit_passes_catch_up_true_false_and_null(self):
+        with patch.object(
+            self.adapter._api, "get", AsyncMock(return_value=[{"id": "job-1", "profile": "default"}])
+        ), patch.object(
+            self.adapter._api, "post", AsyncMock(return_value={"id": "job-1"})
+        ) as mock_post:
+            for rpc_id, value in (("cu-true", True), ("cu-false", False), ("cu-null", None)):
+                await self.adapter._handle_rpc(
+                    _rpc_payload(
+                        "cron.edit",
+                        {"id": "job-1", "profile": "default", "catch_up": value},
+                        rpc_id=rpc_id,
+                    )
+                )
+        bodies = [call.kwargs["body"]["updates"] for call in mock_post.await_args_list]
+        self.assertEqual(bodies, [
+            {"catch_up": True},
+            {"catch_up": False},
+            {"catch_up": None},
+        ])
+
     async def test_edit_schedule_parse_error_surfaces_detail(self):
         error = _http_error(400, "Could not parse schedule: 'nonsense'")
         with patch.object(
@@ -702,8 +792,8 @@ class TestHermesRequestPortSelection(unittest.IsolatedAsyncioTestCase):
             raise ConnectionRefusedError(f"refused: {url}")
 
         with patch(
-            "hermes_bridge.local_api.discover_dashboard_ports",
-            return_value=[],
+            "hermes_bridge.local_api._scan_dashboards",
+            return_value={},
         ), patch(
             "hermes_bridge.local_api._send", side_effect=fake_send
         ), patch.object(api, "token", AsyncMock(return_value="tok")):
@@ -724,8 +814,8 @@ class TestHermesRequestPortSelection(unittest.IsolatedAsyncioTestCase):
         adapter._api.port = 9120  # a stale pin must not outrank it
 
         with patch.dict(os.environ, {"HERMES_BRIDGE_API_PORT": "51234"}), patch(
-            "hermes_bridge.local_api.discover_dashboard_ports",
-            return_value=[],
+            "hermes_bridge.local_api._scan_dashboards",
+            return_value={},
         ):
             ports = adapter._api.ports_to_probe()
 
@@ -742,8 +832,8 @@ class TestHermesRequestPortSelection(unittest.IsolatedAsyncioTestCase):
         "this is the working port", which is the bug this class covers."""
         adapter = _make_adapter()
         with patch(
-            "hermes_bridge.local_api.discover_dashboard_ports",
-            return_value=[],
+            "hermes_bridge.local_api._scan_dashboards",
+            return_value={},
         ):
             probe = adapter._api.ports_to_probe()
             dashboard_only = adapter._api.dashboard_candidates()
@@ -754,6 +844,93 @@ class TestHermesRequestPortSelection(unittest.IsolatedAsyncioTestCase):
         # anywhere: a listener there must never read as "the Agent screen's API
         # is up", so `listening()`/`_ensure()` walk the dashboard list only.
         assert API_SERVER_PORT not in dashboard_only
+
+
+class TestUnknownSessionApi(unittest.IsolatedAsyncioTestCase):
+    async def test_discovery_keeps_only_this_gateways_profile(self):
+        """Foreign-profile dashboards are never candidates — even as fallbacks."""
+        for flags in (
+            ["-p", "e2e", "dashboard", "--isolated"],
+            ["--profile=x", "serve"],
+            ["--profile", "x", "serve"],
+        ):
+            with self.subTest(flags=flags):
+                processes = []
+                for argv, port in ((flags, 9129), (["dashboard"], 9119)):
+                    proc = MagicMock()
+                    proc.info = {"pid": port, "cmdline": ["hermes", *argv, "--port", str(port)]}
+                    conn = MagicMock()
+                    conn.status = "LISTEN"
+                    conn.laddr.port = port
+                    proc.net_connections.return_value = [conn]
+                    processes.append(proc)
+                psutil = MagicMock()
+                psutil.process_iter.return_value = processes
+                psutil.NoSuchProcess = psutil.AccessDenied = _NeverRaised
+                with patch.dict("sys.modules", {"psutil": psutil}), patch.dict(
+                    os.environ, {"HERMES_HOME": str(Path.home() / ".hermes")}, clear=False
+                ):
+                    self.assertEqual(discover_dashboard_ports(), [9119])
+
+    async def test_request_preserves_first_dashboard_404(self):
+        import urllib.error
+
+        api = LocalApi()
+        first = _http_error(404, "unknown session")
+        attempted = []
+
+        def send(url, token, method, body):
+            attempted.append(url)
+            if ":9119" in url:
+                raise first
+            raise urllib.error.URLError(ConnectionRefusedError("refused"))
+
+        with patch.object(api, "ports_to_probe", return_value=[9119, 9129, 9120, API_SERVER_PORT]), patch.object(
+            api, "token", AsyncMock(return_value="tok")
+        ), patch("hermes_bridge.local_api._send", side_effect=send):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                await api.request("/api/sessions/missing/messages")
+        self.assertIs(caught.exception, first)
+        self.assertEqual(len(attempted), 4)
+
+    async def test_uncached_working_port_404_returns_none(self):
+        api = LocalApi()
+        with patch.object(api, "get", AsyncMock(side_effect=_http_error(404, "missing"))):
+            self.assertIsNone(await api.get_on_working_port("/api/sessions/missing/messages"))
+
+    async def test_missing_session_rpcs_keep_proven_port(self):
+        for method, params in (
+            ("sessions.messages", {"id": "missing"}),
+            ("sessions.messages", {"id": "missing", "limit": 0}),
+            ("sessions.messages", {"id": "missing", "limit": 20}),
+            ("sessions.export", {"id": "missing"}),
+            ("sessions.branch", {"id": "missing", "through_message_id": "1"}),
+        ):
+            with self.subTest(method=method, params=params):
+                adapter = _make_adapter()
+                adapter._api.port = 9119
+                attempted = []
+
+                def send(url, token, method, body):
+                    attempted.append(url)
+                    if ":9119" not in url:
+                        raise ConnectionRefusedError("refused")
+                    if "/api/sessions?" in url:
+                        return {"sessions": []}
+                    raise _http_error(404, "missing")
+
+                with patch.object(adapter, "_gateway_session_id", AsyncMock(return_value="missing")), patch.object(
+                    adapter, "_resolve_core_profile", AsyncMock(return_value=None)
+                ), patch.object(adapter._api, "token", AsyncMock(return_value="tok")), patch.object(
+                    adapter._api, "ports_to_probe", return_value=[9119, 9120, API_SERVER_PORT]
+                ), patch("hermes_bridge.local_api._send", side_effect=send), patch.object(
+                    adapter, "_send_rpc_response", AsyncMock()
+                ) as response:
+                    await adapter._handle_rpc(_rpc_payload(method, params))
+                self.assertFalse(response.call_args.kwargs["ok"])
+                self.assertEqual(response.call_args.kwargs["error"], "session_not_found")
+                self.assertEqual(adapter._api.port, 9119)
+                self.assertTrue(all(":9119" in url for url in attempted))
 
 
 class TestLocalApiAutostart(unittest.IsolatedAsyncioTestCase):
@@ -858,7 +1035,7 @@ class TestHermesSessionTokenIsPerPort(unittest.IsolatedAsyncioTestCase):
     """(#64) The dashboard mints its session token per process
     (secrets.token_urlsafe(32) in hermes_cli/web_server.py), so a token scraped
     from one dashboard is invalid on another. The cache must be keyed by port --
-    discover_dashboard_ports() deliberately returns several (main + per-profile).
+    discovery can still return more than one port for this profile.
     """
 
     async def test_token_cached_for_one_port_is_not_reused_for_another(self):

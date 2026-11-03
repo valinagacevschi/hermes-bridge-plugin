@@ -63,39 +63,83 @@ _CONNECT_TIMEOUT_S = 0.3
 _SUPERVISE_INTERVAL_S = 30.0
 
 
-def discover_dashboard_ports() -> List[int]:
-    """Return listening ports of running dashboard/serve processes via psutil.
+def gateway_profile_name(hermes_home: Optional[str] = None) -> str:
+    """Profile id for this gateway process, derived from ``HERMES_HOME``.
 
-    Priority:
-      1. Main dashboard (no --profile flag) — matches this adapter's context.
-      2. Any other dashboard processes (profile-specific) as fallbacks.
+    ``~/.hermes`` (or any home that is not ``…/profiles/<name>``) is ``"default"``.
+    A named profile's home is ``~/.hermes/profiles/<name>`` → ``"<name>"``.
 
-    Returns empty list if psutil is unavailable or nothing is running.
+    Kept as a local helper (stdlib only) so this module stays importable from
+    ``pair.py`` without pulling Hermes core — same shape as
+    ``hermes_constants.profile_name_for_home`` for the common cases.
     """
+    raw = hermes_home if hermes_home is not None else (os.getenv("HERMES_HOME") or "")
+    home = Path(raw.strip() or (Path.home() / ".hermes")).expanduser()
+    if home.parent.name == "profiles" and home.name and not home.name.startswith("."):
+        return home.name
+    return "default"
+
+
+def dashboard_argv_profile(cmdline: List[str]) -> str:
+    """Profile a ``hermes dashboard`` / ``hermes serve`` argv belongs to.
+
+    No ``-p`` / ``--profile`` flag → ``"default"``. ``--isolated`` alone does
+    not rename the profile; it only marks the process private to whatever
+    profile the flags name.
+    """
+    for i, arg in enumerate(cmdline):
+        if arg in ("-p", "--profile") and i + 1 < len(cmdline):
+            name = cmdline[i + 1].strip()
+            return name or "default"
+        if arg.startswith("--profile="):
+            name = arg.split("=", 1)[1].strip()
+            return name or "default"
+    return "default"
+
+
+def _is_hermes_dashboard_cmd(cmd: List[str]) -> bool:
+    """True when argv is a hermes dashboard/serve process (not a path decoy)."""
+    if not any("hermes" in arg for arg in cmd):
+        return False
+    # `serve` counts as well as `dashboard`: it is the same backend with the
+    # SPA switched off, serving the same /api/* routes, and it is what the
+    # Desktop app (and _ensure below) spawns.
+    #
+    # Matched as a whole argv token, not a substring of the joined command
+    # line: "serve" is common in filesystem paths (/Users/x/servers/...) and
+    # a false positive puts a wrong port AHEAD of the defaults in the probe
+    # order.
+    return any(arg in ("dashboard", "serve") for arg in cmd)
+
+
+def _psutil_or_none():
     try:
         import psutil  # optional — available in the Hermes venv
-    except ImportError:
-        return []
 
-    main_ports: List[int] = []
-    profile_ports: List[int] = []
+        return psutil
+    except ImportError:
+        return None
+
+
+def _scan_dashboards() -> Dict[int, str]:
+    """One psutil pass: listening port → argv profile for hermes dashboard/serve.
+
+    Callers (``dashboard_candidates``, ``listening``, ``discover_dashboard_ports``)
+    must reuse this map instead of scanning again — each ``process_iter`` +
+    ``net_connections`` pass is tens of milliseconds on a busy laptop, and
+    every Agent-tab RPC used to pay for several of them on the event loop.
+    """
+    psutil = _psutil_or_none()
+    if psutil is None:
+        return {}
+    owners: Dict[int, str] = {}
     try:
         for proc in psutil.process_iter(["pid", "cmdline"]):
             try:
                 cmd: List[str] = proc.info.get("cmdline") or []
-                if not any("hermes" in arg for arg in cmd):
+                if not _is_hermes_dashboard_cmd(cmd):
                     continue
-                # `serve` counts as well as `dashboard`: it is the same backend
-                # with the SPA switched off, serving the same /api/* routes,
-                # and it is what the Desktop app (and _ensure below) spawns.
-                #
-                # Matched as a whole argv token, not a substring of the joined
-                # command line: "serve" is common in filesystem paths
-                # (/Users/x/servers/...) and a false positive puts a wrong port
-                # AHEAD of the defaults in the probe order.
-                if not any(arg in ("dashboard", "serve") for arg in cmd):
-                    continue
-                is_profile = "--profile" in cmd
+                profile = dashboard_argv_profile(cmd)
                 # `Process.connections` is a deprecated shim for
                 # `net_connections` in psutil 6+ (core pins 7.2.2) and is
                 # slated for removal — when it goes, the AttributeError would
@@ -103,16 +147,27 @@ def discover_dashboard_ports() -> List[int]:
                 list_conns = getattr(proc, "net_connections", None) or proc.connections
                 for conn in list_conns("inet"):
                     if conn.status == "LISTEN":
-                        port = conn.laddr.port
-                        if is_profile:
-                            profile_ports.append(port)
-                        else:
-                            main_ports.append(port)
+                        owners[conn.laddr.port] = profile
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
     except Exception as exc:
-        logger.debug("[hermes_bridge] psutil discovery failed: %s", exc)
-    return main_ports + profile_ports
+        logger.debug("[hermes_bridge] psutil dashboard scan failed: %s", exc)
+    return owners
+
+
+def discover_dashboard_ports() -> List[int]:
+    """Listening ports of dashboard/serve processes for *this* gateway profile.
+
+    A bridge must never discover another profile's dashboard (that was the
+    path from a dead default :9119 to the e2e isolated :9129 and the
+    resulting ``profile_mismatch`` errors). Profile identity comes from
+    ``gateway_profile_name()`` / ``HERMES_HOME``; dashboard argv profile from
+    ``-p`` / ``--profile``.
+
+    Returns empty list if psutil is unavailable or nothing matching is running.
+    """
+    own = gateway_profile_name()
+    return [port for port, profile in _scan_dashboards().items() if profile == own]
 
 
 def _dedupe(ports: List[int]) -> List[int]:
@@ -130,54 +185,105 @@ class LocalApi:
 
     def __init__(self) -> None:
         #: Port that last answered. Cached so a request skips the probe loop,
-        #: cleared whenever that port stops behaving like the right service.
+        #: cleared whenever that port stops behaving like the right service
+        #: (gone, or identified as another profile's dashboard).
         self.port: Optional[int] = None
         #: Session tokens BY PORT: the dashboard mints one per process
         #: (`secrets.token_urlsafe(32)` in hermes_cli/web_server.py), so a
-        #: token scraped from one is invalid on another — and
-        #: discover_dashboard_ports() deliberately returns several.
+        #: token scraped from one is invalid on another — and discovery can
+        #: still return more than one port for *this* profile (e.g. serve +
+        #: an operator dashboard).
         self._tokens: Dict[int, str] = {}
         #: The backend this object started, if it had to. None when an
         #: operator runs their own.
         self._proc: Optional[subprocess.Popen] = None
         self._supervisor: Optional[asyncio.Task] = None
 
+    def drop_port_cache(self, port: Optional[int] = None) -> None:
+        """Forget a cached port (and its token) so the next call re-discovers.
+
+        Used when the cached port or the local ws door pointed at a dashboard
+        that is gone or belongs to another profile.
+        """
+        target = self.port if port is None else port
+        if target is None:
+            return
+        if self.port == target:
+            self.port = None
+        self._tokens.pop(target, None)
+
+    def _candidates_from_scan(self, owners: Dict[int, str]) -> List[int]:
+        """Build the candidate list from one ``_scan_dashboards()`` map."""
+        own = gateway_profile_name()
+        if self.port is not None:
+            owner = owners.get(self.port)
+            if owner is not None and owner != own:
+                self.drop_port_cache(self.port)
+
+        override = os.getenv("HERMES_BRIDGE_API_PORT", "").strip()
+        candidates: List[int] = [int(override)] if override.isdigit() else []
+        if self.port is not None:
+            candidates.append(self.port)
+
+        discovered = [port for port, profile in owners.items() if profile == own]
+        static: List[int] = []
+        for port in DASHBOARD_PORTS:
+            owner = owners.get(port)
+            if owner is not None and owner != own:
+                continue
+            static.append(port)
+        return _dedupe(candidates + discovered + static)
+
     # ── where it listens ────────────────────────────────────────────────
 
     def dashboard_candidates(self) -> List[int]:
-        """Ports that might serve ``/api/*``, in priority order.
+        """Ports that might serve ``/api/*`` for *this* profile, in priority order.
 
         0. HERMES_BRIDGE_API_PORT — escape hatch for a dashboard psutil
            discovery cannot see (psutil missing, AccessDenied, or a command
            line that looks like neither `dashboard` nor `serve`). Without it,
            such a user gets `hermes_offline` on every Agent tab from a
            dashboard that is in fact running, with nothing to change.
-        1. Cached known-good port (fast path, avoids re-probing).
-        2. Live psutil discovery (handles --port 0 / auto-assigned ports).
-        3. Static defaults.
+        1. Cached known-good port (fast path, avoids re-probing) — dropped
+           when that port is gone from discovery's view as foreign.
+        2. Live psutil discovery for this profile only (handles --port 0).
+        3. Static defaults, skipping any port psutil identifies as another
+           profile's dashboard.
+
+        Runs a single psutil process scan; foreign/cache/static checks all
+        read that map.
         """
-        override = os.getenv("HERMES_BRIDGE_API_PORT", "").strip()
-        candidates: List[int] = [int(override)] if override.isdigit() else []
-        if self.port is not None:
-            candidates.append(self.port)
-        return _dedupe(candidates + discover_dashboard_ports() + list(DASHBOARD_PORTS))
+        return self._candidates_from_scan(_scan_dashboards())
 
     def ports_to_probe(self) -> List[int]:
         """Candidates for a request — the dashboard's, plus api_server's."""
         return _dedupe(self.dashboard_candidates() + [API_SERVER_PORT])
 
     def listening(self) -> Optional[int]:
-        """First dashboard port accepting a connection, or None. Blocking.
+        """First *own-profile* dashboard port accepting a connection, or None.
 
         Deliberately not ports_to_probe(): a listener on api_server's 8642
         serves `/v1/*` and none of the routes the Agent screen needs, so it
-        must not read as "the API is up".
+        must not read as "the API is up". Foreign-profile listeners are
+        skipped even if they accept TCP; a dead/foreign cached port is
+        dropped so the next call re-discovers (and ``_ensure`` can spawn).
+
+        Reuses one ``_scan_dashboards()`` map for candidates and ownership.
         """
-        for port in self.dashboard_candidates():
+        owners = _scan_dashboards()
+        own = gateway_profile_name()
+        for port in self._candidates_from_scan(owners):
             try:
                 with socket.create_connection(("127.0.0.1", port), timeout=_CONNECT_TIMEOUT_S):
+                    owner = owners.get(port)
+                    if owner is not None and owner != own:
+                        if port == self.port:
+                            self.drop_port_cache(port)
+                        continue
                     return port
             except OSError:
+                if port == self.port:
+                    self.drop_port_cache(port)
                 continue
         return None
 
@@ -226,8 +332,10 @@ class LocalApi:
         (`web_server._start_parent_death_watchdog`) so the backend exits when
         this gateway does — no service file, no orphan.
 
-        A no-op while something answers, so an operator's own dashboard keeps
-        serving. `HERMES_BRIDGE_START_API=0` opts out entirely.
+        A no-op while something *for this profile* answers, so an operator's
+        own dashboard keeps serving and a foreign-profile dashboard never
+        blocks `_ensure` from starting ours. `HERMES_BRIDGE_START_API=0`
+        opts out entirely.
         """
         if os.getenv("HERMES_BRIDGE_START_API", "1").strip().lower() in ("0", "false", "no"):
             return
@@ -349,6 +457,7 @@ class LocalApi:
             else None
         )
         last_exc: Optional[Exception] = None
+        dashboard_404: Optional[urllib.error.HTTPError] = None
 
         for port in self.ports_to_probe():
             url = f"http://localhost:{port}{path}"
@@ -378,6 +487,9 @@ class LocalApi:
                     # this adapter to the api_server platform on 8642 and made
                     # every Agent-tab RPC fail with a 404 that looked like a
                     # real answer (issue 64). Keep probing instead.
+                    # Preserve an unknown-session response if no candidate succeeds.
+                    if port != API_SERVER_PORT and dashboard_404 is None:
+                        dashboard_404 = exc
                     last_exc = exc
                     if port == self.port:
                         self.port = None
@@ -412,7 +524,7 @@ class LocalApi:
                 if port == self.port:
                     self.port = None
 
-        raise last_exc or RuntimeError("no hermes api port reachable")
+        raise dashboard_404 or last_exc or RuntimeError("no hermes api port reachable")
 
     async def get(self, path: str) -> Any:
         return await self.request(path, method="GET")
@@ -427,7 +539,8 @@ class LocalApi:
         unknown (new phone chat), not that we should clear ``self.port`` and
         fall through to connection-refused noise on 9120/8642.
 
-        Returns None on 404 from the proven port without clearing the cache.
+        Returns None on 404 from the proven port without clearing the cache,
+        or on a dashboard 404 after discovery exhausts its candidates.
         Other HTTP errors and connection failures re-raise (fail closed).
         When no port is cached yet, fall back to ``get()`` to discover one,
         then retry once on the discovered port.
@@ -435,7 +548,9 @@ class LocalApi:
         if self.port is None:
             try:
                 return await self.get(path)
-            except Exception:
+            except Exception as exc:
+                if isinstance(exc, urllib.error.HTTPError) and exc.code == 404:
+                    return None
                 if self.port is None:
                     raise
                 # A non-404 answer pinned the port while raising; retry with

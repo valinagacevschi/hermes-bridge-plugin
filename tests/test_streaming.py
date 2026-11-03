@@ -10,6 +10,7 @@ Run:
 or with any Python ≥3.8 that has websockets + PyNaCl installed.
 """
 
+import asyncio
 import os
 import sys
 import unittest
@@ -248,7 +249,9 @@ class TestEditMessage(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["msg_id"], "msg-abc")
         self.assertTrue(payload["edit"])
         self.assertNotIn("final", payload)
-        self.assertEqual(payload["content"], "Hello wor")
+        self.assertNotIn("content", payload)
+        self.assertEqual(payload["keep"], 0)
+        self.assertEqual(payload["append"], "Hello wor")
 
     async def test_finalize_edit_enqueues_durably(self):
         self.adapter._stream_pending.add("msg-abc")
@@ -269,17 +272,24 @@ class TestEditMessage(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["content"], "Hello world!")
 
     async def test_edit_content_replaces_not_appends(self):
-        """Each edit call carries the FULL accumulated text — verifies the
-        adapter doesn't try to diff/append (that's the gateway's job)."""
+        """Delta ticks reconstruct the full replacement text before final."""
         sent_frames = []
         self.adapter._stream_pending.add("msg-1")
         self.adapter._ws.send = AsyncMock(side_effect=lambda f: sent_frames.append(f))
-        with patch.object(self.adapter, "_enqueue_durable", AsyncMock()):
+        with (
+            patch.object(self.adapter, "_enqueue_durable", AsyncMock()),
+            patch("hermes_bridge.adapter._LIVE_EDIT_INTERVAL_S", 0),
+        ):
             await self.adapter.edit_message("chat-1", "msg-1", "Hi")
             await self.adapter.edit_message("chat-1", "msg-1", "Hi there")
             await self.adapter.edit_message("chat-1", "msg-1", "Hi there!", finalize=True)
 
-        contents = [_open(f)["content"] for f in sent_frames]
+        contents = []
+        text = ""
+        for frame in sent_frames:
+            payload = _open(frame)
+            text = payload["content"] if "content" in payload else text[:payload["keep"]] + payload["append"]
+            contents.append(text)
         self.assertEqual(contents, ["Hi", "Hi there", "Hi there!"])
 
     async def test_edit_without_connection_fails(self):
@@ -452,6 +462,173 @@ class TestStreamDiesBeforeFinalize(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.enqueued), 2)
         self.assertEqual(_open(self.enqueued[0][1])["content"], "all done")
         self.assertEqual(_open(self.enqueued[1][1])["replaces"], msg_id)
+
+
+
+
+class TestCoalescedDeltas(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.adapter = _make_adapter()
+        self.frames = []
+        self.adapter._ws.send = AsyncMock(side_effect=lambda frame: self.frames.append(_open(frame)))
+        self.adapter._enqueue_durable = AsyncMock()
+        self.interval = patch("hermes_bridge.adapter._LIVE_EDIT_INTERVAL_S", 0.03)
+        self.interval.start()
+        self.addCleanup(self.interval.stop)
+        seed = await self.adapter.send("chat", "Hel ▉", metadata={"expect_edits": True})
+        self.msg_id = seed.message_id
+
+    async def test_burst_flushes_latest_and_snapshot_excludes_stash(self):
+        for i in range(10):
+            result = await self.adapter.edit_message("chat", self.msg_id, f"Hello {i} ▉")
+            self.assertTrue(result.success)
+            self.assertEqual(result.message_id, self.msg_id)
+        self.assertEqual(len(self.frames), 1)
+        self.assertEqual(await self.adapter._rpc_stream_snapshot({"msg_id": self.msg_id}), {"text": "Hel ▉", "rev": 0})
+        await asyncio.sleep(0.06)
+        self.assertEqual(len(self.frames), 2)
+        text = self.frames[0]["content"]
+        for rev, frame in enumerate(self.frames[1:], 1):
+            self.assertNotIn("content", frame)
+            self.assertEqual(frame["rev"], rev)
+            text = text.encode("utf-16-le")[:frame["keep"] * 2].decode("utf-16-le") + frame["append"]
+        self.assertEqual(text, "Hello 9 ▉")
+        self.assertEqual(self.frames[1]["keep"], 3)
+        self.assertEqual(self.frames[1]["append"], "lo 9 ▉")
+
+    async def test_finalize_cancels_flush(self):
+        await self.adapter.edit_message("chat", self.msg_id, "first")
+        await self.adapter.edit_message("chat", self.msg_id, "stash")
+        await self.adapter.edit_message("chat", self.msg_id, "complete", finalize=True)
+        self.assertEqual(self.frames[-1]["content"], "complete")
+        self.adapter._enqueue_durable.assert_awaited_once()
+        await asyncio.sleep(0.06)
+        self.assertEqual(len(self.frames), 2)
+        self.assertEqual(await self.adapter._rpc_stream_snapshot({"msg_id": self.msg_id}), {"done": True})
+        self.assertEqual(await self.adapter._rpc_stream_snapshot({"msg_id": "unknown"}), {"done": True})
+
+    async def test_failed_trailing_send_defers_persistence_to_next_edit(self):
+        await self.adapter.edit_message("chat", self.msg_id, "first")
+        await self.adapter.edit_message("chat", self.msg_id, "stash")
+        self.adapter._ws.send = AsyncMock(side_effect=_Closed())
+        with patch("hermes_bridge.adapter.ConnectionClosed", _Closed):
+            await asyncio.sleep(0.06)
+            self.adapter._enqueue_durable.assert_not_awaited()
+            result = await self.adapter.edit_message("chat", self.msg_id, "current")
+        self.assertFalse(result.success)
+        self.adapter._enqueue_durable.assert_awaited_once()
+        self.assertEqual(_open(self.adapter._enqueue_durable.call_args.args[1])["content"], "current")
+
+    async def test_no_socket_bypasses_stash_and_persists_current_text(self):
+        await self.adapter.edit_message("chat", self.msg_id, "first")
+        await self.adapter.edit_message("chat", self.msg_id, "stash")
+        self.adapter._ws = None
+        result = await self.adapter.edit_message("chat", self.msg_id, "current without socket")
+        self.assertFalse(result.success)
+        self.adapter._enqueue_durable.assert_awaited_once()
+        payload = _open(self.adapter._enqueue_durable.call_args.args[1])
+        self.assertEqual(payload["content"], "current without socket")
+        self.assertTrue(payload["final"])
+        self.assertNotIn("keep", payload)
+        self.assertNotIn("append", payload)
+        await asyncio.sleep(0.06)
+        self.assertEqual(len(self.frames), 1)
+        self.assertEqual(await self.adapter._rpc_stream_snapshot({"msg_id": self.msg_id}), {"done": True})
+
+    async def test_utf16_prefix_and_revisions(self):
+        with patch("hermes_bridge.adapter._LIVE_EDIT_INTERVAL_S", 0):
+            for text in ["Hello wo ▉", "Hi 😀 one", "Hi 😀 two", "Hi 😁 three"]:
+                await self.adapter.edit_message("chat", self.msg_id, text)
+        self.assertEqual([frame["rev"] for frame in self.frames], [0, 1, 2, 3, 4])
+        self.assertEqual(self.frames[1]["keep"], 3)
+        self.assertEqual(self.frames[1]["append"], "lo wo ▉")
+        self.assertEqual(self.frames[3]["keep"], 6)
+        self.assertEqual(self.frames[3]["append"], "two")
+        self.assertEqual(self.frames[4]["keep"], 3)
+
+    async def test_seed_coalesces_the_first_edit(self):
+        result = await self.adapter.edit_message("chat", self.msg_id, "Hello first edit")
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, self.msg_id)
+        self.assertEqual(len(self.frames), 1)
+        await asyncio.sleep(0.06)
+        self.assertEqual(len(self.frames), 2)
+        tick = self.frames[1]
+        text = self.frames[0]["content"]
+        reconstructed = text.encode("utf-16-le")[:tick["keep"] * 2].decode("utf-16-le") + tick["append"]
+        self.assertEqual(reconstructed, "Hello first edit")
+        self.assertEqual(tick["rev"], 1)
+
+    async def test_blocked_trailing_send_reserves_revision_before_consumer_edit(self):
+        self.adapter._stream_last_live[self.msg_id] = 0
+        await self.adapter.edit_message("chat", self.msg_id, "Hello 😀 base")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_send(frame):
+            payload = _open(frame)
+            self.frames.append(payload)
+            if not entered.is_set():
+                entered.set()
+                await release.wait()
+
+        self.adapter._ws.send = AsyncMock(side_effect=blocked_send)
+        await self.adapter.edit_message("chat", self.msg_id, "Hello 😀 first")
+        flush = self.adapter._stream_flush[self.msg_id]
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            await asyncio.sleep(0.06)
+            await self.adapter.edit_message("chat", self.msg_id, "Hello 😀 second")
+        finally:
+            release.set()
+            await asyncio.wait_for(flush, 1)
+        self.assertEqual([frame["rev"] for frame in self.frames], [0, 1, 2, 3])
+        text = self.frames[0]["content"]
+        for frame in self.frames[1:]:
+            text = text.encode("utf-16-le")[:frame["keep"] * 2].decode("utf-16-le") + frame["append"]
+        self.assertEqual(text, "Hello 😀 second")
+        self.assertEqual(await self.adapter._rpc_stream_snapshot({"msg_id": self.msg_id}), {"text": text, "rev": 3})
+
+    async def test_finalize_does_not_cancel_a_trailing_send_in_progress(self):
+        self.adapter._stream_last_live[self.msg_id] = 0
+        await self.adapter.edit_message("chat", self.msg_id, "first")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        trailing_finished = asyncio.Event()
+
+        async def blocked_send(frame):
+            payload = _open(frame)
+            if payload.get("final"):
+                await trailing_finished.wait()
+                self.frames.append(payload)
+            else:
+                entered.set()
+                try:
+                    await release.wait()
+                    self.frames.append(payload)
+                finally:
+                    trailing_finished.set()
+
+        self.adapter._ws.send = AsyncMock(side_effect=blocked_send)
+        await self.adapter.edit_message("chat", self.msg_id, "trailing")
+        flush = self.adapter._stream_flush[self.msg_id]
+        await asyncio.wait_for(entered.wait(), 1)
+        final = asyncio.create_task(self.adapter.edit_message("chat", self.msg_id, "complete", finalize=True))
+        try:
+            await asyncio.sleep(0)
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.gather(flush, final), 1)
+        self.assertEqual(len(self.frames), 4)
+        self.assertEqual(self.frames[-2]["append"], "trailing")
+        self.assertEqual(self.frames[-2]["rev"], 2)
+        self.assertEqual(self.frames[-1]["content"], "complete")
+        self.assertTrue(self.frames[-1]["final"])
+        self.adapter._enqueue_durable.assert_awaited_once()
+
+    async def test_snapshot_rpc_registered(self):
+        from hermes_bridge.operation_dispatch import OperationDispatcher
+        self.assertEqual(OperationDispatcher._HANDLER_NAMES["stream.snapshot"], "_rpc_stream_snapshot")
 
 
 if __name__ == "__main__":
