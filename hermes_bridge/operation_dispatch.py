@@ -104,6 +104,7 @@ class OperationDispatcher:
         "skills.reject": "_rpc_skills_pending_reject",
         "skills.diff": "_rpc_skills_pending_diff",
         "chat.stop": "_rpc_chat_stop",
+        "stream.snapshot": "_rpc_stream_snapshot",
         "bots.list": "_rpc_bots_list",
         "profiles.list": "_rpc_profiles_list",
         "bots.capabilities": "_rpc_bots_capabilities",
@@ -189,17 +190,30 @@ class OperationDispatcher:
         async def profiled_get(path: str, p: Dict[str, Any]) -> Any:
             return await host._api.get(await host._profiled_url(path, p))
 
+        async def plugin_commands(_params: Dict[str, Any]) -> Any:
+            try:
+                from hermes_cli.plugins import get_plugin_commands
+            except ImportError:
+                return {"commands": []}
+            return {"commands": [
+                {"name": name, "description": command.get("description") or "",
+                 "args_hint": command.get("args_hint") or ""}
+                for name, command in (get_plugin_commands() or {}).items()
+            ]}
+
         async def hub_update(p: Dict[str, Any]) -> Any:
             body = await host._profile_body(p)
             return await host._api.post("/api/skills/hub/update", body=body)
 
         simple = {
+            "commands.plugins": plugin_commands,
             "skills.list": lambda p: profiled_get("/api/skills", p),
             "skills.hub.update": hub_update,
             "cron.list": lambda p: host._rpc_cron_list(p),
             "cron.pause": lambda p: host._rpc_cron_action(p, "pause"),
             "cron.resume": lambda p: host._rpc_cron_action(p, "resume"),
             "cron.trigger": lambda p: host._rpc_cron_action(p, "trigger"),
+            "cron.cancel": lambda p: host._rpc_cron_action(p, "cancel"),
         }.get(method)
         return simple
 

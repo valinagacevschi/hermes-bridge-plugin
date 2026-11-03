@@ -17,6 +17,7 @@ import re
 import secrets
 import threading
 import time
+import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
@@ -46,7 +47,7 @@ from .bots_policy import (
 from .capability import CapabilityDescriptor
 from .crypto import load_psk, open_blob, open_frame, seal, seal_blob
 from .local_api import API_SERVER_PORT, SESSION_HEADER, LocalApi
-from .operation_dispatch import OperationDispatcher, _LocalRpcError, _RpcError
+from .operation_dispatch import OperationDispatcher, _LocalRpcError, _RpcError, _http_error_detail
 from .session_continue import (
     bare_key_phone_session_from_payload,
     bridge_thread_id,
@@ -65,6 +66,8 @@ from .session_continue import (
     stamp_bare_key_session_id,
     stamp_phone_session_id,
 )
+
+_LIVE_EDIT_INTERVAL_S = 0.8
 
 logger = logging.getLogger(__name__)
 _PRIVATE_IMPORT_WARNED: set[str] = set()
@@ -743,8 +746,11 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             self._inbound_seen_seq = 0
             # Any stream still awaiting its finalize died with the socket. The
             # flush in edit_message already ran for whichever edit failed.
+            for message_id in list(self._stream_pending):
+                self._clear_stream_edit(message_id)
             self._stream_pending.clear()
             self._stream_reply_to.clear()
+            self._stream_session_id.clear()
             if self._should_run:
                 logger.info("[hermes_bridge] reconnecting to relay…")
                 await asyncio.sleep(backoff * (0.8 + 0.4 * random.random()))
@@ -934,6 +940,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             # The seed is already a live preview. Without this marker the
             # phone classifies and persists the partial text as a final reply.
             payload["edit"] = True
+            payload["rev"] = 0
         if is_unsolicited:
             payload["unsolicited"] = True
             if core_profile:
@@ -980,6 +987,8 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         if not result.success:
             return result
         if expect_edits:
+            self._init_stream_edits()
+            self._record_stream_edit(msg_id, content, 0)
             self._stream_pending.add(msg_id)
             if reply_to:
                 self._stream_reply_to[msg_id] = reply_to
@@ -1049,20 +1058,38 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 payload["session_id"] = session_id
             return await self._deliver(payload["msg_id"], payload, category=None, durable=True)
 
-        payload: Dict[str, Any] = {
-            "role": "assistant",
-            "content": content,
-            "msg_id": message_id,
-            "edit": True,
-        }
-        reply_to = self._stream_reply_to.get(message_id)
-        if reply_to:
-            payload["reply_to"] = reply_to
-        session_id = self._stream_session_id.get(message_id)
-        if session_id:
-            payload["session_id"] = session_id
+        self._init_stream_edits()
+        if finalize:
+            task = self._stream_flush.pop(message_id, None)
+            if task:
+                task.cancel()
+            self._stream_stash.pop(message_id, None)
+        else:
+            immediate = self._stream_immediate.pop(message_id, False)
+            last_sent = self._stream_last_live.get(message_id)
+            if (
+                self._ws is not None
+                and not immediate
+                and last_sent is not None
+                and time.monotonic() - last_sent < _LIVE_EDIT_INTERVAL_S
+            ):
+                self._stream_stash[message_id] = content
+                if message_id not in self._stream_flush:
+                    self._stream_flush[message_id] = asyncio.create_task(
+                        self._flush_stream_edit(message_id)
+                    )
+                return SendResult(success=True, message_id=message_id)
+            task = self._stream_flush.pop(message_id, None)
+            if task:
+                task.cancel()
+            self._stream_stash.pop(message_id, None)
+
+        payload = self._stream_edit_payload(message_id, content, finalize=finalize)
         if finalize:
             payload["final"] = True
+        else:
+            # Reserve the delta base before socket I/O can admit another edit.
+            self._record_stream_edit(message_id, content, payload["rev"])
 
         # Only the terminal edit is durable — an intermediate tick is a live
         # preview that the next one replaces.
@@ -1073,6 +1100,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             self._stream_pending.discard(message_id)
             self._stream_reply_to.pop(message_id, None)
             self._stream_session_id.pop(message_id, None)
+            self._clear_stream_edit(message_id)
             return result
         if result.success:
             return result
@@ -1097,9 +1125,104 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 message_id[:8],
                 len(content),
             )
+            self._clear_stream_edit(message_id)
+            payload.pop("keep", None)
+            payload.pop("append", None)
+            payload["content"] = content
             payload["final"] = True
             await self._deliver(message_id, payload, category="turn_complete", durable=True)
         return result
+
+    def _init_stream_edits(self) -> None:
+        self._stream_last_live = getattr(self, "_stream_last_live", {})
+        self._stream_stash = getattr(self, "_stream_stash", {})
+        self._stream_flush = getattr(self, "_stream_flush", {})
+        self._stream_immediate = getattr(self, "_stream_immediate", {})
+        self._stream_text = getattr(self, "_stream_text", {})
+        self._stream_rev = getattr(self, "_stream_rev", {})
+
+    def _clear_stream_edit(self, message_id: str) -> None:
+        self._init_stream_edits()
+        task = self._stream_flush.pop(message_id, None)
+        if task:
+            task.cancel()
+        for values in (
+            self._stream_last_live, self._stream_stash, self._stream_immediate,
+            self._stream_text, self._stream_rev,
+        ):
+            values.pop(message_id, None)
+
+    def _stream_edit_payload(
+        self, message_id: str, content: str, *, finalize: bool = False
+    ) -> Dict[str, Any]:
+        previous = self._stream_text.get(message_id, "")
+        prefix = 0
+        for old, new in zip(previous, content):
+            if old != new:
+                break
+            prefix += 1
+        payload: Dict[str, Any] = {
+            "role": "assistant",
+            "msg_id": message_id,
+            "edit": True,
+            "rev": self._stream_rev.get(message_id, 0) + 1,
+        }
+        if finalize:
+            payload["content"] = content
+        else:
+            # Count whole code points first so the phone never slices a surrogate pair.
+            payload["keep"] = len(content[:prefix].encode("utf-16-le")) // 2
+            payload["append"] = content[prefix:]
+        for key, values in (
+            ("reply_to", self._stream_reply_to),
+            ("session_id", self._stream_session_id),
+        ):
+            if message_id in values:
+                payload[key] = values[message_id]
+        return payload
+
+    def _record_stream_edit(self, message_id: str, content: str, rev: int) -> None:
+        self._stream_text[message_id] = content
+        self._stream_rev[message_id] = rev
+        self._stream_last_live[message_id] = time.monotonic()
+
+    async def _flush_stream_edit(self, message_id: str) -> None:
+        try:
+            delay = self._stream_last_live[message_id] + _LIVE_EDIT_INTERVAL_S - time.monotonic()
+            await asyncio.sleep(max(0, delay))
+            # Finalize may cancel sleeping flushes, but must not interrupt socket I/O.
+            self._stream_flush.pop(message_id, None)
+            content = self._stream_stash.pop(message_id, None)
+            if message_id not in self._stream_pending:
+                return
+            if content is None:
+                return
+            payload = self._stream_edit_payload(message_id, content)
+            self._record_stream_edit(message_id, content, payload["rev"])
+            result = await self._deliver(message_id, payload, category="turn_complete", durable=False)
+            if message_id not in self._stream_pending:
+                return
+            if not result.success:
+                # Only the consumer has the current full text for a durable fallback.
+                self._stream_immediate[message_id] = True
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            self._stream_immediate[message_id] = True
+            logger.warning("[hermes_bridge] trailing stream edit failed", exc_info=True)
+        finally:
+            if self._stream_flush.get(message_id) is asyncio.current_task():
+                self._stream_flush.pop(message_id, None)
+
+    async def _rpc_stream_snapshot(self, p: Dict[str, Any]) -> Dict[str, Any]:
+        self._init_stream_edits()
+        message_id = p.get("msg_id")
+        if message_id not in self._stream_pending:
+            return {"done": True}
+        return {
+            "text": self._stream_text.get(message_id, ""),
+            "rev": self._stream_rev.get(message_id, 0),
+        }
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {
@@ -2184,7 +2307,8 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 if not isinstance(attached.get("session_id"), str) or not attached["session_id"]:
                     raise ValueError("Owner returned no runtime session id")
         except Exception as exc:
-            logger.debug("[hermes_bridge] local owner unavailable: %s", type(exc).__name__)
+            logger.warning("[hermes_bridge] local owner unavailable; falling back to fork: %s: %s",
+                           type(exc).__name__, exc)
             return local_owned_continue_result(session_id)
         return {"id": session_id, "continued": True, "owner": "local"}
 
@@ -2262,7 +2386,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         except local_owner.OwnerUnconfirmed as exc:
             await self._local_owner_error(payload, "owner_unconfirmed", str(exc))
         except Exception as exc:
-            logger.warning("[hermes_bridge] local owner turn failed: %s", type(exc).__name__)
+            logger.warning("[hermes_bridge] local owner turn failed: %s: %s", type(exc).__name__, exc)
             await self._local_owner_error(payload,
                 "owner_unconfirmed" if admitted else "owner_unavailable",
                 "Couldn't receive the Laptop reply. Check its transcript before sending again." if admitted
@@ -2360,7 +2484,10 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         path = f"/api/sessions/{quote(session_id, safe='')}/messages"
         if not any(key in p for key in ("limit", "offset", "order")):
             query = urlencode({"profile": profile}) if profile else ""
-            return _project_session_messages(await self._api.get(f"{path}?{query}" if query else path))
+            data = await self._api.get_on_working_port(f"{path}?{query}" if query else path)
+            if data is None:
+                raise _RpcError("session_not_found")
+            return _project_session_messages(data)
         try:
             limit = int(p.get("limit", 20))
             offset = int(p.get("offset", 0))
@@ -2374,7 +2501,10 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             params["profile"] = profile
         query = urlencode(params)
         if limit == 0:
-            return _project_session_messages(await self._api.get(f"{path}?{query}"))
+            data = await self._api.get_on_working_port(f"{path}?{query}")
+            if data is None:
+                raise _RpcError("session_not_found")
+            return _project_session_messages(data)
         # Pages are counted in raw rows, but tool calls/results and internal
         # notices are projected away, so a 20-row page of a tool-heavy turn
         # can render as one bubble. Read a wider raw window and report the raw
@@ -2382,7 +2512,9 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         raw_limit = min(500, limit * 10)
         params["limit"] = raw_limit
         query = urlencode(params)
-        data = await self._api.get(f"{path}?{query}")
+        data = await self._api.get_on_working_port(f"{path}?{query}")
+        if data is None:
+            raise _RpcError("session_not_found")
         if not isinstance(data, dict):
             return data
         raw_rows = data.get("messages")
@@ -2497,7 +2629,9 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             params = {"limit": 500, "offset": offset, "order": "oldest"}
             if profile:
                 params["profile"] = profile
-            page = await self._api.get(f"{path}?{urlencode(params)}")
+            page = await self._api.get_on_working_port(f"{path}?{urlencode(params)}")
+            if page is None:
+                raise _RpcError("session_not_found")
             rows = page.get("messages", []) if isinstance(page, dict) else []
             if not isinstance(rows, list) or not rows:
                 break
@@ -2591,7 +2725,10 @@ class HermesBridgeAdapter(BasePlatformAdapter):
 
     async def _rpc_sessions_export(self, p: Dict[str, Any]) -> Any:
         session_id = await self._gateway_session_id(_require(p, "id", "missing_session_id"))
-        return await self._api.get(f"/api/sessions/{session_id}/export")
+        data = await self._api.get_on_working_port(f"/api/sessions/{session_id}/export")
+        if data is None:
+            raise _RpcError("session_not_found")
+        return data
 
     async def _rpc_skills_toggle(self, p: Dict[str, Any]) -> Any:
         name = _require(p, "name", "missing_skill_name")
@@ -3161,7 +3298,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         allowed = (
             "id", "name", "schedule", "schedule_display", "next_run_at", "last_run_at",
             "enabled", "state", "paused_at", "prompt", "skills", "deliver", "context_from",
-            "last_status", "last_error",
+            "last_status", "last_error", "catch_up",
         )
         projected = {key: row[key] for key in allowed if key in row}
         if isinstance(projected.get("last_error"), str):
@@ -3202,7 +3339,18 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         job_id = quote(_require(p, "id", "missing_job_id"), safe="")
         await self._require_cron_owner(p, "id")
         query = self._cron_profile_query(p)
-        return await self._api.post(f"/api/cron/jobs/{job_id}/{action}?{query}")
+        try:
+            return await self._api.post(f"/api/cron/jobs/{job_id}/{action}?{query}")
+        except urllib.error.HTTPError as exc:
+            # Older Hermes has no cancel route (404/405). On >=0.22.6 the same
+            # path returns 404 {"detail":"Job not found"} for an unknown job —
+            # keep that as a not-found error, not "unsupported".
+            if action == "cancel" and exc.code in (404, 405):
+                detail = _http_error_detail(exc)
+                if exc.code == 404 and "job not found" in detail.lower():
+                    raise _RpcError(detail) from exc
+                raise _RpcError("unsupported") from exc
+            raise
 
     async def _rpc_cron_create(self, p: Dict[str, Any]) -> Any:
         schedule = _require(p, "schedule", "missing_schedule")
@@ -3210,6 +3358,8 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         for key in ("prompt", "name", "deliver", "context_from"):
             if key in p:
                 body[key] = p[key] if key == "context_from" else str(p[key])
+        if "catch_up" in p:
+            body["catch_up"] = p["catch_up"]
         skills = p.get("skills")
         if skills:
             body["skills"] = skills if isinstance(skills, list) else [str(skills)]
@@ -3225,6 +3375,9 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         if "skills" in p:
             skills = p.get("skills")
             updates["skills"] = skills if isinstance(skills, list) else ([str(skills)] if skills else [])
+        if "catch_up" in p:
+            # true / false / None → JSON null (Hermes default missed-run policy).
+            updates["catch_up"] = p["catch_up"]
         if not updates:
             raise _RpcError("no_updates")
         await self._require_cron_owner(p, "id")
@@ -3513,6 +3666,11 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 return
             except Exception as exc:
                 last_exc = exc
+                # Gone or refused: if this was the cached port, drop it so the
+                # next candidates()/listening() pass re-discovers (never keep
+                # pinning a dead or foreign-profile dashboard).
+                if self._api.port == port:
+                    self._api.drop_port_cache(port)
                 logger.debug("[hermes_bridge] local ws connect :%d failed: %s", port, exc)
                 continue
         if not saw_dashboard:
