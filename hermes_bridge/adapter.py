@@ -2160,12 +2160,36 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             return session_id
         return resolve_message_session_id(session_id, rows)
 
+    def _own_core_profile_name(self) -> str:
+        """Gateway process profile name; matches `_resolve_core_profile` own-name lookup."""
+        try:
+            from hermes_constants import get_hermes_home, profile_name_for_home
+
+            return profile_name_for_home(get_hermes_home()) or "default"
+        except Exception:
+            return "default"
+
     async def _rpc_sessions_list(self, p: Dict[str, Any]) -> Any:
         profile = await self._resolve_core_profile(p.get("core_profile"))
         query = {"limit": 100}
         if profile:
             query["profile"] = profile
-        return rewrite_listed_sessions(await self._api.get(f"/api/sessions?{urlencode(query)}"))
+        data = await self._api.get(f"/api/sessions?{urlencode(query)}")
+        expected = profile if profile else self._own_core_profile_name()
+        sessions = data.get("sessions") if isinstance(data, dict) else None
+        if isinstance(sessions, list):
+            for row in sessions:
+                if not isinstance(row, dict):
+                    continue
+                row_profile = row.get("profile")
+                if isinstance(row_profile, str) and row_profile and row_profile != expected:
+                    logger.warning(
+                        "[hermes_bridge] sessions.list served by profile %s, expected %s; refusing",
+                        row_profile,
+                        expected,
+                    )
+                    raise _RpcError("profile_mismatch")
+        return rewrite_listed_sessions(data)
 
     async def _rpc_sessions_active(self, p: Dict[str, Any]) -> Any:
         return {
