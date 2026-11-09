@@ -280,4 +280,16 @@ def rewrite_listed_sessions(data: Any) -> Any:
         if isinstance(row, dict):
             seen.add(row.get("id"))
         unique.append(row)
-    return {**data, "sessions": unique}
+    # Match the Hermes desktop sidebar: hide unused empty rows. Keep active
+    # empty rows (first phone turn may be in flight) and rows without
+    # message_count (older cores).
+    kept = [row for row in unique if _keep_listed_session(row)]
+    return {**data, "sessions": kept}
+
+
+def _keep_listed_session(row: Any) -> bool:
+    if not isinstance(row, dict) or "message_count" not in row:
+        return True
+    if row.get("message_count") == 0 and row.get("is_active") is not True:
+        return False
+    return True

@@ -1,4 +1,5 @@
 # Hosted Bot rooms: groups.* ops; #84 H: phone owns seq cursor (handle has no cursor).
+# #149: project groups.state context + member_activity; derive unmentioned_delivery from routing.
 """Phone-facing rooms.* operations over Hermes hosted-room groups.* RPCs."""
 
 from __future__ import annotations
@@ -19,6 +20,11 @@ from .operation_dispatch import _LocalRpcError, _RpcError
 _GROUPS_META_KEY = "hermes-bots-groups"
 _DEFAULT_LOG_LIMIT = 50
 _UNMENTIONED_DELIVERY = "all_members"
+# Host RoomContext.routing (tui_gateway/contracts/groups_bot_relay.py) — duck-typed.
+_ROUTING_EVERYONE = "everyone"
+_ROUTING_LEAD = "lead"
+_ROUTING_AUTO = "auto"
+_ROUTING_MODES = frozenset({_ROUTING_EVERYONE, _ROUTING_LEAD, _ROUTING_AUTO})
 # Mirrors gateway.hosted_room_discussion._MENTION_RE — upstream recipient contract
 # is @handle tokens inside message text (resolve_mentions).
 _MENTION_RE = re.compile(r"@([A-Za-z0-9][A-Za-z0-9._:-]*)", re.IGNORECASE)
@@ -164,6 +170,56 @@ def _project_pending_approval(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def _delivery_from_routing(routing: str) -> str:
+    """Map host RoomContext.routing to phone unmentioned_delivery."""
+    if routing == _ROUTING_LEAD:
+        return "lead"
+    if routing == _ROUTING_AUTO:
+        return "auto"
+    return _UNMENTIONED_DELIVERY
+
+
+def _project_context(raw: Any) -> Optional[Dict[str, Any]]:
+    """Project groups.state context; None when the host omitted it (older gateways)."""
+    if not isinstance(raw, dict):
+        return None
+    routing = str(raw.get("routing") or _ROUTING_EVERYONE).strip() or _ROUTING_EVERYONE
+    if routing not in _ROUTING_MODES:
+        routing = _ROUTING_EVERYONE
+    return {
+        "purpose": str(raw.get("purpose") or ""),
+        "notes": str(raw.get("notes") or ""),
+        "routing": routing,
+        "lead_member_id": str(raw.get("lead_member_id") or ""),
+    }
+
+
+def _project_member_activity_row(raw: Any) -> Optional[Dict[str, Any]]:
+    """One RoomMemberActivity row (tui_gateway/contracts/groups_bot_relay.py)."""
+    if not isinstance(raw, dict):
+        return None
+    member_id = str(raw.get("member_id") or "").strip()
+    status = str(raw.get("status") or "").strip()
+    if not member_id or not status:
+        return None
+    row: Dict[str, Any] = {
+        "member_id": member_id,
+        "status": status,
+        "thread_id": str(raw["thread_id"]) if isinstance(raw.get("thread_id"), str) else None,
+        "round_index": int(raw["round_index"])
+        if isinstance(raw.get("round_index"), (int, float)) and not isinstance(raw.get("round_index"), bool)
+        else None,
+        "started_at": float(raw["started_at"])
+        if isinstance(raw.get("started_at"), (int, float)) and not isinstance(raw.get("started_at"), bool)
+        else None,
+        "tool": str(raw["tool"]) if isinstance(raw.get("tool"), str) else None,
+        "progress_at": float(raw["progress_at"])
+        if isinstance(raw.get("progress_at"), (int, float)) and not isinstance(raw.get("progress_at"), bool)
+        else None,
+    }
+    return row
+
+
 def _project_driver_status(status: Any) -> Dict[str, Any]:
     if not isinstance(status, dict):
         return {"working": False, "pending_approvals": []}
@@ -173,10 +229,35 @@ def _project_driver_status(status: Any) -> Dict[str, Any]:
         projected = _project_pending_approval(action) if isinstance(action, dict) else None
         if projected is not None:
             pending.append(projected)
-    return {
+    out: Dict[str, Any] = {
         "working": bool(status.get("working")),
         "pending_approvals": pending,
     }
+    # Absent on older gateways — omit the key so open/log match today's payload.
+    if "member_activity" in status:
+        rows = status.get("member_activity")
+        out["member_activity"] = [
+            projected
+            for item in (rows if isinstance(rows, list) else [])
+            if (projected := _project_member_activity_row(item)) is not None
+        ]
+    return out
+
+
+def _apply_context_fields(target: Dict[str, Any], context: Optional[Dict[str, Any]]) -> None:
+    """Attach purpose/notes/routing/lead + derived delivery when host sent context."""
+    if context is None:
+        return
+    target["purpose"] = context["purpose"]
+    target["notes"] = context["notes"]
+    target["routing"] = context["routing"]
+    target["lead_member_id"] = context["lead_member_id"]
+    target["unmentioned_delivery"] = _delivery_from_routing(context["routing"])
+
+
+def _apply_member_activity(target: Dict[str, Any], driver: Dict[str, Any]) -> None:
+    if "member_activity" in driver:
+        target["member_activity"] = driver["member_activity"]
 
 
 def _mirror_unsupported(default_row: Optional[Dict[str, Any]], hosted_ids: Set[str]) -> List[Dict[str, Any]]:
@@ -441,13 +522,22 @@ async def _fetch_older_page(
 
 
 
-async def _fetch_driver_status(host: Any, room_id: str) -> Dict[str, Any]:
+async def _fetch_live_state(host: Any, room_id: str) -> Dict[str, Any]:
+    """groups.state → driver + optional context/activity (same call the poll already makes)."""
     try:
         state = await host._local_rpc("groups.state", {"room_id": room_id})
     except _LocalRpcError:
         return _project_driver_status(None)
-    status = state.get("driver_status") if isinstance(state, dict) else None
-    return _project_driver_status(status)
+    if not isinstance(state, dict):
+        return _project_driver_status(None)
+    out = _project_driver_status(state.get("driver_status"))
+    context = _project_context(state.get("context"))
+    _apply_context_fields(out, context)
+    return out
+
+
+async def _fetch_driver_status(host: Any, room_id: str) -> Dict[str, Any]:
+    return await _fetch_live_state(host, room_id)
 
 
 def _mint_handle(host: Any, room_id: str, name: str) -> str:
@@ -487,9 +577,10 @@ async def open_room(host: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     latest_seq = int(room_raw.get("latest_seq") or 0)
     page = await _fetch_latest_page(host, room_id, latest_seq=latest_seq, limit=limit)
     driver = _project_driver_status(state.get("driver_status") if isinstance(state, dict) else None)
+    context = _project_context(state.get("context") if isinstance(state, dict) else None)
     projected = _project_room(room_raw, set(bots))
     handle = _mint_handle(host, room_id, projected["name"])
-    return {
+    opened: Dict[str, Any] = {
         "handle": handle,
         "room_id": projected["room_id"],
         "name": projected["name"],
@@ -502,6 +593,9 @@ async def open_room(host: Any, params: Dict[str, Any]) -> Dict[str, Any]:
         "working": driver["working"],
         "pending_approvals": driver["pending_approvals"],
     }
+    _apply_context_fields(opened, context)
+    _apply_member_activity(opened, driver)
+    return opened
 
 
 def _mention_handles_in_text(text: str) -> List[str]:
@@ -677,9 +771,18 @@ async def read_log(host: Any, params: Dict[str, Any]) -> Dict[str, Any]:
         raise _RpcError("invalid_params")
     since_seq = int(since)
     page = await _fetch_log(host, str(room["room_id"]), since_seq=since_seq, limit=limit)
-    driver = await _fetch_driver_status(host, str(room["room_id"]))
-    page["working"] = driver["working"]
-    page["pending_approvals"] = driver["pending_approvals"]
+    live = await _fetch_live_state(host, str(room["room_id"]))
+    page["working"] = live["working"]
+    page["pending_approvals"] = live["pending_approvals"]
+    _apply_member_activity(page, live)
+    if "routing" in live:
+        page["purpose"] = live.get("purpose", "")
+        page["notes"] = live.get("notes", "")
+        page["routing"] = live["routing"]
+        page["lead_member_id"] = live.get("lead_member_id", "")
+        page["unmentioned_delivery"] = live.get(
+            "unmentioned_delivery", _UNMENTIONED_DELIVERY
+        )
     return page
 
 
