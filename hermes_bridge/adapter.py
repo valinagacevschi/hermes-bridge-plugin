@@ -6,6 +6,7 @@ both transcript rows; the bridge delivers the final reply on the phone chat.
 """
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -28,15 +29,26 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from gateway.platforms.base import (
+    AudioFormat,
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
     Platform,
     ProcessingOutcome,
     SendResult,
+    StreamingTTSHandle,
 )
 
-from . import bot_activity, bot_chats, bot_notify, bot_rooms, bot_subagents, local_owner
+from . import (
+    bot_activity,
+    bot_chats,
+    bot_notify,
+    bot_rooms,
+    bot_subagents,
+    kanban_events,
+    local_owner,
+    session_queued,
+)
 from .bots_policy import (
     blocked_bot_capabilities,
     bots_flag_enabled,
@@ -66,8 +78,20 @@ from .session_continue import (
     stamp_bare_key_session_id,
     stamp_phone_session_id,
 )
+from .streaming_voice import (
+    STT_MAX_DURATION_S,
+    LiveSttSession,
+    StreamingTtsState,
+    new_stream_id,
+    stt_expired,
+    wav_b64_for_pcm,
+)
 
 _LIVE_EDIT_INTERVAL_S = 0.8
+# Read-only kanban.db poll (PRD_Inbox_Kanban.md §3). Same order of magnitude as
+# the pending-writes poll: cheap indexed reads, and nobody expects a board
+# change to reach the phone in less than a few seconds.
+_KANBAN_POLL_INTERVAL_S = 20.0
 
 logger = logging.getLogger(__name__)
 _PRIVATE_IMPORT_WARNED: set[str] = set()
@@ -307,6 +331,13 @@ _INBOUND_REPLAY_GRACE_S = 30.0
 # open_frame() after use. Comparing wall-clock against an absolute deadline
 # sidesteps that entirely.
 _PROMPT_TIMEOUT_S = 300.0
+
+# Host locales/en.yaml `gateway.clarify.hint_multi` — local copy so we do not
+# pull hermes i18n into the bridge for one string.
+_CLARIFY_HINT_MULTI = (
+    'Multiple selections allowed — reply with the numbers separated by commas '
+    'or spaces (e.g. "1, 3"), the option text, or your own answer.'
+)
 
 
 def _require(params: Dict[str, Any], key: str, error: str) -> str:
@@ -595,6 +626,10 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         # Background poll for newly staged memory/skill writes (PRD_Features.md
         # §2.7) — see _poll_pending_writes for why this is polling, not a push.
         self._approval_poll_task: Optional[asyncio.Task] = None
+        # Board events (PRD_Inbox_Kanban.md §3) — read-only poll of kanban.db.
+        # None means the watcher never started; the task disables itself when
+        # no watch profiles are configured.
+        self._kanban_poll_task: Optional[asyncio.Task] = None
         # Capability handshake received from the relay on this connection (#40).
         # None means "no hello has arrived yet on this connection" — distinct
         # from an empty-ops descriptor, and reset on every reconnect since a
@@ -644,6 +679,13 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         # goal continuations after a gateway restart still route to that chat — never stamp
         # Agent inbox ids (agent:…).
         self._bare_key_phone_session: Optional[str] = _load_bare_key_phone_session(self._profile_id)
+        # Phone-advertised streaming TTS playback (client.capabilities). Old phones
+        # never call it → False → core keeps whole-file send_voice.
+        self._client_streaming_tts: bool = False
+        # handle id → StreamingTtsState for concurrent write serialization.
+        self._tts_streams: Dict[str, StreamingTtsState] = {}
+        # Cap: one live host-dictation session per chat (keyed by stream_id).
+        self._stt_sessions: Dict[str, LiveSttSession] = {}
         # One-shot fork context is intentionally in memory; a bridge restart drops it.
         self._pending_handoffs: Dict[str, str] = {}
         self._active_threads: set = set()
@@ -689,6 +731,8 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         self._run_task = asyncio.ensure_future(self._run_loop())
         if self._approval_poll_task is None or self._approval_poll_task.done():
             self._approval_poll_task = asyncio.ensure_future(self._poll_pending_writes())
+        if getattr(self, "_kanban_poll_task", None) is None or self._kanban_poll_task.done():
+            self._kanban_poll_task = asyncio.ensure_future(self._poll_kanban_events())
         self._ensure_bot_notify_observer()
         return ok
 
@@ -739,6 +783,9 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             # A descriptor is scoped to one connection — the next connect gets
             # a fresh hello (or none, if talking to a relay predating #40).
             self._descriptor = None
+            # Phone must re-advertise after reconnect; don't keep a stale flag.
+            self._client_streaming_tts = False
+            await self._cancel_all_stt_sessions("phone_disconnected")
             # The high-water mark is connection-scoped (#41) — the next
             # connect's replay starts fresh from `_inbound_cursor` (durable),
             # so a seq the relay legitimately resends must not be rejected as
@@ -796,6 +843,13 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             self._approval_poll_task = None
+        if getattr(self, "_kanban_poll_task", None):
+            self._kanban_poll_task.cancel()
+            try:
+                await self._kanban_poll_task
+            except asyncio.CancelledError:
+                pass
+            self._kanban_poll_task = None
         self._stop_bot_notify_observer()
         if self._bot_notify_task:
             try:
@@ -803,6 +857,8 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             except (asyncio.CancelledError, Exception):
                 pass
             self._bot_notify_task = None
+        await self._cancel_all_stt_sessions("phone_disconnected")
+        self._client_streaming_tts = False
         if self._ws:
             await self._ws.close()
             self._ws = None
@@ -894,7 +950,12 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         # dedicated "origin" flag exists upstream — job_id's presence is the
         # only reliable signal. The phone uses this to route the message to a
         # dedicated "Agent" inbox session instead of whatever chat is open.
-        is_unsolicited = bool(metadata and "job_id" in metadata)
+        kanban_event = metadata.get("kanban_event") if metadata else None
+        # Board events carry no job_id, but they are unsolicited in exactly the
+        # same sense: no Hermes session and no triggering user message. Keep
+        # the marker distinct so the cron-owner lookup below (which would RPC
+        # on a job that does not exist) is never reached for them.
+        is_unsolicited = bool(metadata and ("job_id" in metadata or kanban_event))
         core_profile = None
         if is_unsolicited:
             owner = metadata.get("profile") or metadata.get("profile_name")
@@ -945,6 +1006,8 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             payload["unsolicited"] = True
             if core_profile:
                 payload["core_profile"] = core_profile
+        if isinstance(kanban_event, dict):
+            payload["kanban_event"] = kanban_event
         thread_id = metadata.get("thread_id") if metadata else None
         outbound_session_id = self._outbound_phone_session_id(
             thread_id, is_unsolicited=is_unsolicited
@@ -1371,17 +1434,156 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         )
 
     # ------------------------------------------------------------------
-    # Interactive controls (#42) — tool-approval / slash-confirm / clarify / choice-picker
-    # rendered as native buttons instead of text, mirroring Hermes core's own
-    # experimental relay-connector `prompt` op. Four hooks cover approvals,
-    # slash confirmations, clarify prompts, and model choice pickers.
-    # send_exec_approval has NO base-class default at
-    # all (gateway/run.py:5827 checks `getattr(type(adapter),
-    # "send_exec_approval", None)` directly, independent of supported_ops),
-    # while send_slash_confirm/send_clarify do — see each method's own
-    # unsupported-path comment for the (different, verified-against-run.py)
-    # fallback contract each one needs.
+    # Streaming TTS — PCM segments as sealed tts_chunk / tts_end frames.
+    # Only when the phone advertised streaming_tts via client.capabilities;
+    # otherwise core falls back to whole-file send_voice unchanged.
     # ------------------------------------------------------------------
+
+    def supports_streaming_tts(self, chat_id: str, audio_format: AudioFormat) -> bool:
+        return bool(getattr(self, "_client_streaming_tts", False))
+
+    async def begin_streaming_tts(
+        self,
+        chat_id: str,
+        audio_format: AudioFormat,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[StreamingTTSHandle]:
+        if not self.supports_streaming_tts(chat_id, audio_format):
+            return None
+        stream_id = new_stream_id()
+        session_id: Optional[str] = None
+        if metadata:
+            thread_id = metadata.get("thread_id")
+            session_id = self._outbound_phone_session_id(thread_id)
+        state = StreamingTtsState(
+            stream_id=stream_id,
+            chat_id=str(chat_id),
+            sample_rate=int(audio_format.sample_rate),
+            channels=int(audio_format.channels),
+            sample_width=int(audio_format.sample_width),
+            session_id=session_id,
+        )
+        handle = StreamingTTSHandle(chat_id=str(chat_id), audio_format=audio_format)
+        # Opaque id so write/finish/abort find the same lockable state.
+        handle.stream_id = stream_id  # type: ignore[attr-defined]
+        self._tts_streams[stream_id] = state
+        return handle
+
+    def _tts_state(self, handle: StreamingTTSHandle) -> Optional[StreamingTtsState]:
+        stream_id = getattr(handle, "stream_id", None)
+        if not isinstance(stream_id, str) or not stream_id:
+            return None
+        return self._tts_streams.get(stream_id)
+
+    async def _send_live_payload(self, payload: Dict[str, Any]) -> None:
+        """Seal + push a non-durable frame (tts/stt). Drop silently if offline."""
+        if self._ws is None:
+            return
+        try:
+            frame = seal(self._profile_id, "out", payload, self._psk)
+            await self._ws.send(frame)
+        except ConnectionClosed:
+            return
+        except Exception as exc:
+            logger.warning("[hermes_bridge] live frame send failed: %s", exc)
+
+    async def _emit_tts_segment(self, state: StreamingTtsState, pcm: bytes, handle: StreamingTTSHandle) -> None:
+        if not pcm or state.aborted:
+            return
+        seq = state.next_seq
+        state.next_seq += 1
+        payload: Dict[str, Any] = {
+            "role": "tts_chunk",
+            "content": "",
+            "stream_id": state.stream_id,
+            "seq": seq,
+            "wav_b64": wav_b64_for_pcm(state, pcm),
+        }
+        if state.session_id:
+            payload["session_id"] = state.session_id
+        await self._send_live_payload(payload)
+        handle.audible = True
+
+    async def write_streaming_tts(self, handle: StreamingTTSHandle, chunk: bytes) -> None:
+        state = self._tts_state(handle)
+        if state is None or handle.aborted or state.aborted or state.finished:
+            return
+        async with state.lock:
+            if state.aborted or state.finished or handle.aborted:
+                return
+            state.buffer.extend(chunk)
+            for pcm in state.take_full_segments():
+                await self._emit_tts_segment(state, pcm, handle)
+
+    async def finish_streaming_tts(
+        self, handle: StreamingTTSHandle, *, interrupted: bool = False
+    ) -> None:
+        state = self._tts_state(handle)
+        if state is None:
+            return
+        async with state.lock:
+            if state.finished or state.aborted:
+                return
+            state.finished = True
+            remainder = state.take_remainder()
+            if remainder:
+                await self._emit_tts_segment(state, remainder, handle)
+            end_payload: Dict[str, Any] = {
+                "role": "tts_end",
+                "content": "",
+                "stream_id": state.stream_id,
+                "interrupted": bool(interrupted),
+            }
+            if state.session_id:
+                end_payload["session_id"] = state.session_id
+            await self._send_live_payload(end_payload)
+        self._tts_streams.pop(state.stream_id, None)
+
+    async def abort_streaming_tts(
+        self, handle: StreamingTTSHandle, error: Optional[str] = None
+    ) -> None:
+        state = self._tts_state(handle)
+        if state is None:
+            handle.aborted = True
+            return
+        async with state.lock:
+            if state.aborted:
+                return
+            state.aborted = True
+            handle.aborted = True
+            state.buffer.clear()
+            end_payload: Dict[str, Any] = {
+                "role": "tts_end",
+                "content": "",
+                "stream_id": state.stream_id,
+                "interrupted": True,
+            }
+            if error:
+                end_payload["error"] = str(error)
+            if state.session_id:
+                end_payload["session_id"] = state.session_id
+            await self._send_live_payload(end_payload)
+        self._tts_streams.pop(state.stream_id, None)
+
+    # ------------------------------------------------------------------
+    # Interactive controls (#42 / #146) — tool-approval / slash-confirm /
+    # clarify / choice-picker as native buttons via the relay `prompt` op.
+    # Exec approval rides the v0.23 template method: base `send_exec_approval`
+    # builds ExecApprovalPrompt; we override `_send_exec_approval_prompt` so
+    # `supports_exec_approval_buttons()` is True and the turn runner skips its
+    # plain-text `/approve` fallback. Returning success=False when `prompt` is
+    # unsupported still lets that host fallback run. Slash-confirm / clarify
+    # keep their own unsupported contracts — see each method.
+    # ------------------------------------------------------------------
+
+    # Phone button copy is fixed for clients; host `prompt.actions` only picks
+    # which choices appear (gateway/platforms/base.py `_exec_approval_actions`).
+    _APPROVAL_OPTION_BY_CHOICE: Dict[str, Dict[str, str]] = {
+        "once": {"id": "once", "label": "Allow Once"},
+        "session": {"id": "session", "label": "Session"},
+        "always": {"id": "always", "label": "Always"},
+        "deny": {"id": "deny", "label": "Deny", "style": "destructive"},
+    }
 
     def _mint_prompt(self, kind: str, **extra: Any) -> str:
         """Register a pending prompt and return its id. `extra` carries
@@ -1399,6 +1601,8 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         options: List[Dict[str, str]],
         prompt_id: str,
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        multi_select: bool = False,
     ) -> SendResult:
         """Build+send a `prompt` frame — shared by all three overrides below.
 
@@ -1420,6 +1624,9 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             # Absolute epoch ms — see _PROMPT_TIMEOUT_S doc comment.
             "expires_at": int((time.time() + _PROMPT_TIMEOUT_S) * 1000),
         }
+        # Omit the flag when false so old phones see today's wire shape.
+        if multi_select:
+            payload["multi_select"] = True
         thread_id = metadata.get("thread_id") if metadata else None
         outbound_session_id = self._outbound_phone_session_id(thread_id)
         if outbound_session_id:
@@ -1430,42 +1637,35 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         # renders as expired on arrival rather than looking fresh.
         return await self._deliver(msg_id, payload)
 
-    async def send_exec_approval(
-        self,
-        chat_id: str,
-        command: str,
-        session_key: str,
-        description: str = "dangerous command",
-        metadata: Optional[Dict[str, Any]] = None,
-        allow_permanent: bool = True,
-        allow_session: bool = True,
-        smart_denied: bool = False,
-    ) -> SendResult:
-        """Tool-approval prompt as native buttons (#42).
+    async def _send_exec_approval_prompt(self, prompt: Any) -> SendResult:
+        """Render a v0.23 ExecApprovalPrompt as a phone `prompt` frame (#146).
 
-        No base-class default exists for this hook — verified against the
-        installed hermes-agent venv: gateway/run.py's
-        `_approval_notify_sync` checks `getattr(type(adapter),
-        "send_exec_approval", None) is not None` directly, and on a
-        False/failed result falls back to its OWN plain-text `/approve`
-        `/deny` prompt (`_format_exec_approval_fallback` + `adapter.send()`)
-        itself. So returning a plain failure here when unsupported is
-        correct — no need to duplicate that fallback in this method.
+        Duck-typed on ``prompt`` (chat_id/session_key/actions/command/
+        description/metadata/request_id) so we do not import the host
+        dataclass. A failed send (``prompt`` op missing) returns
+        ``prompt_unsupported`` so the gateway's text ``/approve`` path runs.
         """
         if not self._supports("prompt"):
             return SendResult(success=False, error="prompt_unsupported")
-        options: List[Dict[str, str]] = [{"id": "once", "label": "Allow Once"}]
-        if not smart_denied and allow_session:
-            options.append({"id": "session", "label": "Session"})
-            if allow_permanent:
-                options.append({"id": "always", "label": "Always"})
-        options.append({"id": "deny", "label": "Deny", "style": "destructive"})
+        options: List[Dict[str, str]] = []
+        for _label, choice, _style in prompt.actions:
+            option = self._APPROVAL_OPTION_BY_CHOICE.get(choice)
+            if option is not None:
+                options.append(dict(option))
+        description = prompt.description or "dangerous command"
+        command = prompt.command or ""
         fallback = (
             f"⚠️ Approval required: {description}\n\n{command}\n\n"
             "Reply /approve, /approve session, /approve always, or /deny."
         )
-        prompt_id = self._mint_prompt("approval", session_key=session_key)
-        return await self._send_prompt(chat_id, "approval", fallback, options, prompt_id, metadata)
+        prompt_id = self._mint_prompt(
+            "approval",
+            session_key=prompt.session_key,
+            request_id=prompt.request_id,
+        )
+        return await self._send_prompt(
+            prompt.chat_id, "approval", fallback, options, prompt_id, prompt.metadata
+        )
 
     async def send_slash_confirm(
         self,
@@ -1528,6 +1728,17 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             return await super().send_clarify(
                 chat_id, question, choices, clarify_id, session_key, metadata=metadata
             )
+        # Host tools.clarify_gateway.get_pending — multi_select arrived in
+        # v0.23; older hosts (or a missing entry) keep single-select UX.
+        multi_select = False
+        try:
+            from tools.clarify_gateway import get_pending
+
+            pending = get_pending(clarify_id)
+            if pending is not None:
+                multi_select = bool(getattr(pending, "multi_select", False))
+        except (ImportError, AttributeError):
+            multi_select = False
         options = [{"id": str(i), "label": str(c)} for i, c in enumerate(choices)]
         options.append({"id": "__other__", "label": "Other (type answer)"})
         lines = [f"❓ {question}", ""]
@@ -1535,9 +1746,26 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             lines.append(f"  {i + 1}. {c}")
         lines.append("")
         lines.append("Reply with a number, or the exact choice text.")
+        if multi_select:
+            lines.append(_CLARIFY_HINT_MULTI)
         fallback = "\n".join(lines)
-        prompt_id = self._mint_prompt("clarify", clarify_id=clarify_id)
-        return await self._send_prompt(chat_id, "clarify", fallback, options, prompt_id, metadata)
+        # options stay on the registry so option_ids resolve to labels in
+        # declared order even when the phone omits content.
+        prompt_id = self._mint_prompt(
+            "clarify",
+            clarify_id=clarify_id,
+            multi_select=multi_select,
+            options=options,
+        )
+        return await self._send_prompt(
+            chat_id,
+            "clarify",
+            fallback,
+            options,
+            prompt_id,
+            metadata,
+            multi_select=multi_select,
+        )
 
     async def send_choice_picker(
         self,
@@ -1588,7 +1816,12 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         """
         prompt_id = str(payload.get("prompt_id", ""))
         option_id = str(payload.get("option_id", ""))
-        if not prompt_id or not option_id:
+        raw_option_ids = payload.get("option_ids")
+        option_ids: Optional[List[str]] = None
+        if isinstance(raw_option_ids, list):
+            option_ids = [str(item) for item in raw_option_ids if str(item)]
+        # Multi-select submit may omit a single option_id and send option_ids.
+        if not prompt_id or (not option_id and not option_ids):
             return
         entry = self._pop_prompt(prompt_id)
         if entry is None:
@@ -1600,10 +1833,24 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         kind = entry.get("kind")
         try:
             if kind == "approval":
-                from tools.approval import resolve_gateway_approval
+                # Card resolver ties the press to this prompt's request_id
+                # (tools.approval.resolve_gateway_approval_card); older hosts
+                # only have the FIFO resolve_gateway_approval.
+                if not option_id:
+                    return
+                try:
+                    from tools.approval import resolve_gateway_approval_card
+                except (ImportError, AttributeError):
+                    from tools.approval import resolve_gateway_approval
 
-                resolve_gateway_approval(entry["session_key"], option_id)
+                    resolve_gateway_approval(entry["session_key"], option_id)
+                else:
+                    resolve_gateway_approval_card(
+                        entry["session_key"], option_id, entry.get("request_id")
+                    )
             elif kind == "slash_confirm":
+                if not option_id:
+                    return
                 try:
                     from tools.slash_confirm import resolve as resolve_slash_confirm
                 except (ImportError, AttributeError) as exc:
@@ -1627,9 +1874,22 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             elif kind == "clarify":
                 from tools.clarify_gateway import mark_awaiting_text, resolve_gateway_clarify
 
-                if option_id == "__other__":
+                selected_ids = option_ids if option_ids else ([option_id] if option_id else [])
+                if "__other__" in selected_ids:
                     mark_awaiting_text(entry["clarify_id"])
+                elif entry.get("multi_select") and option_ids:
+                    # Join labels in the prompt's option order (not tap order).
+                    selected = set(option_ids)
+                    labels = [
+                        str(opt.get("label", ""))
+                        for opt in entry.get("options") or []
+                        if str(opt.get("id", "")) in selected
+                        and str(opt.get("id", "")) != "__other__"
+                    ]
+                    resolve_gateway_clarify(entry["clarify_id"], ", ".join(labels))
                 else:
+                    # Single-select (or old app tapping one id on a multi
+                    # prompt): content is the chosen label from the phone.
                     resolve_gateway_clarify(entry["clarify_id"], str(payload.get("content", "")))
             elif kind == "choice_picker":
                 try:
@@ -2169,6 +2429,33 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         except Exception:
             return "default"
 
+    def _multiplex_profiles_enabled(self) -> bool:
+        """True only when this gateway process is the multiplex runner."""
+        runner = getattr(self, "gateway_runner", None)
+        config = getattr(runner, "config", None) if runner is not None else None
+        return bool(getattr(config, "multiplex_profiles", False))
+
+    def _recorded_served_profiles(self) -> Any:
+        """Machine-global multiplex roster; valid only for the live default multiplexer."""
+        from hermes_cli.gateway_multiplex_served import recorded_served_profiles
+
+        return recorded_served_profiles()
+
+    def _gateway_served_profiles(self) -> List[str]:
+        """Profiles this gateway process serves.
+
+        Standalone gateways must not trust ``recorded_served_profiles()`` — that
+        list is written by the live default multiplexer and leaks foreign
+        profiles (e.g. expo-hermes) into an isolated e2e gateway's roster.
+        """
+        own = self._own_core_profile_name()
+        if not self._multiplex_profiles_enabled():
+            return [own]
+        served = self._recorded_served_profiles()
+        if not isinstance(served, (list, tuple, set)):
+            raise RuntimeError("served profile snapshot unavailable")
+        return [str(name) for name in served]
+
     async def _rpc_sessions_list(self, p: Dict[str, Any]) -> Any:
         profile = await self._resolve_core_profile(p.get("core_profile"))
         query = {"limit": 100}
@@ -2374,20 +2661,27 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         # Admission answers promptly; do not block the inbound FIFO on the whole model turn.
         await ready.wait()
 
-    async def _run_local_owner(self, payload, profile, request_id, ready):
-        admitted = False
+    async def _run_local_owner(self, payload, profile, request_id, ready, receipt=None):
+        admitted = receipt is not None
         try:
             async with self._connect_local_owner(profile) as client:
                 attached = await client.rpc("session.resume", session_id=payload["session_id"])
                 target = attached.get("session_id")
                 if not isinstance(target, str) or not target:
                     raise ValueError("Owner returned no runtime session id")
-                receipt = await local_owner.submit(client, target, payload["content"],
-                                                   request_id, _warn_private_import_once)
+                if receipt is not None:
+                    # Replacement may finish before this observer attaches.
+                    receipt = await client.rpc("prompt.receipt", session_id=target,
+                                               admission_id=receipt["admission_id"], include_result=True)
+                else:
+                    receipt = await local_owner.submit(client, target, payload["content"],
+                                                       request_id, _warn_private_import_once)
                 admission = receipt["admission_id"]
                 admitted = True
                 ready.set()
                 if receipt["status"] == "terminal":
+                    if receipt.get("outcome") in ("cancelled", "steered"):
+                        return True
                     saved = await client.rpc("prompt.receipt", session_id=target,
                                              admission_id=admission, include_result=True)
                     result = saved.get("result")
@@ -2404,7 +2698,17 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                             continue
                         if params.get("type") != "message.complete":
                             continue
-                        content = (params.get("payload") or {}).get("text")
+                        event_payload = params.get("payload") or {}
+                        if event_payload.get("outcome") in ("cancelled", "steered"):
+                            return True
+                        content = event_payload.get("text")
+                        if content is None:
+                            # A reply streamed to a Laptop viewer settles with no text; the
+                            # committed receipt still holds it.
+                            saved = await client.rpc("prompt.receipt", session_id=target,
+                                                     admission_id=admission, include_result=True)
+                            result = saved.get("result")
+                            content = result.get("final_response") if isinstance(result, dict) else None
                         await self._deliver_local_owner_reply(payload, request_id, content)
                         return True
         except local_owner.OwnerUnconfirmed as exc:
@@ -2470,16 +2774,27 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         return {"id": source_id, "continued": True}
 
     async def _rpc_session_control_read(self, p: Dict[str, Any]) -> Any:
-        """Read an allowlisted goal/loop/heartbeat snapshot for one Session."""
+        """Read goal/loop/heartbeat plus laptop-owned queued admissions (#150).
+
+        Queued rows piggyback on this existing live-state RPC so the phone does
+        not open a second poll loop; absent on non-local sessions / older hosts.
+        """
+        phone_id = _require(p, "id", "missing_session_id")
+        profile = await self._resolve_core_profile(p.get("core_profile"))
+        queued = await session_queued.read_queued(self, phone_id, profile)
+
+        def _with_queued(result: Dict[str, Any]) -> Dict[str, Any]:
+            if queued is not None:
+                result = {**result, "queued": queued}
+            return result
+
         try:
-            session_id = _require(p, "id", "missing_session_id")
-            profile = await self._resolve_core_profile(p.get("core_profile"))
-            session_id = await self._gateway_session_id(session_id, profile, profile_resolved=True)
+            session_id = await self._gateway_session_id(phone_id, profile, profile_resolved=True)
             try:
                 from tui_gateway.methods_session_control import _snapshot_control
             except (ImportError, AttributeError) as exc:
                 _warn_private_import_once("tui_gateway.methods_session_control._snapshot_control", exc)
-                return {"available": False}
+                return _with_queued({"available": False})
 
             home_token = None
             if profile:
@@ -2488,17 +2803,23 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                     from hermes_cli.profiles import get_profile_dir
                 except (ImportError, AttributeError) as exc:
                     _warn_private_import_once("hermes_cli.profiles.get_profile_dir", exc)
-                    return {"available": False}
+                    return _with_queued({"available": False})
 
                 home_token = set_hermes_home_override(str(get_profile_dir(profile)))
             try:
-                return {"available": True, "control": _snapshot_control(session_id)}
+                return _with_queued({"available": True, "control": _snapshot_control(session_id)})
             finally:
                 if home_token is not None:
                     reset_hermes_home_override(home_token)
         except Exception as exc:
             logger.debug("[hermes_bridge] session control snapshot unavailable: %s", type(exc).__name__)
-            return {"available": False}
+            return _with_queued({"available": False})
+
+    async def _rpc_sessions_queued_steer(self, p: Dict[str, Any]) -> Any:
+        return await session_queued.steer(self, p)
+
+    async def _rpc_sessions_queued_replace(self, p: Dict[str, Any]) -> Any:
+        return await session_queued.replace(self, p)
 
     async def _rpc_sessions_messages(self, p: Dict[str, Any]) -> Any:
         profile = await self._resolve_core_profile(p.get("core_profile"))
@@ -2796,16 +3117,13 @@ class HermesBridgeAdapter(BasePlatformAdapter):
     def _mcp_profile_is_served(self, profile: Optional[str]) -> bool:
         if not profile:
             return True
-        try:
-            from hermes_constants import get_hermes_home, profile_name_for_home
-            current = profile_name_for_home(get_hermes_home()) or "default"
-        except Exception:
-            current = "default"
+        current = self._own_core_profile_name()
         if profile == current:
             return True
+        if not self._multiplex_profiles_enabled():
+            return False
         try:
-            from hermes_cli.gateway_multiplex_served import recorded_served_profiles
-            return profile in (recorded_served_profiles() or [])
+            return profile in (self._recorded_served_profiles() or [])
         except Exception as exc:
             _warn_private_import_once("hermes_cli.gateway_multiplex_served.recorded_served_profiles", exc)
             return False
@@ -2817,20 +3135,14 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         if not isinstance(name, str) or not name.strip():
             return None
         name = name.strip()
-        try:
-            from hermes_constants import get_hermes_home, profile_name_for_home
-            current = profile_name_for_home(get_hermes_home()) or "default"
-        except Exception:
-            current = "default"
+        current = self._own_core_profile_name()
         if name in ("default", current):
             return None
         try:
             if snapshot is None:
                 snapshot = await fetch_profiles_snapshot(self, include_sessions=False)
             if served is None:
-                from hermes_cli.gateway_multiplex_served import recorded_served_profiles
-
-                served = recorded_served_profiles()
+                served = self._gateway_served_profiles()
             if not isinstance(served, (list, tuple, set)):
                 raise RuntimeError("served profile snapshot unavailable")
         except Exception as exc:
@@ -2844,15 +3156,26 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             raise _RpcError("profile_not_served")
         return name
 
-    @staticmethod
-    def _core_profile_row_is_served(row: Optional[Dict[str, Any]], served: Any) -> bool:
-        return bool(
+    def _core_profile_row_is_served(self, row: Optional[Dict[str, Any]], served: Any) -> bool:
+        """Whether a roster row is served by this gateway.
+
+        Multiplex keeps the default row even when the recorded list only names
+        secondaries. Standalone ``served`` is exactly ``[own]`` — never invent
+        a default beside it.
+        """
+        if not (
             row
             and isinstance(row.get("name"), str)
             and row.get("name")
             and not (isinstance(row.get("ui_meta"), dict) and "hermes-bots" in row["ui_meta"])
-            and (row.get("is_default") or row.get("name") == "default" or row["name"] in served)
-        )
+        ):
+            return False
+        name = row["name"]
+        if name in served:
+            return True
+        if not self._multiplex_profiles_enabled():
+            return False
+        return bool(row.get("is_default") or name == "default")
 
     async def _rpc_skills_content(self, p: Dict[str, Any]) -> Any:
         name = _require(p, "name", "missing_skill_name")
@@ -3609,6 +3932,259 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             raise _RpcError("pending_not_found")
         return {"diff": wa.skill_pending_diff(rec)}
 
+    async def _rpc_client_capabilities(self, p: Dict[str, Any]) -> Any:
+        """Phone advertises playback support; adapter replies with live_stt.
+
+        Same fail-closed default as relay supported_ops: absent/false means
+        the peer does not have the feature.
+        """
+        if p.get("streaming_tts") is True:
+            self._client_streaming_tts = True
+        live_stt = await self._probe_live_stt(p)
+        return {
+            "streaming_tts": bool(self._client_streaming_tts),
+            "live_stt": live_stt,
+        }
+
+    async def _probe_live_stt(self, p: Dict[str, Any]) -> bool:
+        """Cheap probe under the chat's profile scope; False on any failure."""
+        try:
+            from tools.transcription_streaming import streaming_available
+
+            profile = None
+            if isinstance(p.get("core_profile"), str) and p.get("core_profile"):
+                try:
+                    profile = await self._resolve_core_profile(p.get("core_profile"))
+                except _RpcError:
+                    profile = None
+
+            def _check() -> bool:
+                return bool(streaming_available())
+
+            if profile:
+                return await self._run_under_profile(profile, _check)
+            return await asyncio.to_thread(_check)
+        except Exception as exc:
+            logger.debug("[hermes_bridge] live_stt probe failed: %s", exc)
+            return False
+
+    async def _run_under_profile(self, profile: Optional[str], fn: Callable[[], Any]) -> Any:
+        """Run ``fn`` in a worker under Hermes' config-only profile scope."""
+        def _scoped():
+            if not profile:
+                return fn()
+            try:
+                from hermes_cli.web_server_profiles import _config_profile_scope
+            except ImportError:
+                return fn()
+            with _config_profile_scope(profile):
+                return fn()
+
+        return await asyncio.to_thread(_scoped)
+
+    async def _send_stt_frame(self, role: str, stream_id: str, **extra: Any) -> None:
+        payload: Dict[str, Any] = {"role": role, "content": "", "stream_id": stream_id}
+        payload.update(extra)
+        await self._send_live_payload(payload)
+
+    async def _cancel_stt_session(
+        self, stream_id: str, *, reason: str, emit_error: bool = False
+    ) -> None:
+        live = self._stt_sessions.pop(stream_id, None)
+        if live is None:
+            return
+        live.cancelled = True
+        if live.duration_task and not live.duration_task.done():
+            live.duration_task.cancel()
+        try:
+            await asyncio.to_thread(live.session.cancel)
+        except Exception as exc:
+            logger.debug("[hermes_bridge] stt cancel failed: %s", exc)
+        if emit_error:
+            await self._send_stt_frame("stt_error", stream_id, message=reason)
+
+    async def _cancel_all_stt_sessions(self, reason: str) -> None:
+        for stream_id in list(getattr(self, "_stt_sessions", {}).keys()):
+            await self._cancel_stt_session(stream_id, reason=reason, emit_error=False)
+
+    async def _rpc_stt_stream_start(self, p: Dict[str, Any]) -> Any:
+        stream_id = _require(p, "stream_id", "missing_stream_id")
+        sample_rate = p.get("sample_rate")
+        try:
+            rate = int(sample_rate)
+        except (TypeError, ValueError):
+            raise _RpcError("invalid_sample_rate") from None
+        if not 8000 <= rate <= 48000:
+            raise _RpcError("invalid_sample_rate")
+        # Cap one live session per chat — cancel any previous before opening.
+        for existing_id in list(self._stt_sessions.keys()):
+            await self._cancel_stt_session(existing_id, reason="replaced", emit_error=True)
+
+        profile = None
+        if isinstance(p.get("core_profile"), str) and p.get("core_profile"):
+            try:
+                profile = await self._resolve_core_profile(p.get("core_profile"))
+            except _RpcError:
+                profile = None
+
+        loop = asyncio.get_running_loop()
+
+        def _open():
+            from tools.transcription_streaming import open_streaming_session
+
+            def on_partial(text: str) -> None:
+                live = self._stt_sessions.get(stream_id)
+                if live is None or live.cancelled or live.ended:
+                    return
+                live.mark_partial()
+                loop.call_soon_threadsafe(
+                    lambda: asyncio.ensure_future(
+                        self._send_stt_frame("stt_partial", stream_id, text=text)
+                    )
+                )
+
+            def _do_open():
+                return open_streaming_session(on_partial=on_partial)
+
+            if profile:
+                try:
+                    from hermes_cli.web_server_profiles import _config_profile_scope
+                except ImportError:
+                    return _do_open()
+                with _config_profile_scope(profile):
+                    return _do_open()
+            return _do_open()
+
+        session = await asyncio.to_thread(_open)
+        if session is None:
+            await self._send_stt_frame(
+                "stt_error", stream_id, message="no live STT for the configured provider"
+            )
+            return {"ok": False, "live_stt": False}
+
+        session.set_input_rate(rate)
+        live = LiveSttSession(stream_id=stream_id, session=session)
+        self._stt_sessions[stream_id] = live
+
+        async def _duration_cap() -> None:
+            try:
+                await asyncio.sleep(STT_MAX_DURATION_S)
+                if stream_id in self._stt_sessions:
+                    await self._cancel_stt_session(
+                        stream_id, reason="duration_cap", emit_error=True
+                    )
+            except asyncio.CancelledError:
+                return
+
+        live.duration_task = asyncio.ensure_future(_duration_cap())
+        return {"ok": True, "live_stt": True}
+
+    async def _rpc_stt_stream_audio(self, p: Dict[str, Any]) -> Any:
+        stream_id = _require(p, "stream_id", "missing_stream_id")
+        pcm_b64 = p.get("pcm_b64")
+        if not isinstance(pcm_b64, str) or not pcm_b64:
+            raise _RpcError("missing_pcm")
+        live = self._stt_sessions.get(stream_id)
+        if live is None or live.cancelled or live.ended:
+            raise _RpcError("stt_stream_not_found")
+        if stt_expired(live):
+            await self._cancel_stt_session(stream_id, reason="duration_cap", emit_error=True)
+            raise _RpcError("stt_stream_expired")
+        try:
+            pcm = base64.b64decode(pcm_b64, validate=False)
+        except Exception as exc:
+            raise _RpcError("invalid_pcm") from exc
+        try:
+            seq = p.get("seq")
+            if not isinstance(seq, int) or seq < 0:
+                raise _RpcError("invalid_seq")
+            async with live.lock:
+                if live.ended or live.cancelled:
+                    raise _RpcError("stt_stream_not_found")
+                if seq < live.next_seq:
+                    return {"ok": True}
+                if seq > live.next_seq + 16:
+                    raise _RpcError("stt_sequence_too_far_ahead")
+                live.pending.setdefault(seq, pcm)
+                while live.next_seq in live.pending:
+                    await asyncio.to_thread(live.session.push_audio, live.pending.pop(live.next_seq))
+                    live.next_seq += 1
+                live.audio_changed.set()
+        except Exception as exc:
+            await self._cancel_stt_session(stream_id, reason=str(exc), emit_error=True)
+            raise _RpcError("stt_push_failed") from exc
+        return {"ok": True}
+
+    async def _rpc_stt_stream_end(self, p: Dict[str, Any]) -> Any:
+        stream_id = _require(p, "stream_id", "missing_stream_id")
+        live = self._stt_sessions.get(stream_id)
+        if live is None:
+            raise _RpcError("stt_stream_not_found")
+        async with live.lock:
+            if live.ended or live.cancelled:
+                return {"ok": True}
+            last_seq = p.get("last_seq")
+            if last_seq is not None and (not isinstance(last_seq, int) or last_seq < -1):
+                raise _RpcError("invalid_last_seq")
+            deadline = asyncio.get_running_loop().time() + 2.0
+            while last_seq is not None and live.next_seq <= last_seq:
+                live.audio_changed.clear()
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                # Release the lock so late audio RPCs can drain the missing sequences.
+                live.lock.release()
+                try:
+                    await asyncio.wait_for(live.audio_changed.wait(), remaining)
+                except asyncio.TimeoutError:
+                    break
+                finally:
+                    await live.lock.acquire()
+                if live.cancelled or live.ended:
+                    return {"ok": True}
+            live.ended = True
+            if live.duration_task and not live.duration_task.done():
+                live.duration_task.cancel()
+
+            profile = None
+            if isinstance(p.get("core_profile"), str) and p.get("core_profile"):
+                try:
+                    profile = await self._resolve_core_profile(p.get("core_profile"))
+                except _RpcError:
+                    profile = None
+
+            def _finalize():
+                if profile:
+                    try:
+                        from hermes_cli.web_server_profiles import _config_profile_scope
+                    except ImportError:
+                        return live.session.finalize()
+                    with _config_profile_scope(profile):
+                        return live.session.finalize()
+                return live.session.finalize()
+
+            result = await asyncio.to_thread(_finalize)
+        self._stt_sessions.pop(stream_id, None)
+        if result.get("success"):
+            await self._send_stt_frame(
+                "stt_final",
+                stream_id,
+                transcript=str(result.get("transcript") or ""),
+                provider=str(result.get("provider") or ""),
+            )
+        else:
+            await self._send_stt_frame(
+                "stt_error",
+                stream_id,
+                message=str(result.get("error") or "transcription failed"),
+            )
+        return {"ok": True}
+
+    async def _rpc_stt_stream_cancel(self, p: Dict[str, Any]) -> Any:
+        stream_id = _require(p, "stream_id", "missing_stream_id")
+        await self._cancel_stt_session(stream_id, reason="cancelled", emit_error=False)
+        return {"ok": True}
+
     async def _rpc_chat_stop(self, p: Dict[str, Any]) -> Any:
         """Abort the in-flight chat turn (PRD_Features.md §2.6).
 
@@ -3737,11 +4313,10 @@ class HermesBridgeAdapter(BasePlatformAdapter):
     async def _rpc_profiles_list(self, p: Dict[str, Any]) -> Any:
         try:
             snap = await fetch_profiles_snapshot(self, include_sessions=False)
-            from hermes_cli.gateway_multiplex_served import recorded_served_profiles
-
-            served = recorded_served_profiles()
+            served = self._gateway_served_profiles()
             if not isinstance(served, (list, tuple, set)):
                 raise RuntimeError("served profile snapshot unavailable")
+            own = self._own_core_profile_name()
             profiles = []
             for row in snap.rows:
                 name = row.get("name")
@@ -3751,9 +4326,11 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                     resolved = await self._resolve_core_profile(name, snap, served)
                 except _RpcError:
                     continue
+                # Own named profiles (e.g. standalone `e2e`) resolve to None like
+                # `default`; still list them when this gateway serves them.
                 if resolved is None and not (
                     self._core_profile_row_is_served(row, served)
-                    and (row.get("is_default") or name == "default")
+                    and (row.get("is_default") or name == "default" or name == own)
                 ):
                     continue
                 if not self._core_profile_row_is_served(row, served):
@@ -4044,6 +4621,59 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             # Seed attempt failed — retry almost immediately rather than
             # waiting out a full interval with an unestablished baseline.
             await asyncio.sleep(self._APPROVAL_POLL_INTERVAL_S if seeded else 1)
+
+    async def _poll_kanban_events(self) -> None:
+        """Emit watched card transitions as unsolicited inbox frames.
+
+        Read-only by construction (``kanban_events.poll`` opens the DB with
+        ``mode=ro``). Disabled — with one log line — when no watch profiles
+        resolve, when the board file is absent, or when the file is not a
+        readable kanban schema; none of those may crash the gateway.
+        """
+        watched = kanban_events.watch_profiles(
+            getattr(self, "config", None), self._own_core_profile_name()
+        )
+        if not watched:
+            logger.info("[hermes_bridge] kanban events disabled: no watch profiles")
+            return
+        db_path = kanban_events.kanban_db_path()
+        cursor_path = kanban_events.state_path(self._profile_id)
+        cursor = kanban_events.load_cursor(cursor_path)
+        saved_cursor = cursor
+        unavailable_logged = False
+
+        while self._should_run:
+            try:
+                result = await asyncio.to_thread(
+                    kanban_events.poll, db_path, cursor, watched
+                )
+            except Exception as exc:
+                logger.warning("[hermes_bridge] kanban poll failed: %s", exc)
+                result = None
+
+            if result is None:
+                if not unavailable_logged:
+                    unavailable_logged = True
+                    logger.debug("[hermes_bridge] kanban events unavailable: %s", db_path)
+            else:
+                unavailable_logged = False
+                events, cursor = result
+                if cursor != saved_cursor:
+                    kanban_events.save_cursor(cursor_path, cursor)
+                    saved_cursor = cursor
+                for event in events:
+                    wire = dict(event)
+                    assignee = wire.pop("assignee", None)
+                    metadata: Dict[str, Any] = {"kanban_event": wire}
+                    if isinstance(assignee, str) and assignee:
+                        metadata["profile"] = assignee
+                    await self.send(
+                        chat_id="kanban",
+                        content=kanban_events.event_content(event),
+                        metadata=metadata,
+                    )
+
+            await asyncio.sleep(_KANBAN_POLL_INTERVAL_S)
 
     async def _upload_blob(self, sealed: bytes, mime: str) -> str:
         """POST sealed bytes to the relay's sealed-blob store

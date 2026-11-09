@@ -110,6 +110,9 @@ if "gateway.platforms.base" not in sys.modules:
     _gw_base.MessageType = MagicMock()
     _gw_base.Platform = MagicMock()
     _gw_base.ProcessingOutcome = _ProcessingOutcome
+    # Voice (streaming TTS) types adapter.py imports at module scope.
+    _gw_base.AudioFormat = MagicMock()
+    _gw_base.StreamingTTSHandle = MagicMock()
     sys.modules["gateway.platforms.base"] = _gw_base
 
 # `tools.write_approval`/`tools.memory_tool`/`tools.skill_manager_tool` are
@@ -218,6 +221,10 @@ def make_adapter(psk: bytes = PSK, profile_id: str = PROFILE):
         adapter._bots_enabled = None
         adapter._bot_chats = {}
         adapter._bot_poll_tasks = {}
+        # Voice: streaming TTS / live STT bookkeeping (monorepo make_adapter).
+        adapter._client_streaming_tts = False
+        adapter._tts_streams = {}
+        adapter._stt_sessions = {}
         # Opaque child refs + cached subagent.list/tail support — mirror
         # monorepo make_adapter (bot_subagents.py). Cleared on disconnect.
         adapter._subagent_refs = {}
@@ -234,4 +241,13 @@ def make_adapter(psk: bytes = PSK, profile_id: str = PROFILE):
         adapter._thread_phone_session = {}
         adapter._bare_key_phone_session = None
         adapter._active_threads = set()
+        # Constructor default (adapter.__init__); tests override per case.
+        adapter._relay_url = "ws://localhost:8082"
+        # Default harness is multiplex so roster tests that patch
+        # recorded_served_profiles keep working; standalone cases set False.
+        adapter.gateway_runner = type(
+            "Runner",
+            (),
+            {"config": type("Config", (), {"multiplex_profiles": True})()},
+        )()
     return adapter
