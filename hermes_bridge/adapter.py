@@ -46,6 +46,7 @@ from . import (
     bot_rooms,
     bot_subagents,
     kanban_events,
+    kanban_snapshot,
     local_owner,
     session_queued,
 )
@@ -92,6 +93,10 @@ _LIVE_EDIT_INTERVAL_S = 0.8
 # the pending-writes poll: cheap indexed reads, and nobody expects a board
 # change to reach the phone in less than a few seconds.
 _KANBAN_POLL_INTERVAL_S = 20.0
+# kanban.snapshot emitter (PRD_Inbox_Kanban.md §3/§4 wire contract) — feeds
+# the phone's kanban cache directly, so it polls faster than the Inbox-only
+# board-event watcher above; a snapshot is only pushed when it changed.
+_KANBAN_SNAPSHOT_POLL_INTERVAL_S = 5.0
 
 logger = logging.getLogger(__name__)
 _PRIVATE_IMPORT_WARNED: set[str] = set()
@@ -630,6 +635,16 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         # None means the watcher never started; the task disables itself when
         # no watch profiles are configured.
         self._kanban_poll_task: Optional[asyncio.Task] = None
+        # kanban.snapshot emitter (PRD_Inbox_Kanban.md §3/§4) — full-board
+        # push on change, feeds lib/kanban-cache.ts. Separate from the
+        # per-profile Inbox board-event watcher above.
+        self._kanban_snapshot_poll_task: Optional[asyncio.Task] = None
+        # Last emitted snapshot_json() string. None forces a resend on the
+        # next tick — true at process start, and reset on every reconnect
+        # (see _run_loop) so a phone that was offline for a board change
+        # gets the current state instead of waiting for the next change.
+        self._kanban_snapshot_last: Optional[str] = None
+        self._kanban_snapshot_db_missing_logged: bool = False
         # Capability handshake received from the relay on this connection (#40).
         # None means "no hello has arrived yet on this connection" — distinct
         # from an empty-ops descriptor, and reset on every reconnect since a
@@ -733,6 +748,11 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             self._approval_poll_task = asyncio.ensure_future(self._poll_pending_writes())
         if getattr(self, "_kanban_poll_task", None) is None or self._kanban_poll_task.done():
             self._kanban_poll_task = asyncio.ensure_future(self._poll_kanban_events())
+        if (
+            getattr(self, "_kanban_snapshot_poll_task", None) is None
+            or self._kanban_snapshot_poll_task.done()
+        ):
+            self._kanban_snapshot_poll_task = asyncio.ensure_future(self._poll_kanban_snapshot())
         self._ensure_bot_notify_observer()
         return ok
 
@@ -791,6 +811,10 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             # so a seq the relay legitimately resends must not be rejected as
             # already-seen from the PREVIOUS connection's state.
             self._inbound_seen_seq = 0
+            # A reconnect may have missed a board change while offline — force
+            # a resend on the first kanban.snapshot tick of the new
+            # connection instead of waiting for the board to change again.
+            self._kanban_snapshot_last = None
             # Any stream still awaiting its finalize died with the socket. The
             # flush in edit_message already ran for whichever edit failed.
             for message_id in list(self._stream_pending):
@@ -850,6 +874,13 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             self._kanban_poll_task = None
+        if getattr(self, "_kanban_snapshot_poll_task", None):
+            self._kanban_snapshot_poll_task.cancel()
+            try:
+                await self._kanban_snapshot_poll_task
+            except asyncio.CancelledError:
+                pass
+            self._kanban_snapshot_poll_task = None
         self._stop_bot_notify_observer()
         if self._bot_notify_task:
             try:
@@ -4674,6 +4705,63 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                     )
 
             await asyncio.sleep(_KANBAN_POLL_INTERVAL_S)
+
+    async def _kanban_snapshot_tick(self) -> None:
+        """One build-compare-send cycle for kanban.snapshot (PRD_Inbox_Kanban.md
+        §3/§4). Pulled out of _poll_kanban_snapshot so a test can drive one
+        cycle directly, same reason _diff_new_pending is a plain function.
+
+        Reuses _deliver, but with durable=False: seal-and-push-live only, no
+        durable enqueue (see the comment at the call site below). _run_loop's
+        reconnect of the gateway's own socket to the relay resets
+        `_kanban_snapshot_last`, so the first tick after THAT reconnect
+        treats the board as changed and retries the send — but it only
+        reaches the phone if the phone itself is connected when the frame
+        goes out. That reset is not proof that a phone which was offline
+        when the board changed gets the snapshot once the phone reconnects.
+        """
+        try:
+            snapshot = await asyncio.to_thread(kanban_snapshot.build_snapshot)
+        except FileNotFoundError:
+            if not self._kanban_snapshot_db_missing_logged:
+                self._kanban_snapshot_db_missing_logged = True
+                logger.debug("[hermes_bridge] kanban snapshot unavailable: no kanban.db")
+            return
+        except Exception as exc:
+            logger.warning("[hermes_bridge] kanban snapshot build failed: %s", exc)
+            return
+
+        self._kanban_snapshot_db_missing_logged = False
+        body = kanban_snapshot.snapshot_json(snapshot)
+        if body == self._kanban_snapshot_last:
+            return
+
+        msg_id = str(uuid.uuid4())
+        payload: Dict[str, Any] = {"role": "kanban.snapshot", "content": body, "msg_id": msg_id}
+        try:
+            # durable=False: live push only, no durable enqueue and no "New
+            # message" push. A phone that is not connected when the frame
+            # goes out misses it until the board changes again or the
+            # gateway reconnects to the relay (_run_loop resets
+            # _kanban_snapshot_last on that reconnect, forcing a retry).
+            result = await self._deliver(msg_id, payload, category=None, durable=False)
+        except Exception as exc:
+            logger.warning("[hermes_bridge] kanban snapshot send failed: %s", exc)
+            return
+        if result.success:
+            self._kanban_snapshot_last = body
+
+    async def _poll_kanban_snapshot(self) -> None:
+        """Push the full board to the phone's kanban cache on change.
+
+        Unlike _poll_kanban_events (per-profile Inbox items), this always
+        covers board "default" with no watch-profile gating. Errors are
+        logged and swallowed per tick — same contract as
+        _poll_pending_writes — so a bad tick never kills the connection.
+        """
+        while self._should_run:
+            await self._kanban_snapshot_tick()
+            await asyncio.sleep(_KANBAN_SNAPSHOT_POLL_INTERVAL_S)
 
     async def _upload_blob(self, sealed: bytes, mime: str) -> str:
         """POST sealed bytes to the relay's sealed-blob store
