@@ -3339,6 +3339,26 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         query = {"days": days, **await self._profile_body(p)}
         return await self._api.get(f"/api/analytics/usage?{urlencode(query)}")
 
+    def _kanban_feature_enabled(self) -> bool:
+        """Prefer the live runner's plugin gate; old runtimes fall back to its DB."""
+        try:
+            runner = getattr(self, "gateway_runner", None)
+            config = getattr(runner, "config", None) if runner is not None else None
+            plugins = config.get("plugins") if isinstance(config, dict) else getattr(config, "plugins", None)
+            if plugins is not None:
+                enabled = plugins.get("enabled") if isinstance(plugins, dict) else getattr(plugins, "enabled", None)
+                disabled = plugins.get("disabled") if isinstance(plugins, dict) else getattr(plugins, "disabled", None)
+                if enabled is not None or disabled is not None:
+                    enabled_names = set(enabled) if isinstance(enabled, (list, tuple, set)) else set()
+                    disabled_names = set(disabled) if isinstance(disabled, (list, tuple, set)) else set()
+                    return "kanban" in enabled_names and "kanban" not in disabled_names
+        except Exception:
+            pass
+        try:
+            return os.path.isfile(kanban_events.kanban_db_path())
+        except Exception:
+            return False
+
     async def _rpc_agents_list(self, p: Dict[str, Any]) -> Any:
         deadline = asyncio.get_running_loop().time() + _AGENTS_SUBCALL_TIMEOUT
 
@@ -3442,7 +3462,9 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         return {"hermes_version": status.get("version") if isinstance(status, dict) else None,
                 "can_update_hermes": status.get("can_update_hermes") if isinstance(status, dict) else None,
                 "plugin_version": version_match.group(1) if version_match else None,
-                "profile_scoping": profile_scoping, "agents": agents}
+                "profile_scoping": profile_scoping,
+                "features": {"inbox": True, "kanban": self._kanban_feature_enabled()},
+                "agents": agents}
 
     @staticmethod
     def _project_connector_status(row: Dict[str, Any]) -> Dict[str, Any]:
