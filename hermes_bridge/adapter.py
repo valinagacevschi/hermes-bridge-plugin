@@ -2310,6 +2310,21 @@ class HermesBridgeAdapter(BasePlatformAdapter):
     # connection errors propagate — _handle_rpc classifies them uniformly.
     # ------------------------------------------------------------------
 
+    async def _rpc_kanban_resync(self, p: Dict[str, Any]) -> Any:
+        """Resend the current board after the phone's stream reconnects
+        (PRD_Inbox_Kanban.md §3/§4).
+
+        `_kanban_snapshot_last` records a successful bridge→relay WS send,
+        not phone delivery — the relay publishes live frames with no
+        per-phone buffer. A phone that reconnects after a board change hence
+        keeps a stale cache until the board changes again. Clearing the
+        watermark forces _kanban_snapshot_tick to resend even when the body
+        is unchanged; the send stays durable=False (live-only, no push).
+        """
+        self._kanban_snapshot_last = None
+        await self._kanban_snapshot_tick()
+        return {"ok": True}
+
     async def _listed_bridge_sessions(
         self,
         core_profile: Optional[str] = None,
@@ -4459,6 +4474,9 @@ class HermesBridgeAdapter(BasePlatformAdapter):
 
     async def _rpc_rooms_approve(self, p: Dict[str, Any]) -> Any:
         return await bot_rooms.approve_room(self, p)
+
+    async def _rpc_rooms_context(self, p: Dict[str, Any]) -> Any:
+        return await bot_rooms.context(self, p)
 
     async def _rpc_rooms_close(self, p: Dict[str, Any]) -> Any:
         return await bot_rooms.close_room(self, p)

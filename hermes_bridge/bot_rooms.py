@@ -47,6 +47,12 @@ def _control_cap(available: bool, reason: Optional[str] = None) -> Dict[str, Any
     return {"available": available, "reason": reason}
 
 
+def _context_cap(available: bool, reason: Optional[str] = None) -> Dict[str, Any]:
+    """Room settings gate — never advertise lead/auto when the write path is missing."""
+    modes = [_ROUTING_EVERYONE, _ROUTING_LEAD, _ROUTING_AUTO] if available else [_ROUTING_EVERYONE]
+    return {"available": available, "reason": reason, "routing_modes": modes}
+
+
 def _blocked(reason: str) -> Dict[str, Any]:
     return {
         "available": False,
@@ -57,6 +63,7 @@ def _blocked(reason: str) -> Dict[str, Any]:
         "methods": [],
         "stop": _control_cap(False, reason),
         "approve": _control_cap(False, reason),
+        "context": _context_cap(False, reason),
     }
 
 
@@ -339,6 +346,7 @@ async def capabilities(host: Any, _params: Dict[str, Any]) -> Dict[str, Any]:
         return result
     stop_ok = "groups.stop" in method_names
     approve_ok = "groups.approve" in method_names
+    context_ok = "groups.context" in method_names
     result = {
         "available": True,
         "reason": None,
@@ -348,6 +356,7 @@ async def capabilities(host: Any, _params: Dict[str, Any]) -> Dict[str, Any]:
         "methods": [str(m) for m in methods],
         "stop": _control_cap(True) if stop_ok else _control_cap(False, "stop_unsupported"),
         "approve": _control_cap(True) if approve_ok else _control_cap(False, "approve_unsupported"),
+        "context": _context_cap(True) if context_ok else _context_cap(False, "context_unsupported"),
     }
     host._room_caps = result
     return result
@@ -358,6 +367,88 @@ async def _require_rooms(host: Any) -> Dict[str, Any]:
     if not caps.get("available"):
         raise _RpcError(str(caps.get("reason") or "rooms_unavailable"))
     return caps
+
+
+def _context_rpc_error(exc: _LocalRpcError) -> str:
+    """groups.state/context LocalRpcError → phone error.
+
+    Heuristic on the upstream message: a disbanded or unknown room is gone;
+    every other upstream failure is transient/unavailable.
+    """
+    message = str(getattr(exc, "message", "") or "").lower()
+    if "disband" in message or "not found" in message or "unknown room" in message:
+        return "room_gone"
+    return "rooms_unavailable"
+
+
+async def context(host: Any, params: Dict[str, Any]) -> Dict[str, Any]:
+    """rooms.context: PATCH purpose/notes/routing; omitted fields keep live values."""
+    require_bots_enabled()
+    await _require_rooms(host)
+    room_id = str(params.get("room_id") or "").strip()
+    if not room_id:
+        raise _RpcError("invalid_room")
+    event_id = str(params.get("event_id") or "").strip()
+    if not event_id:
+        raise _RpcError("invalid_event")
+    try:
+        state = await host._local_rpc("groups.state", {"room_id": room_id})
+    except _LocalRpcError as exc:
+        raise _RpcError(_context_rpc_error(exc)) from exc
+    room_raw = state.get("room") if isinstance(state, dict) else None
+    if not isinstance(room_raw, dict) or room_raw.get("disbanded_at") is not None:
+        raise _RpcError("room_gone")
+    current = _project_context(state.get("context") if isinstance(state, dict) else None) or {
+        "purpose": "",
+        "notes": "",
+        "routing": _ROUTING_EVERYONE,
+        "lead_member_id": "",
+    }
+    # Key absent = keep live value; "" is an explicit clear.
+    for field in ("purpose", "notes", "lead_member_id"):
+        if field in params and not isinstance(params[field], str):
+            raise _RpcError("invalid_params")
+    purpose = params["purpose"] if "purpose" in params else current["purpose"]
+    notes = params["notes"] if "notes" in params else current["notes"]
+    lead_member_id = (
+        params["lead_member_id"] if "lead_member_id" in params else current["lead_member_id"]
+    )
+    routing = params["routing"] if "routing" in params else current["routing"]
+    if not isinstance(routing, str) or routing not in _ROUTING_MODES:
+        raise _RpcError("invalid_routing")
+    if routing == _ROUTING_LEAD:
+        members_raw = room_raw.get("members") if isinstance(room_raw.get("members"), list) else []
+        seated = {
+            str(m.get("member_id") or "")
+            for m in members_raw
+            if isinstance(m, dict)
+        }
+        if not lead_member_id or lead_member_id not in seated:
+            raise _RpcError("recipient_unknown")
+    try:
+        await host._local_rpc(
+            "groups.context",
+            {
+                "room_id": room_id,
+                "event_id": event_id,
+                "purpose": purpose,
+                "notes": notes,
+                "routing": routing,
+                "lead_member_id": lead_member_id,
+            },
+        )
+    except _LocalRpcError as exc:
+        raise _RpcError(_context_rpc_error(exc)) from exc
+    return {
+        "ok": True,
+        "context": {
+            "purpose": purpose,
+            "notes": notes,
+            "routing": routing,
+            "lead_member_id": lead_member_id,
+            "unmentioned_delivery": _delivery_from_routing(routing),
+        },
+    }
 
 
 async def list_rooms(host: Any, _params: Dict[str, Any]) -> Dict[str, Any]:

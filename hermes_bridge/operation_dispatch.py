@@ -135,7 +135,9 @@ class OperationDispatcher:
         "rooms.log": "_rpc_rooms_log",
         "rooms.stop": "_rpc_rooms_stop",
         "rooms.approve": "_rpc_rooms_approve",
+        "rooms.context": "_rpc_rooms_context",
         "rooms.close": "_rpc_rooms_close",
+        "kanban.resync": "_rpc_kanban_resync",
     }
 
     def __init__(self, host: Any):

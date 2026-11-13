@@ -1012,7 +1012,15 @@ class TestLocalApiAutostart(unittest.IsolatedAsyncioTestCase):
         psutil.process_iter.return_value = [decoy, real]
         psutil.NoSuchProcess = psutil.AccessDenied = _NeverRaised
 
-        with patch.dict("sys.modules", {"psutil": psutil}):
+        with patch.dict("sys.modules", {"psutil": psutil}), patch.dict(
+            os.environ, {"HERMES_HOME": str(Path.home() / ".hermes")}, clear=False
+        ):
+            # Pin the profile: discovery's own profile comes from the CALLER's
+            # HERMES_HOME (#143), and the mocked serve below carries no -p
+            # (profile "default") — under a profile harness (e.g.
+            # ~/.hermes/profiles/expo-hermes) it would be filtered as foreign
+            # and the test would fail whenever the runner itself runs in a
+            # named profile.
             assert discover_dashboard_ports() == [9131]
 
     async def test_does_not_start_a_second_api_over_a_live_one(self):
