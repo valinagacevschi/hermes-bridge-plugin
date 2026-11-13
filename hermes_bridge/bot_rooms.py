@@ -1,5 +1,6 @@
 # Hosted Bot rooms: groups.* ops; #84 H: phone owns seq cursor (handle has no cursor).
 # #149: project groups.state context + member_activity; derive unmentioned_delivery from routing.
+# #140: scheduled room posts (actor id cron:<label>) project as agent-side rows.
 """Phone-facing rooms.* operations over Hermes hosted-room groups.* RPCs."""
 
 from __future__ import annotations
@@ -8,7 +9,7 @@ import re
 import secrets
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .bots_policy import (
     bots_flag_enabled,
@@ -31,6 +32,12 @@ _MENTION_RE = re.compile(r"@([A-Za-z0-9][A-Za-z0-9._:-]*)", re.IGNORECASE)
 _RESERVED_HANDLES = frozenset({"all", "everyone"})
 # Upstream Discussion resolve_mentions(..., default_all=True) — not a
 # groups.capabilities field; phone must not invent a different policy.
+_SCHEDULED_POST_PREFIX = "cron:"
+_SCHEDULED_NOTICE_PREFIX = "cron-notice:"
+# #140: host scheduled-post actor ids — gateway/hosted_room_context.py
+# (SCHEDULED_POST_PREFIX = "cron:", SCHEDULED_NOTICE_PREFIX = "cron-notice:").
+# Declared locally (not imported from the host) so PRIVATE_IMPORTS count
+# stays flat; the strings must be kept in step with the host constants.
 _REQUIRED_METHODS = frozenset(
     {
         "groups.capabilities",
@@ -117,6 +124,24 @@ def _project_room(raw: Dict[str, Any], available_profiles: Set[str]) -> Dict[str
     }
 
 
+def _scheduled_post_match(actor_id: str) -> Optional[Tuple[str, str]]:
+    """Host scheduled-post actor id → (flag, label); None for interactive senders.
+
+    Matches the host constants (gateway/hosted_room_context.py). The host only
+    labels ``message.user`` events with prefixed ids, so the id alone selects
+    the branch. A bare prefix (empty label) is outside the host contract and
+    falls through to the ordinary user row.
+    """
+    for prefix, flag in (
+        (_SCHEDULED_NOTICE_PREFIX, "notice"),
+        (_SCHEDULED_POST_PREFIX, "post"),
+    ):
+        label = actor_id[len(prefix):] if actor_id.startswith(prefix) else ""
+        if label:
+            return (flag, label)
+    return None
+
+
 def _project_event(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not isinstance(raw, dict):
         return None
@@ -126,27 +151,39 @@ def _project_event(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     text = payload.get("text")
     if not isinstance(text, str):
         return None
+    scheduled: Optional[Tuple[str, str]] = None
     if kind == "message.user":
-        role = "user"
+        # #140: host scheduled posts ride message.user with a cron:<label> /
+        # cron-notice:<label> actor id — project them agent-side, labelled with
+        # the job, so the phone does not render them as the human's own rows.
+        scheduled = _scheduled_post_match(str(actor.get("id") or ""))
+        role = "assistant" if scheduled else "user"
         turn_id = None
     elif kind == "message.member":
         role = "assistant"
         turn_id = str(payload.get("turn_id") or "") or None
     else:
         return None
-    return {
+    author = {
+        "kind": str(actor.get("kind") or ""),
+        "id": str(actor.get("id") or ""),
+    }
+    if scheduled is not None:
+        author = {"kind": "scheduled", "id": scheduled[1]}
+    row = {
         "id": str(raw.get("event_id") or ""),
         "seq": int(raw.get("seq") or 0),
         "role": role,
-        "author": {
-            "kind": str(actor.get("kind") or ""),
-            "id": str(actor.get("id") or ""),
-        },
+        "author": author,
         "turn_id": turn_id,
         "content": text,
         "ts": float(raw.get("created_at") or 0),
         "thread_id": str(payload.get("thread_id") or "") or None,
     }
+    # Non-scheduled rows keep today's exact payload shape: no `scheduled` key.
+    if scheduled is not None:
+        row["scheduled"] = scheduled[0]
+    return row
 
 
 
