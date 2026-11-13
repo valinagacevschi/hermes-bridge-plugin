@@ -46,6 +46,7 @@ from . import (
     bot_rooms,
     bot_subagents,
     kanban_events,
+    kanban_op_exec,
     kanban_snapshot,
     local_owner,
     session_queued,
@@ -2324,6 +2325,39 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         self._kanban_snapshot_last = None
         await self._kanban_snapshot_tick()
         return {"ok": True}
+
+    def _kanban_op_receiver(self) -> kanban_op_exec.KanbanOpReceiver:
+        """The kanban.op receiver (GitLab #156) — lazily built, test-replaceable."""
+        receiver = getattr(self, "_kanban_op_receiver_cache", None)
+        if receiver is None:
+            receiver = kanban_op_exec.KanbanOpReceiver(
+                kanban_op_exec.GatewayKanbanExecutor(self._profile_id),
+                ledger=kanban_op_exec.KanbanOpLedger(kanban_op_exec.ledger_path(self._profile_id)),
+                version_fn=kanban_snapshot.build_snapshot,
+                on_mutated=self._kanban_snapshot_tick,
+            )
+            self._kanban_op_receiver_cache = receiver
+        return receiver
+
+    async def _rpc_kanban_op(self, p: Dict[str, Any]) -> Any:
+        """Kanban op receiver (PRD_Inbox_Kanban.md §2.1/§4; GitLab #156).
+
+        ``p`` is the phone's sealed-frame OpRequest body verbatim (the sealed
+        envelope itself was already verified and decrypted in ``_read_frame``).
+        The returned data is an Ack body mirrored from lib/kanban-wire.ts with
+        a mandatory op_id echo, acked in order under the receiver's serial
+        lock. Only a body without a usable op_id and an executor turn that
+        does not settle within its bound raise: those become rpc errors
+        ("malformed…" / "executor_timeout") so the phone's op queue treats
+        them as retryable transport failures, never as successes.
+        """
+        receiver = self._kanban_op_receiver()
+        try:
+            return await receiver.handle(p)
+        except kanban_op_exec.KanbanOpTransportError as exc:
+            raise _RpcError(str(exc))
+        except kanban_op_exec.KanbanOpExecutionTimeout:
+            raise _RpcError("executor_timeout")
 
     async def _listed_bridge_sessions(
         self,

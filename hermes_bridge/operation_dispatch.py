@@ -138,6 +138,7 @@ class OperationDispatcher:
         "rooms.context": "_rpc_rooms_context",
         "rooms.close": "_rpc_rooms_close",
         "kanban.resync": "_rpc_kanban_resync",
+        "kanban.op": "_rpc_kanban_op",
     }
 
     def __init__(self, host: Any):
