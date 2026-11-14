@@ -45,6 +45,37 @@ serves it, as a child of the gateway that exits with it. Already run your own
 
 `pair.py --check` reports all of the above without touching the relay.
 
+**Pairing from inside Hermes: `/pair`.** Once the plugin is enabled, the same
+thing is a slash command (Hermes 0.22.3 or newer; older Hermes answers with a
+pointer back to `pair.py`):
+
+- In the Hermes CLI (or a TUI/Desktop session) `/pair` prints the pairing code,
+  the terminal QR, and the readiness report, like `pair.py`. `/pair --check`
+  only reports. `/pair --verbose` adds the sensitive dump (API key, PSK, raw
+  relay response) and is refused everywhere except a local session.
+- In a direct message on a messaging gateway (Telegram, Discord, ...) `/pair`
+  sends the QR as an image, the pairing code as text, and a warning that the
+  image is a secret. It refuses group chats. The image file is written `0600`
+  under `~/.hermes/cache/images/` and deleted after five minutes; the chat
+  message itself stays until you delete it, so delete it once the phone is
+  paired. Without `qrcode` it mints nothing and says how to fix it — the key
+  is never sent as text.
+- Only senders the gateway already authorizes can run it (unknown senders
+  never reach a command). If several people can talk to your gateway, list
+  yourself in `allow_admin_from` for that platform so only admins can run
+  plugin commands such as `/pair`.
+
+The QR carries the end-to-end key, so the trade-off is yours: a QR sent through
+Telegram (or any third-party messenger) passes through, and may stay on, that
+service's servers, and through any device signed in to the chat. Until the
+invite is used (single use, about an hour), whoever scans the image first gets a
+paired phone talking to your agent; after that it still holds the key that
+decrypts traffic between this laptop and your phones. Prefer `/pair` in the CLI when
+you are at the laptop; use the chat when you are not, delete the message after
+scanning, and re-key (delete `~/.hermes/psk`, pair again, re-scan) if the image
+went somewhere it should not have. Asking the agent in plain words ("pair my
+phone") gets you pointed at `/pair`; the agent itself never handles the key.
+
 The Runs and Approvals tabs need one more surface — Hermes' `/v1/runs` routes.
 Set `platforms.api_server.enabled: true` in `~/.hermes/config.yaml` for those
 two, then send one chat message to confirm replies still arrive: that setting
