@@ -81,6 +81,17 @@ for f in "${PURE_COPY_FILES[@]}"; do
 done
 cp "$SRC_PLUGIN/requirements.txt" "$DST_REPO/requirements.txt"
 
+# Plugin-bundled skills (registered with ctx.register_skill, e.g. pair-phone)
+# live under skills/<name>/ — a directory tree the top-level *.py glob above
+# never sees. Mirror it wholesale (delete first so a skill removed upstream is
+# removed here too); markdown only, so no import rewriting applies.
+rm -rf "$DST_REPO/hermes_bridge/skills"
+if [[ -d "$SRC_PLUGIN/skills" ]]; then
+  echo "Copying skills/..."
+  cp -R "$SRC_PLUGIN/skills" "$DST_REPO/hermes_bridge/skills"
+  find "$DST_REPO/hermes_bridge/skills" -type f | sed "s#^$DST_REPO/hermes_bridge/#  #"
+fi
+
 # ---------------------------------------------------------------------------
 # Bucket 1b: production modules that need a namespace rewrite
 # ---------------------------------------------------------------------------
