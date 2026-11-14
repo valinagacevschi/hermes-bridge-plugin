@@ -220,6 +220,7 @@ def make_adapter(psk: bytes = PSK, profile_id: str = PROFILE):
         adapter._local_ws_next_id = 1
         adapter._bots_enabled = None
         adapter._bot_chats = {}
+        adapter._local_viewer_entries = {}
         adapter._bot_poll_tasks = {}
         # Voice: streaming TTS / live STT bookkeeping (monorepo make_adapter).
         adapter._client_streaming_tts = False
