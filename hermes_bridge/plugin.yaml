@@ -36,8 +36,9 @@ tags:
 # do not — after-install.md has the manual pip fallback for those.
 python_dependencies:
   - PyNaCl>=1.6,<1.7
-  # pair.py renders the pairing QR with it; without it pairing degrades to a
-  # payload string nobody can scan. Hermes core pins qrcode==7.4.2 in its
+  # pair.py and /pair render the pairing QR with it (the PNG a chat gets uses
+  # its bundled pypng writer); without it the terminal degrades to a payload
+  # string nobody can scan, and a chat gets no QR at all. Hermes core pins qrcode==7.4.2 in its
   # messaging/dingtalk/feishu extras, so the range stays compatible with those.
   - qrcode>=7.4,<8
 # All three are written by pair.py, not typed by the user, so none belong in

@@ -12,6 +12,9 @@ end-to-end PSK at ``~/.hermes/psk``, and prints a QR holding ``{token, psk}``. L
 fresh phone invite — run it again whenever an invite expires or a second phone
 needs pairing.
 
+Inside Hermes, the plugin's ``/pair`` command (pair_command.py) runs the same
+steps through ``mint_invite`` and renders the result in the CLI or a chat.
+
 Pass ``--verbose`` to print the complete provision response, credentials, PSK,
 and exact QR payload for troubleshooting or manual entry. These values are
 sensitive and are hidden by default.
@@ -27,6 +30,7 @@ whichever of those is installed, so ``python3 pair.py`` works either way.
 """
 
 import binascii
+import io
 import json
 import os
 import socket
@@ -34,8 +38,9 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 # The port list belongs to local_api.py, which owns everything about Hermes'
 # localhost API — importing it keeps this script from carrying a second copy
@@ -75,6 +80,50 @@ def die(msg: str) -> None:
     sys.exit(1)
 
 
+class PairError(Exception):
+    """A pairing step failed.
+
+    ``str(error)`` is the full operator message the script has always printed
+    after ``error:`` — it can quote a relay response body, which may carry the
+    laptop API key. ``summary`` names the failure without quoting anything,
+    for surfaces that are not this terminal (a chat).
+    """
+
+    def __init__(self, message: str, summary: str = ""):
+        super().__init__(message)
+        self.summary = summary or message
+
+
+@dataclass(frozen=True)
+class PairingInvite:
+    """One minted phone invite and everything needed to show or scan it.
+
+    ``payload`` is the exact QR content, ``{token, psk}``: whoever holds it can
+    claim the invite AND decrypt this laptop's traffic. ``provisioned`` is True
+    when this run created the profile, so a running gateway has not loaded the
+    new credentials yet.
+    """
+
+    token: str
+    expires_at: str
+    profile_id: str
+    api_key: str
+    psk_hex: str
+    payload: str
+    response: dict
+    provisioned: bool
+    relay_url: str
+
+
+def _silent(_message: str) -> None:
+    pass
+
+
+def default_hermes_home() -> Path:
+    """The Hermes home this script has always used: ``$HERMES_HOME`` or ``~/.hermes``."""
+    return Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+
+
 def read_env(env_file: Path) -> dict:
     """Parse ~/.hermes/.env well enough to find our three keys."""
     values = {}
@@ -110,22 +159,23 @@ def post(url: str, payload: dict) -> dict:
             return json.loads(response.read())
     except urllib.error.HTTPError as exc:
         body = exc.read().decode(errors="replace")[:200]
-        die(f"relay returned {exc.code}: {body}")
+        raise PairError(f"relay returned {exc.code}: {body}", f"relay returned HTTP {exc.code}") from exc
     except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
-        die(f"relay unreachable: {exc}")
+        raise PairError(f"relay unreachable: {exc}", "relay unreachable") from exc
 
 
-def load_or_create_psk(psk_file: Path) -> str:
+def load_or_create_psk(psk_file: Path, log: Callable[[str], None] = print) -> str:
     """Return the 32-byte PSK as hex, creating it on first run."""
     if psk_file.exists():
         psk = psk_file.read_bytes()
         if len(psk) != 32:
-            die(f"{psk_file} is {len(psk)} bytes, expected 32 — delete it to regenerate")
+            message = f"{psk_file} is {len(psk)} bytes, expected 32 — delete it to regenerate"
+            raise PairError(message)
     else:
         psk = os.urandom(32)
         psk_file.write_bytes(psk)
         psk_file.chmod(0o600)
-        print(f"Generated E2E PSK → {psk_file} (chmod 600)")
+        log(f"Generated E2E PSK → {psk_file} (chmod 600)")
     return binascii.hexlify(psk).decode()
 
 
@@ -254,7 +304,7 @@ def reexec_under_hermes_python(hermes_home: Path) -> None:
         return
 
 
-def authorize_adapter_user(env_file: Path, env: dict) -> None:
+def authorize_adapter_user(env_file: Path, env: dict, log: Callable[[str], None] = print) -> None:
     """Allowlist the adapter's user id for Hermes' authorization gate.
 
     Hermes default-denies a sender when no allowlist is configured for the
@@ -272,7 +322,7 @@ def authorize_adapter_user(env_file: Path, env: dict) -> None:
     configured = env.get("HERMES_BRIDGE_ALLOWED_USERS", "")
     if configured:
         if ADAPTER_USER_ID not in [u.strip() for u in configured.split(",")]:
-            print(
+            log(
                 f"warning: HERMES_BRIDGE_ALLOWED_USERS={configured} does not include "
                 f"'{ADAPTER_USER_ID}' — Hermes will not recognize the phone. Add it, "
                 "or approve the pairing code Hermes offers on the first message."
@@ -280,10 +330,11 @@ def authorize_adapter_user(env_file: Path, env: dict) -> None:
         return
     with env_file.open("a", encoding="utf-8") as handle:
         handle.write(f"HERMES_BRIDGE_ALLOWED_USERS={ADAPTER_USER_ID}\n")
-    print(f"Authorized the bridge's sender in {env_file} (HERMES_BRIDGE_ALLOWED_USERS)")
+    log(f"Authorized the bridge's sender in {env_file} (HERMES_BRIDGE_ALLOWED_USERS)")
 
 
-def set_home_channel(env_file: Path, env: dict, profile_id: str) -> None:
+def set_home_channel(env_file: Path, env: dict, profile_id: str,
+                     log: Callable[[str], None] = print) -> None:
     """Point Hermes' cron/notification delivery at this phone.
 
     A home channel is where Hermes sends cron results and cross-platform
@@ -297,7 +348,7 @@ def set_home_channel(env_file: Path, env: dict, profile_id: str) -> None:
         return
     with env_file.open("a", encoding="utf-8") as handle:
         handle.write(f"HERMES_BRIDGE_HOME_CHANNEL={profile_id}\n")
-    print(f"Set this chat as the home channel for cron results and notifications")
+    log("Set this chat as the home channel for cron results and notifications")
 
 
 def dashboard_port(env: dict) -> Optional[int]:
@@ -324,7 +375,7 @@ def dashboard_port(env: dict) -> Optional[int]:
     return None
 
 
-def readiness_report(hermes_home: Path, env: dict) -> list:
+def readiness_checks(hermes_home: Path, env: dict) -> list:
     """Check the things that only fail at first use, and say how to fix them.
 
     Every one of these was found by a user chatting to a freshly paired phone
@@ -401,12 +452,25 @@ def readiness_report(hermes_home: Path, env: dict) -> list:
             "hermes plugins enable hermes_bridge",
         ))
 
-    print()
-    print("Readiness:")
+    return checks
+
+
+def format_readiness(checks: list) -> list[str]:
+    """The readiness block as lines: a ``Readiness:`` heading, then one line per check."""
+    lines = ["Readiness:"]
     for status, label, fix in checks:
-        print(f"  {status:<4} {label}")
+        lines.append(f"  {status:<4} {label}")
         if fix:
-            print(f"       fix: {fix}")
+            lines.append(f"       fix: {fix}")
+    return lines
+
+
+def readiness_report(hermes_home: Path, env: dict) -> list:
+    """Run ``readiness_checks`` and print the block, as ``--check`` and a pairing run do."""
+    checks = readiness_checks(hermes_home, env)
+    print()
+    for line in format_readiness(checks):
+        print(line)
     return checks
 
 
@@ -464,40 +528,171 @@ def _plugin_enabled(hermes_home: Path) -> Optional[bool]:
     return None
 
 
-def print_qr(payload: str) -> None:
+def qr_available() -> bool:
+    try:
+        import qrcode  # noqa: F401,PLC0415 — optional, absent on a bare Hermes install
+    except ImportError:
+        return False
+    return True
+
+
+def qr_text(payload: str) -> Optional[str]:
+    """The terminal QR exactly as ``print_ascii(invert=True)`` draws it, or None without qrcode."""
     try:
         import qrcode  # noqa: PLC0415 — optional, absent on a bare Hermes install
     except ImportError:
-        print("  No QR: `qrcode` is missing from the Hermes dependency environment.")
-        print(f"  {_MODERN_DEPS}.")
-        print(f"  Older installs: {_LEGACY_QR}")
-        print(f"  payload (manual entry): {payload}")
-        return
+        return None
     qr = qrcode.QRCode(border=1)
     qr.add_data(payload)
     qr.make(fit=True)
-    qr.print_ascii(invert=True)
+    out = io.StringIO()
+    qr.print_ascii(out=out, invert=True)
+    return out.getvalue().rstrip("\n")
+
+
+def qr_missing_lines(payload: str) -> list[str]:
+    """What a terminal shows instead of the QR: the fix, and the payload for manual entry."""
+    return [
+        "  No QR: `qrcode` is missing from the Hermes dependency environment.",
+        f"  {_MODERN_DEPS}.",
+        f"  Older installs: {_LEGACY_QR}",
+        f"  payload (manual entry): {payload}",
+    ]
+
+
+def write_qr_png(payload: str, path: Path) -> bool:
+    """Write the QR as a PNG readable only by this user; False when it cannot be drawn.
+
+    qrcode 7.x always brings ``pypng``, so the pure-Python writer is tried
+    first and Pillow (core on current Hermes) is only a fallback. The border is
+    the spec's four modules: this image gets photographed off another screen,
+    not read straight from a terminal. ``O_EXCL`` refuses to write through a
+    file or link someone planted at the path.
+    """
+    try:
+        import qrcode  # noqa: PLC0415 — optional, absent on a bare Hermes install
+    except ImportError:
+        return False
+    qr = qrcode.QRCode(border=4, box_size=10)
+    qr.add_data(payload)
+    qr.make(fit=True)
+    try:
+        try:
+            from qrcode.image.pure import PyPNGImage  # noqa: PLC0415
+
+            image = qr.make_image(image_factory=PyPNGImage)
+        except ImportError:
+            image = qr.make_image()
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except Exception:  # noqa: BLE001 — no image backend, or the path is taken: the caller falls back
+        return False
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            image.save(handle)
+    except Exception:  # noqa: BLE001 — a half-written secret is removed, then the caller falls back
+        Path(path).unlink(missing_ok=True)
+        return False
+    return True
+
+
+def print_qr(payload: str) -> None:
+    drawn = qr_text(payload)
+    if drawn is None:
+        for line in qr_missing_lines(payload):
+            print(line)
+        return
+    print(drawn)
+
+
+def verbose_lines(response: dict, profile_id: str, api_key: str,
+                  psk_hex: str, payload: str) -> list[str]:
+    """Every pairing value, for troubleshooting and manual entry.
+
+    These values are deliberately omitted from the normal output because the
+    API key and PSK grant access to the paired bridge.  ``--verbose`` is an
+    explicit opt-in for operators who need to inspect or recover the payload,
+    and only a local terminal ever gets it.
+    """
+    return [
+        "",
+        "Verbose pairing data (sensitive — do not share):",
+        f"  provision response: {json.dumps(response, sort_keys=True)}",
+        f"  profile_id: {profile_id}",
+        f"  api_key: {api_key}",
+        f"  pairing code: {response.get('token')}",
+        f"  psk: {psk_hex}",
+        f"  payload: {payload}",
+    ]
 
 
 def print_verbose_pairing_data(response: dict, profile_id: str, api_key: str,
                                psk_hex: str, payload: str) -> None:
-    """Print every pairing value for troubleshooting and manual entry.
+    """Print ``verbose_lines``."""
+    for line in verbose_lines(response, profile_id, api_key, psk_hex, payload):
+        print(line)
 
-    These values are deliberately omitted from the normal output because the
-    API key and PSK grant access to the paired bridge.  ``--verbose`` is an
-    explicit opt-in for operators who need to inspect or recover the payload.
+
+def mint_invite(hermes_home: Path, *, env: Optional[dict] = None, relay_http: Optional[str] = None,
+                log: Callable[[str], None] = _silent) -> PairingInvite:
+    """Provision this laptop on first use, then mint a fresh phone invite.
+
+    Same side effects as the script always had: a first run appends the relay
+    URL, profile and API key to ``.env``; every run allowlists the adapter's
+    sender and sets the home channel when they are missing, and creates the
+    PSK when there is none. Progress goes to *log*, never stdout. Raises
+    ``PairError`` instead of exiting, so a long-lived process can call it.
+
+    *env* defaults to what ``.env`` holds now; *relay_http* to the configured
+    relay, else ``DEFAULT_RELAY``. Never prompts.
     """
-    print("\nVerbose pairing data (sensitive — do not share):")
-    print(f"  provision response: {json.dumps(response, sort_keys=True)}")
-    print(f"  profile_id: {profile_id}")
-    print(f"  api_key: {api_key}")
-    print(f"  pairing code: {response.get('token')}")
-    print(f"  psk: {psk_hex}")
-    print(f"  payload: {payload}")
+    env_file = hermes_home / ".env"
+    env = read_env(env_file) if env is None else env
+    relay_http = relay_http or to_http(env.get("HERMES_BRIDGE_RELAY_URL") or DEFAULT_RELAY)
+
+    profile_id = env.get("HERMES_BRIDGE_PROFILE_ID")
+    api_key = env.get("HERMES_BRIDGE_API_KEY")
+    repairing = bool(profile_id and api_key)
+
+    if repairing:
+        log(f"Minting a fresh phone invite for {profile_id} ...")
+        response = post(f"{relay_http}/api/pair/provision", {"profile_id": profile_id})
+    else:
+        log(f"Provisioning a new profile via {relay_http} ...")
+        response = post(f"{relay_http}/api/pair/provision", {})
+        profile_id = response.get("profile_id")
+        api_key = response.get("api_key")
+        if not profile_id or not api_key:
+            raise PairError(f"unexpected provision response: {response}", "unexpected provision response")
+        with env_file.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"\nHERMES_BRIDGE_RELAY_URL={to_ws(relay_http)}"
+                f"\nHERMES_BRIDGE_PROFILE_ID={profile_id}"
+                f"\nHERMES_BRIDGE_API_KEY={api_key}\n"
+            )
+        log(f"Provisioned {profile_id} — credentials written to {env_file}")
+
+    token = response.get("token")
+    if not token:
+        raise PairError(f"no invite token in response: {response}", "no invite token in the relay response")
+
+    authorize_adapter_user(env_file, env, log)
+    set_home_channel(env_file, env, profile_id, log)
+    psk_hex = load_or_create_psk(hermes_home / "psk", log)
+    return PairingInvite(
+        token=token,
+        expires_at=str(response.get("expires_at", "in 1 hour")),
+        profile_id=profile_id,
+        api_key=api_key,
+        psk_hex=psk_hex,
+        payload=json.dumps({"token": token, "psk": psk_hex}, separators=(",", ":")),
+        response=response,
+        provisioned=not repairing,
+        relay_url=relay_http,
+    )
 
 
 def main() -> None:
-    hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+    hermes_home = default_hermes_home()
     if not hermes_home.is_dir():
         die(f"{hermes_home} not found — is Hermes installed?")
     reexec_under_hermes_python(hermes_home)
@@ -516,45 +711,20 @@ def main() -> None:
         if answer:
             relay_http = to_http(answer)
 
-    profile_id = env.get("HERMES_BRIDGE_PROFILE_ID")
-    api_key = env.get("HERMES_BRIDGE_API_KEY")
-    repairing = bool(profile_id and api_key)
-
-    if repairing:
-        print(f"Minting a fresh phone invite for {profile_id} ...")
-        response = post(f"{relay_http}/api/pair/provision", {"profile_id": profile_id})
-    else:
-        print(f"Provisioning a new profile via {relay_http} ...")
-        response = post(f"{relay_http}/api/pair/provision", {})
-        profile_id = response.get("profile_id")
-        api_key = response.get("api_key")
-        if not profile_id or not api_key:
-            die(f"unexpected provision response: {response}")
-        with env_file.open("a", encoding="utf-8") as handle:
-            handle.write(
-                f"\nHERMES_BRIDGE_RELAY_URL={to_ws(relay_http)}"
-                f"\nHERMES_BRIDGE_PROFILE_ID={profile_id}"
-                f"\nHERMES_BRIDGE_API_KEY={api_key}\n"
-            )
-        print(f"Provisioned {profile_id} — credentials written to {env_file}")
-
-    token = response.get("token")
-    if not token:
-        die(f"no invite token in response: {response}")
-
-    authorize_adapter_user(env_file, env)
-    set_home_channel(env_file, env, profile_id)
-    psk_hex = load_or_create_psk(hermes_home / "psk")
-    payload = json.dumps({"token": token, "psk": psk_hex}, separators=(",", ":"))
+    try:
+        invite = mint_invite(hermes_home, env=env, relay_http=relay_http, log=print)
+    except PairError as exc:
+        die(str(exc))
 
     if verbose:
-        print_verbose_pairing_data(response, profile_id, api_key, psk_hex, payload)
+        print_verbose_pairing_data(invite.response, invite.profile_id, invite.api_key,
+                                   invite.psk_hex, invite.payload)
 
     print()
-    print(f"Pairing code: {token} — single use, expires {response.get('expires_at', 'in 1 hour')}")
+    print(f"Pairing code: {invite.token} — single use, expires {invite.expires_at}")
     print("Open HermLink on your phone → Pair new device → scan:")
     print()
-    print_qr(payload)
+    print_qr(invite.payload)
     print()
     print("The QR carries the invite AND the encryption key — keep it on screen only until scanned.")
 

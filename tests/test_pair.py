@@ -53,7 +53,9 @@ class _StubRelay(BaseHTTPRequestHandler):
         pass
 
 
-class PairScriptTest(unittest.TestCase):
+class StubRelayCase(unittest.TestCase):
+    """A throwaway HERMES_HOME wired to a stub relay; no tests of its own."""
+
     def setUp(self):
         REQUESTS.clear()
         self.server = HTTPServer(("127.0.0.1", 0), _StubRelay)
@@ -80,6 +82,8 @@ class PairScriptTest(unittest.TestCase):
         with patch.object(sys.stdin, "isatty", return_value=False):
             pair.main()
 
+
+class PairScriptTest(StubRelayCase):
     def test_first_run_provisions_and_writes_credentials(self):
         self._run()
 
@@ -401,6 +405,89 @@ class PairScriptTest(unittest.TestCase):
         self.assertIn(f"psk: {psk}", text)
         self.assertIn(f'"token":"tok_fresh","psk":"{psk}"', text)
         self.assertIn("Pairing code: tok_fresh", text)
+
+
+class MintInviteTest(StubRelayCase):
+    """The importable core ``/pair`` runs in a long-lived Hermes process."""
+
+    def test_returns_the_invite_and_prints_nothing(self):
+        notes: list = []
+        output = StringIO()
+        with redirect_stdout(output):
+            invite = pair.mint_invite(self.home, log=notes.append)
+
+        self.assertEqual(output.getvalue(), "", "the core must not write to stdout")
+        psk = (self.home / "psk").read_bytes().hex()
+        self.assertEqual(invite.token, "tok_fresh")
+        self.assertEqual(invite.expires_at, "2026-01-01T00:00:00.000Z")
+        self.assertEqual(invite.profile_id, "profile_ss_abc123")
+        self.assertEqual(invite.api_key, "hb_secret")
+        self.assertEqual(invite.psk_hex, psk)
+        self.assertEqual(json.loads(invite.payload), {"token": "tok_fresh", "psk": psk})
+        self.assertTrue(invite.provisioned)
+        self.assertTrue(any("Provisioned profile_ss_abc123" in note for note in notes), notes)
+        self.assertEqual(pair.read_env(self.home / ".env")["HERMES_BRIDGE_API_KEY"], "hb_secret")
+
+        again = pair.mint_invite(self.home)
+        self.assertFalse(again.provisioned, "an existing profile only mints an invite")
+        self.assertEqual(again.token, "tok_repair")
+        self.assertEqual(again.psk_hex, psk)
+        self.assertEqual(again.expires_at, "in 1 hour")
+
+    def test_relay_failure_raises_with_a_summary_that_quotes_nothing(self):
+        with patch.object(pair, "DEFAULT_RELAY", "http://127.0.0.1:9"):
+            with self.assertRaises(pair.PairError) as caught:
+                pair.mint_invite(self.home)
+        self.assertIn("relay unreachable:", str(caught.exception))
+        self.assertEqual(caught.exception.summary, "relay unreachable")
+
+    def test_unexpected_response_keeps_the_body_out_of_the_summary(self):
+        with patch.object(pair, "post", return_value={"api_key": "hb_leak"}):
+            with self.assertRaises(pair.PairError) as caught:
+                pair.mint_invite(self.home)
+        self.assertIn("hb_leak", str(caught.exception), "the terminal keeps the full detail")
+        self.assertNotIn("hb_leak", caught.exception.summary)
+
+    def test_a_wrong_size_psk_raises_instead_of_exiting(self):
+        (self.home / "psk").write_bytes(b"short")
+        with self.assertRaises(pair.PairError):
+            pair.mint_invite(self.home)
+
+    def test_cli_still_exits_with_the_error_line(self):
+        (self.home / "psk").write_bytes(b"short")
+        errors = StringIO()
+        with patch.object(sys, "stderr", errors), self.assertRaises(SystemExit) as caught:
+            self._run()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("error: ", errors.getvalue())
+        self.assertIn("expected 32", errors.getvalue())
+
+    def test_readiness_checks_are_data_and_the_report_still_prints(self):
+        checks = pair.readiness_checks(self.home, {})
+        self.assertTrue(all(status in (pair.OK, pair.WARN, pair.FAIL) for status, _, _ in checks))
+        lines = pair.format_readiness(checks)
+        self.assertEqual(lines[0], "Readiness:")
+        output = StringIO()
+        with redirect_stdout(output):
+            pair.readiness_report(self.home, {})
+        self.assertEqual(output.getvalue(), "\n" + "\n".join(lines) + "\n")
+
+    def test_qr_png_is_a_private_png_and_never_overwrites(self):
+        if not pair.qr_available():
+            self.skipTest("qrcode is not installed")
+        target = self.home / "qr.png"
+        self.assertTrue(pair.write_qr_png('{"token":"t","psk":"00"}', target))
+        self.assertEqual(target.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(pair.write_qr_png("{}", target), "an existing path is refused")
+
+    def test_without_qrcode_there_is_no_qr_and_the_terminal_gets_the_payload(self):
+        with patch.dict(sys.modules, {"qrcode": None}):
+            self.assertFalse(pair.qr_available())
+            self.assertIsNone(pair.qr_text("payload"))
+            self.assertFalse(pair.write_qr_png("payload", self.home / "qr.png"))
+        self.assertFalse((self.home / "qr.png").exists())
+        self.assertIn("  payload (manual entry): payload", pair.qr_missing_lines("payload"))
 
 
 if __name__ == "__main__":

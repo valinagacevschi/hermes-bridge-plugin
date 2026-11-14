@@ -63,6 +63,7 @@ from .capability import CapabilityDescriptor
 from .crypto import load_psk, open_blob, open_frame, seal, seal_blob
 from .local_api import API_SERVER_PORT, SESSION_HEADER, LocalApi
 from .operation_dispatch import OperationDispatcher, _LocalRpcError, _RpcError, _http_error_detail
+from .pair_command import register_pair_command
 from .session_continue import (
     bare_key_phone_session_from_payload,
     bridge_thread_id,
@@ -5305,3 +5306,5 @@ def register(ctx) -> None:
         # exactly one chat, and its id is the profile id.
         cron_deliver_env_var="HERMES_BRIDGE_HOME_CHANNEL",
     )
+    # `/pair` in the CLI or a DM: the same invite pair.py mints, without leaving Hermes.
+    register_pair_command(ctx)
