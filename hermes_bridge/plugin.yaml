@@ -9,7 +9,13 @@ kind: platform
 name: hermes_bridge
 label: HermLink
 version: 0.2.0
-# Documented minimum. Hermes enforces this at load; pairing itself is unchanged.
+# Minimum Hermes the plugin loads and registers on; Hermes enforces it at load.
+# CI's "plugin floor load" job checks exactly this release (0.21.0 = tag
+# v2026.8.31), so bump both together. Newer-core features degrade on older
+# hosts instead of failing the load: native exec-approval buttons need 0.21.3+
+# (`_send_exec_approval_prompt`; older hosts get the text /approve prompt), and
+# live host dictation needs `tools.transcription_streaming` (reported as
+# unsupported otherwise).
 requires_hermes: ">=0.21.0"
 description: >
   Connects Hermes to the HermLink mobile app over an end-to-end-encrypted
