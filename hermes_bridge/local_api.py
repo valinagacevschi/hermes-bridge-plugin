@@ -121,18 +121,17 @@ def _psutil_or_none():
         return None
 
 
-def _scan_dashboards() -> Dict[int, str]:
-    """One psutil pass: listening port → argv profile for hermes dashboard/serve.
+def _scan_dashboards_owners() -> Dict[int, Dict[str, Any]]:
+    """One psutil pass: listening port → profile + owning pid for dashboard/serve.
 
-    Callers (``dashboard_candidates``, ``listening``, ``discover_dashboard_ports``)
-    must reuse this map instead of scanning again — each ``process_iter`` +
-    ``net_connections`` pass is tens of milliseconds on a busy laptop, and
-    every Agent-tab RPC used to pay for several of them on the event loop.
+    Callers that also need WHO spawned the dashboard (the Desktop app vs a
+    operator/bridge CLI chain, for local_api door preference) read the pid
+    here; ``_scan_dashboards`` stays the profile-only view for everyone else.
     """
     psutil = _psutil_or_none()
     if psutil is None:
         return {}
-    owners: Dict[int, str] = {}
+    owners: Dict[int, Dict[str, Any]] = {}
     try:
         for proc in psutil.process_iter(["pid", "cmdline"]):
             try:
@@ -147,12 +146,80 @@ def _scan_dashboards() -> Dict[int, str]:
                 list_conns = getattr(proc, "net_connections", None) or proc.connections
                 for conn in list_conns("inet"):
                     if conn.status == "LISTEN":
-                        owners[conn.laddr.port] = profile
+                        owners[conn.laddr.port] = {
+                            "profile": profile,
+                            "pid": proc.info.get("pid"),
+                        }
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
     except Exception as exc:
         logger.debug("[hermes_bridge] psutil dashboard scan failed: %s", exc)
     return owners
+
+
+def _scan_dashboards() -> Dict[int, str]:
+    """One psutil pass: listening port → argv profile for hermes dashboard/serve.
+
+    Callers (``dashboard_candidates``, ``listening``, ``discover_dashboard_ports``)
+    must reuse this map instead of scanning again — each ``process_iter`` +
+    ``net_connections`` pass is tens of milliseconds on a busy laptop, and
+    every Agent-tab RPC used to pay for several of them on the event loop.
+    """
+    return {
+        port: info["profile"]
+        for port, info in _scan_dashboards_owners().items()
+    }
+
+
+def _is_desktop_spawn_parent_cmd(cmd: List[str]) -> bool:
+    """True when argv belongs to the Desktop shell that spawns ``serve`` children.
+
+    The Desktop app (productName ``Hermes``) launches the same
+    ``python -m hermes_cli.main serve`` backend every other surface does, so
+    the SPA itself cannot disambiguate a door — the spawner can:
+    macOS release runs ``.../Hermes.app/Contents/MacOS/Hermes``; dev shells and
+    Linux use the Electron binary; Windows uses ``Hermes.exe``. Gateway-side
+    spawners (the bridge's own ``_ensure`` child, operator consoles) are
+    python/bash harnesses and match none of those markers. Best-effort: an
+    unmatched spawner keeps the plain ordering — nothing regresses.
+    """
+    if not cmd:
+        return False
+    exe = str(cmd[0]).replace("\\", "/")
+    base = exe.rsplit("/", 1)[-1].lower()
+    if base in ("electron", "hermes.exe"):
+        return True
+    # The release binary's own name is a bare "Hermes" — too generic to match
+    # alone; only trust it inside the .app bundle path.
+    return "hermes.app" in exe.lower()
+
+
+def _desktop_owned_ports(owners: Dict[int, Dict[str, Any]]) -> set:
+    """Discovered dashboard/serve ports whose spawner is the Desktop app.
+
+    Never re-walks the process table: parent lookups are per-candidate
+    ``psutil.Process(pid)`` reads. Any failure (process gone mid-scan,
+    AccessDenied) counts as not-desktop — door preference degrades quietly.
+    """
+    psutil = _psutil_or_none()
+    if psutil is None:
+        return set()
+    desktop: set = set()
+    for port, info in owners.items():
+        profile = info.get("profile")
+        pid = info.get("pid")
+        if not profile or not pid:
+            continue
+        try:
+            parent = psutil.Process(int(pid)).parent()
+            if parent is None:
+                continue
+            cmd = [str(arg) for arg in (parent.cmdline() or [])]
+        except Exception:
+            continue
+        if _is_desktop_spawn_parent_cmd(cmd):
+            desktop.add(port)
+    return desktop
 
 
 def discover_dashboard_ports() -> List[int]:
@@ -212,27 +279,40 @@ class LocalApi:
             self.port = None
         self._tokens.pop(target, None)
 
-    def _candidates_from_scan(self, owners: Dict[int, str]) -> List[int]:
-        """Build the candidate list from one ``_scan_dashboards()`` map."""
+    def _candidates_from_scan(self, owners: Dict[int, Dict[str, Any]]) -> List[int]:
+        """Build the candidate list from one ``_scan_dashboards_owners()`` map.
+
+        Desktop-spawned doors rank above gateway/CLI-spawned ones (#159): the
+        plugin's own headless ``serve`` enumerates a narrower profile root
+        than the Desktop's API, so when both answer for this profile the door
+        must move to the Desktop's — a cached CLI port cannot pin it away from
+        a Desktop door that discovery sees live.
+        """
         own = gateway_profile_name()
         if self.port is not None:
             owner = owners.get(self.port)
-            if owner is not None and owner != own:
+            if owner is not None and owner.get("profile") != own:
                 self.drop_port_cache(self.port)
 
         override = os.getenv("HERMES_BRIDGE_API_PORT", "").strip()
-        candidates: List[int] = [int(override)] if override.isdigit() else []
-        if self.port is not None:
-            candidates.append(self.port)
+        head: List[int] = [int(override)] if override.isdigit() else []
 
-        discovered = [port for port, profile in owners.items() if profile == own]
+        discovered = [
+            port for port, info in owners.items() if info.get("profile") == own
+        ]
+        desktop = _desktop_owned_ports(owners)
+        desktop_ports: List[int] = [port for port in discovered if port in desktop]
+        cli_ports: List[int] = [port for port in discovered if port not in desktop]
+
+        cached: List[int] = [self.port] if self.port is not None else []
+
         static: List[int] = []
         for port in DASHBOARD_PORTS:
             owner = owners.get(port)
-            if owner is not None and owner != own:
+            if owner is not None and owner.get("profile") != own:
                 continue
             static.append(port)
-        return _dedupe(candidates + discovered + static)
+        return _dedupe(head + desktop_ports + cached + cli_ports + static)
 
     # ── where it listens ────────────────────────────────────────────────
 
@@ -244,16 +324,19 @@ class LocalApi:
            line that looks like neither `dashboard` nor `serve`). Without it,
            such a user gets `hermes_offline` on every Agent tab from a
            dashboard that is in fact running, with nothing to change.
-        1. Cached known-good port (fast path, avoids re-probing) — dropped
+        1. Desktop-spawned dashboards (spawned by the Electron shell) — the
+           serve the Desktop itself talks to; its profile view is the
+           multiplexed one, not a headless CLI home (#159).
+        2. Cached known-good port (fast path, avoids re-probing) — dropped
            when that port is gone from discovery's view as foreign.
-        2. Live psutil discovery for this profile only (handles --port 0).
-        3. Static defaults, skipping any port psutil identifies as another
+        3. Live psutil discovery for this profile only (handles --port 0).
+        4. Static defaults, skipping any port psutil identifies as another
            profile's dashboard.
 
-        Runs a single psutil process scan; foreign/cache/static checks all
-        read that map.
+        Runs a single psutil process walk; the per-candidate desktop checks
+        read only their owning pid's parent.
         """
-        return self._candidates_from_scan(_scan_dashboards())
+        return self._candidates_from_scan(_scan_dashboards_owners())
 
     def ports_to_probe(self) -> List[int]:
         """Candidates for a request — the dashboard's, plus api_server's."""
@@ -268,15 +351,15 @@ class LocalApi:
         skipped even if they accept TCP; a dead/foreign cached port is
         dropped so the next call re-discovers (and ``_ensure`` can spawn).
 
-        Reuses one ``_scan_dashboards()`` map for candidates and ownership.
+        Reuses one ``_scan_dashboards_owners()`` map for candidates and ownership.
         """
-        owners = _scan_dashboards()
+        owners = _scan_dashboards_owners()
         own = gateway_profile_name()
         for port in self._candidates_from_scan(owners):
             try:
                 with socket.create_connection(("127.0.0.1", port), timeout=_CONNECT_TIMEOUT_S):
                     owner = owners.get(port)
-                    if owner is not None and owner != own:
+                    if owner is not None and owner.get("profile") != own:
                         if port == self.port:
                             self.drop_port_cache(port)
                         continue
