@@ -792,7 +792,7 @@ class TestHermesRequestPortSelection(unittest.IsolatedAsyncioTestCase):
             raise ConnectionRefusedError(f"refused: {url}")
 
         with patch(
-            "hermes_bridge.local_api._scan_dashboards",
+            "hermes_bridge.local_api._scan_dashboards_owners",
             return_value={},
         ), patch(
             "hermes_bridge.local_api._send", side_effect=fake_send
@@ -814,7 +814,7 @@ class TestHermesRequestPortSelection(unittest.IsolatedAsyncioTestCase):
         adapter._api.port = 9120  # a stale pin must not outrank it
 
         with patch.dict(os.environ, {"HERMES_BRIDGE_API_PORT": "51234"}), patch(
-            "hermes_bridge.local_api._scan_dashboards",
+            "hermes_bridge.local_api._scan_dashboards_owners",
             return_value={},
         ):
             ports = adapter._api.ports_to_probe()
@@ -832,7 +832,7 @@ class TestHermesRequestPortSelection(unittest.IsolatedAsyncioTestCase):
         "this is the working port", which is the bug this class covers."""
         adapter = _make_adapter()
         with patch(
-            "hermes_bridge.local_api._scan_dashboards",
+            "hermes_bridge.local_api._scan_dashboards_owners",
             return_value={},
         ):
             probe = adapter._api.ports_to_probe()
