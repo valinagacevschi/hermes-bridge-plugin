@@ -16,7 +16,7 @@ import json
 import logging
 import os
 import sqlite3
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from . import bot_notify
@@ -182,9 +182,10 @@ def _translate(conn: sqlite3.Connection, row: sqlite3.Row) -> Optional[Dict[str,
         "excerpt": _first_line(excerpt),
         "actor": actor.strip() if isinstance(actor, str) and actor.strip() else None,
         "created_at": int(row["created_at"] or 0),
-        # Internal routing label; adapter pops it before sealing the frame so
-        # the wire payload keeps exactly the contracted keys.
+        # Internal routing label and progress position; the adapter pops both
+        # (see wire_event) so the wire payload keeps exactly the contracted keys.
         "assignee": row["assignee"],
+        "cursor": int(row["event_row_id"]),
     }
 
 
@@ -240,6 +241,42 @@ def poll(
         return None
     finally:
         conn.close()
+
+
+def wire_event(event: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Split an event into its wire payload and its internal routing label."""
+    wire = dict(event)
+    wire.pop("cursor", None)
+    assignee = wire.pop("assignee", None)
+    return wire, assignee if isinstance(assignee, str) and assignee else None
+
+
+async def deliver_batch(
+    events: Sequence[Dict[str, Any]],
+    cursor: Optional[int],
+    batch_cursor: int,
+    send: Callable[[Dict[str, Any]], Awaitable[bool]],
+) -> Optional[int]:
+    """Send one poll's events in order and return the cursor to persist.
+
+    The cursor is the last contiguous row delivered, never the greatest row
+    read (CODING_STANDARDS "Treat a paged cursor as the last contiguous item
+    processed"). The first failed or raising send stops the batch and leaves
+    the cursor just before that event, so the next poll re-reads it: delivery
+    is at-least-once, and the phone collapses repeats on the stable
+    ``event_id``. Only a fully delivered batch moves to ``batch_cursor``, which
+    also covers trailing rows that produced no event.
+    """
+    for event in events:
+        try:
+            delivered = bool(await send(event))
+        except Exception as exc:
+            logger.warning("[hermes_bridge] kanban event send raised: %s", exc)
+            delivered = False
+        if not delivered:
+            return cursor
+        cursor = int(event["cursor"])
+    return batch_cursor
 
 
 def event_content(event: Dict[str, Any]) -> str:

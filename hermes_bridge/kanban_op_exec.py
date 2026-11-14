@@ -14,23 +14,25 @@ reaches this module. What this module owns is the op contract:
   whose earlier execution never settled is answered with a terminal
   ``kanban_outcome_unknown`` ack instead of a silent re-execution (create is
   non-idempotent, PRD §2.1.5),
-* execution is one deterministic single-turn prompt to a dedicated executor
-  session on the adapter's own gateway profile (``prompt.submit`` ->
-  ``prompt.receipt`` include_result), with the code — not the model —
-  authoritative: the receipt must contain a ``tool_use`` for the mandated
-  ``kanban_<name>`` tool with exactly the sent args, and the final response
-  must not report a failure,
+* execution calls Hermes' own registered ``kanban_<name>`` tool handler
+  directly (``DirectKanbanExecutor``) — the same code an agent's tool call
+  runs, minus the model — and the handler's structured JSON result decides the
+  ack,
 * acks mirror ``lib/kanban-wire.ts`` Ack bodies with a mandatory ``op_id``
   echo and are delivered in order: this receiver holds one asyncio lock so
   execution and acks are strictly serialized per adapter.
 
-Timeouts and ambiguous submissions are transport-style errors, not acks: the
-receiver raises ``KanbanOpExecutionTimeout``, which the adapter maps to an
-``executor_timeout`` rpc error — a failure the phone's queue marks retryable
-(a real ack or nothing, never a guessed success). The unsettled attempt stays
-``pending`` in the ledger, so the same op_id replayed later gets
-``kanban_outcome_unknown`` for mutations and a fresh execution for read-only
-ops.
+Timeouts: the receiver answers within ``DEFAULT_EXECUTOR_TIMEOUT_S``, which
+stays below the relay's synchronous RPC bound (``RPC_REPLY_TIMEOUT_MS`` in
+``app/api/relay/message+api.ts``) so the phone hears the laptop's answer rather
+than a relay 504. An op still running at that bound raises
+``KanbanOpExecutionTimeout`` (adapter: ``executor_timeout`` rpc error, which the
+phone's queue retries), but the execution keeps running and settles the ledger
+when it lands. A retry of the same op_id waits for that execution instead of
+re-running it or calling it unknown, so a slow-but-successful op is reported
+as the success it was. Only an execution that ends ambiguously stays
+``pending``: the same op_id replayed later gets ``kanban_outcome_unknown`` for
+mutations and a fresh execution for read-only ops.
 """
 
 from __future__ import annotations
@@ -40,10 +42,9 @@ import json
 import logging
 import os
 import time
-import uuid
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
-from . import bot_notify, local_owner
+from . import bot_notify
 
 logger = logging.getLogger(__name__)
 
@@ -74,16 +75,15 @@ _OP_SET = frozenset(KANBAN_OPS)
 # answered with kanban_outcome_unknown (locked decision #3, issue #156).
 READONLY_OPS = frozenset({"list", "show", "heartbeat", "attachments"})
 
-_EXECUTOR_TITLE = "kanban-executor"
 _ACK_ROLE = "kanban.ack"
 _MAX_ERROR_CHARS = 400
-# Receiver-side bound for one executor turn. Bounded, never hangs the rpc
-# request (locked decision #2). The phone's own rpc wait is far shorter; a
-# turn that misses this bound stays pending and the op resolves per the
-# ledger rules above.
-DEFAULT_EXECUTOR_TIMEOUT_S = 90.0
-# Interval between prompt.receipt polls.
-_RECEIPT_POLL_S = 0.5
+# How long one rpc request waits for its op (locked decision #2: bounded, never
+# hangs the request). Must stay below the relay's RPC_REPLY_TIMEOUT_MS (12 s,
+# app/api/relay/message+api.ts), itself below the phone's POST abort (15 s,
+# lib/kanban-op-send.ts), so the laptop's answer always reaches the phone. A
+# direct tool call settles in well under a second; an op that misses this bound
+# keeps running and settles the ledger for the phone's retry.
+DEFAULT_EXECUTOR_TIMEOUT_S = 8.0
 _LEDGER_MAX_ENTRIES = 500
 
 
@@ -92,7 +92,7 @@ class KanbanOpTransportError(Exception):
 
 
 class KanbanOpExecutionTimeout(Exception):
-    """The executor turn did not settle within its bound — retryable."""
+    """The op did not settle within the receiver's bound — retryable."""
 
 
 def _plain_object(value: Any) -> bool:
@@ -261,7 +261,7 @@ class KanbanOpReceiver:
     """Validates, dedupes, executes and acks one kanban.op RPC payload.
 
     ``executor`` is a seam: ``async execute(op) -> outcome`` with the outcome
-    contract below. Production uses ``GatewayKanbanExecutor``; tests inject a
+    contract below. Production uses ``DirectKanbanExecutor``; tests inject a
     fake. ``version_fn`` reads the board snapshot (run off-thread when the
     receiver needs the ok ack version); ``on_mutated`` is the cheap
     snapshot-refresh tick the adapter provides so board state follows an ack
@@ -284,6 +284,8 @@ class KanbanOpReceiver:
         self._timeout_s = timeout_s
         self._loaded = False
         self._lock = asyncio.Lock()
+        # Executions whose rpc answer timed out but which are still running.
+        self._inflight: Dict[str, "asyncio.Future[Dict[str, Any]]"] = {}
 
     async def handle(self, params: Dict[str, Any]) -> Dict[str, Any]:
         if not _plain_object(params):
@@ -309,63 +311,106 @@ class KanbanOpReceiver:
                 if isinstance(stored, dict):
                     return {str(key): value for key, value in stored.items()}
                 return ack_error(op_id, "executor_failed", "unsettled ledger record")
+            running = self._inflight.get(op_id)
+            if running is not None and not running.done():
+                # A retry of an op whose earlier answer timed out while it kept
+                # running: wait for that execution's real outcome rather than
+                # re-running it or calling it unknown.
+                return await self._await_settled(op_id, running)
             if replayed and replayed.get("status") == "pending" and params.get("op") not in READONLY_OPS:
                 return self._settle_outcome_unknown(op_id)
 
+            # Strict order: a later op never overtakes one still running.
+            await self._wait_for_inflight()
             op_name = params.get("op")
             task_id = op_card_id(params.get("args") or {})
             self._ledger.record_pending(op_id, op_name, task_id)
-            try:
-                outcome = await asyncio.wait_for(
-                    self._executor.execute(dict(params)), timeout=self._timeout_s
-                )
-            except asyncio.TimeoutError:
-                # The gateway turn may still run; the ledger keeps it pending so
-                # a mutation is never silently re-executed behind our back.
-                logger.warning("[hermes_bridge] kanban.op %s executor turn timed out", op_id)
-                raise KanbanOpExecutionTimeout() from None
-            except Exception as exc:  # noqa: BLE001 — executor blew up mid-call
-                logger.warning(
-                    "[hermes_bridge] kanban.op %s executor raised %s: %s",
-                    op_id,
-                    type(exc).__name__,
-                    exc,
-                )
-                # Outcome unknown — same conservative treatment as a timeout.
-                raise KanbanOpExecutionTimeout() from None
+            execution = asyncio.ensure_future(self._execute_and_settle(op_id, dict(params)))
+            self._inflight[op_id] = execution
+            execution.add_done_callback(lambda done, key=op_id: self._forget(key, done))
+            return await self._await_settled(op_id, execution)
 
-            if not _plain_object(outcome):
-                outcome = {"settled": False, "committed": True}
-
-            entry = self._ledger.get(op_id)
-            if outcome.get("settled"):
-                if outcome.get("ok") is True:
-                    version = int(outcome.get("version") or 0) or await self.board_version()
-                    ack = ack_ok(op_id, version)
-                else:
-                    ack = self._build_error_ack(op_id, outcome)
-                self._ledger.settle(op_id, ack)
-                await self._maybe_tick(entry)
-                return ack
-
-            if outcome.get("committed") is False:
-                # Refused before any commit: provably nothing ran.
-                ack = ack_error(
-                    op_id,
-                    str(outcome.get("code") or "executor_unavailable"),
-                    str(outcome.get("message") or "executor did not run the op"),
-                )
-                self._ledger.settle(op_id, ack)
-                return ack
-
-            # Submitted but ambiguous: leave pending, transport-retryable error
-            # (same conservative semantics as the bounded-wait timeout above).
+    async def _await_settled(
+        self, op_id: str, execution: "asyncio.Future[Dict[str, Any]]"
+    ) -> Dict[str, Any]:
+        """The execution's ack, or a retryable timeout while it keeps running."""
+        try:
+            return await asyncio.wait_for(asyncio.shield(execution), timeout=self._timeout_s)
+        except asyncio.TimeoutError:
             logger.warning(
-                "[hermes_bridge] kanban.op %s left unsettled (%s)",
+                "[hermes_bridge] kanban.op %s still running after %.1fs; its outcome "
+                "settles the ledger for the retry",
                 op_id,
-                outcome.get("code") or "unknown",
+                self._timeout_s,
             )
-            raise KanbanOpExecutionTimeout()
+            raise KanbanOpExecutionTimeout() from None
+
+    async def _wait_for_inflight(self) -> None:
+        """Bounded wait for executions whose rpc answer already timed out."""
+        for execution in list(self._inflight.values()):
+            if execution.done():
+                continue
+            try:
+                await asyncio.wait_for(asyncio.shield(execution), timeout=self._timeout_s)
+            except asyncio.TimeoutError:
+                # Nothing recorded for the new op yet: a plain retryable error.
+                raise KanbanOpExecutionTimeout() from None
+            except Exception:  # noqa: BLE001 — that op's own outcome is in the ledger
+                pass
+
+    def _forget(self, op_id: str, execution: "asyncio.Future[Dict[str, Any]]") -> None:
+        if self._inflight.get(op_id) is execution:
+            del self._inflight[op_id]
+        # Retrieve a late failure nobody awaited, so asyncio does not log it.
+        if not execution.cancelled():
+            execution.exception()
+
+    async def _execute_and_settle(self, op_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Run one op to completion and record its ack (or leave it pending)."""
+        try:
+            outcome = await self._executor.execute(params)
+        except Exception as exc:  # noqa: BLE001 — executor blew up mid-call
+            logger.warning(
+                "[hermes_bridge] kanban.op %s executor raised %s: %s",
+                op_id,
+                type(exc).__name__,
+                exc,
+            )
+            # Outcome unknown: the ledger keeps it pending so a mutation is
+            # never silently re-executed.
+            raise KanbanOpExecutionTimeout() from None
+
+        if not _plain_object(outcome):
+            outcome = {"settled": False, "committed": True}
+
+        entry = self._ledger.get(op_id)
+        if outcome.get("settled"):
+            if outcome.get("ok") is True:
+                version = int(outcome.get("version") or 0) or await self.board_version()
+                ack = ack_ok(op_id, version)
+            else:
+                ack = self._build_error_ack(op_id, outcome)
+            self._ledger.settle(op_id, ack)
+            await self._maybe_tick(entry)
+            return ack
+
+        if outcome.get("committed") is False:
+            # Refused before any commit: provably nothing ran.
+            ack = ack_error(
+                op_id,
+                str(outcome.get("code") or "executor_unavailable"),
+                str(outcome.get("message") or "executor did not run the op"),
+            )
+            self._ledger.settle(op_id, ack)
+            return ack
+
+        # Ran but ambiguous: leave pending, transport-retryable error.
+        logger.warning(
+            "[hermes_bridge] kanban.op %s left unsettled (%s)",
+            op_id,
+            outcome.get("code") or "unknown",
+        )
+        raise KanbanOpExecutionTimeout()
 
     def _settle_outcome_unknown(self, op_id: str) -> Dict[str, Any]:
         ack = ack_error(
@@ -411,189 +456,81 @@ class KanbanOpReceiver:
         return default
 
 
-class GatewayKanbanExecutor:
-    """Real seam: one deterministic single-turn prompt on the owner gateway.
+class DirectKanbanExecutor:
+    """Real seam: the op runs through Hermes' own registered kanban tool.
 
-    A dedicated ``kanban-executor`` session on the adapter's own gateway
-    profile (``session.create`` with the title resolves-or-creates under the
-    owner's lock). The prompt mandates exactly one tool call; verification of
-    the committed receipt — not the model's word — decides the outcome.
+    ``tools.registry.registry.dispatch("kanban_<op>", args)`` is the code path
+    an agent's tool call takes (argument checks, board resolution, author
+    identity from the gateway's profile), without a model in the loop: no
+    executor session, no prompt, no receipt to reverse-engineer. The handlers
+    are synchronous SQLite work, so the call runs off the event loop and
+    settles in well under a second.
     """
 
-    def __init__(self, profile_id: str):
-        self._profile_id = profile_id
-        self._cached_executor_session: Optional[str] = None
-
     async def execute(self, op: Dict[str, Any]) -> Dict[str, Any]:
-        """Run ``op``; classify the receipt into the outcome contract.
+        """Run ``op``; map the tool's JSON result onto the outcome contract.
 
         ``{"settled": bool, "committed": bool|None, "ok": bool, "code": str,
         "message": str}`` — settled outcomes become ledger-replayed acks;
-        committed-False means provably nothing ran; anything ambiguous stays
+        committed-False means provably nothing ran; an unreadable result stays
         pending and surfaces as a retryable transport error.
         """
-        op_id = str(op.get("op_id") or "")
-        op_name = str(op.get("op") or "")
-        tool = f"kanban_{op_name}"
-        args = op.get("args") or {}
-        from_context: Optional[BaseException] = None
+        tool = f"kanban_{op.get('op')}"
+        args = dict(op.get("args") or {})
+        raw = await asyncio.to_thread(_dispatch_kanban_tool, tool, args)
+        if raw is None:
+            return {
+                "settled": False,
+                "committed": False,
+                "code": "executor_unavailable",
+                "message": "this Hermes has no kanban tools to run the op",
+            }
+        return classify_tool_result(raw)
+
+
+def _dispatch_kanban_tool(tool: str, args: Dict[str, Any]) -> Optional[Any]:
+    """``registry.dispatch`` for one kanban tool; None when the host lacks it.
+
+    Private Hermes surface (see PRIVATE_IMPORTS.md), imported lazily: importing
+    ``tools.kanban_tools`` registers the ``kanban_*`` handlers.
+    """
+    try:
+        import tools.kanban_tools  # noqa: F401
+        from tools.registry import registry
+    except Exception as exc:  # noqa: BLE001 — any import failure means "unavailable"
+        _warn_private_import("tools.kanban_tools / tools.registry", exc)
+        return None
+    dispatch = getattr(registry, "dispatch", None)
+    if not callable(dispatch):
+        _warn_private_import("tools.registry.dispatch", AttributeError("dispatch"))
+        return None
+    return dispatch(tool, args)
+
+
+def classify_tool_result(raw: Any) -> Dict[str, Any]:
+    """Kanban tool result -> outcome. Handlers answer JSON: ``{"error": ...}``
+    (``tool_error``, nothing changed) or a success object."""
+    payload: Any = raw
+    if isinstance(raw, str):
         try:
-            async with local_owner.connect(None, _warn_private_import) as client:
-                target = await self._ensure_executor_session(client)
-                submission = local_owner.submission_id(self._profile_id, _EXECUTOR_TITLE, op_id)
-                receipt = await local_owner.submit(
-                    client, target, _executor_prompt(tool, args, op_id), submission,
-                    _warn_private_import,
-                )
-                admission = receipt["admission_id"]
-                while True:
-                    receipt = await client.rpc(
-                        "prompt.receipt",
-                        session_id=target,
-                        admission_id=admission,
-                        include_result=True,
-                    )
-                    if isinstance(receipt, dict) and receipt.get("status") == "terminal":
-                        break
-                    await asyncio.sleep(_RECEIPT_POLL_S)
-                return self._classify_receipt(receipt, tool, args)
-        except local_owner.OwnerUnconfirmed as exc:
-            from_context = exc
-        except Exception as exc:  # noqa: BLE001 — classified by _committed_before_submit
-            from_context = exc
-        committed = self._committed_before_submit(from_context)
-        logger.warning(
-            "[hermes_bridge] kanban.op %s executor unavailable (%s, committed=%s)",
-            op_id,
-            type(from_context).__name__ if from_context else "?",
-            committed,
-        )
+            payload = json.loads(raw)
+        except ValueError:
+            payload = None
+    if not _plain_object(payload):
         return {
             "settled": False,
-            "committed": committed,
-            "code": "executor_unavailable",
-            "message": f"kanban executor turn could not start: {_brief(from_context)}",
+            "committed": True,
+            "code": "executor_failed",
+            "message": "unreadable kanban tool result",
         }
-
-    async def _ensure_executor_session(self, client: Any) -> str:
-        """Resolve-or-create the dedicated session, then resume its runtime id."""
-        stored: Optional[str] = None
-        try:
-            created = await client.rpc(
-                "session.create", request_id=uuid.uuid4().hex, title=_EXECUTOR_TITLE
-            )
-            if isinstance(created, dict):
-                stored = created.get("stored_session_id")
-        except Exception:
-            stored = self._cached_executor_session
-        if not isinstance(stored, str) or not stored.strip():
-            raise RuntimeError("no kanban-executor session on the owner gateway")
-        attached = await client.rpc("session.resume", session_id=stored)
-        target = attached.get("session_id") if isinstance(attached, dict) else None
-        if not _non_empty_string(target):
-            raise RuntimeError("session.resume returned no runtime session id")
-        self._cached_executor_session = stored
-        return target
-
-    def _committed_before_submit(self, exc: Optional[BaseException]) -> bool:
-        """False only for refusals the owner raised before the submit committed."""
-        if exc is None:
-            return False
-        try:
-            _, refused, rpc_error, *_ = local_owner._api(_warn_private_import)
-        except Exception:
-            return True
-        if isinstance(exc, rpc_error):
-            data = getattr(exc, "data", None)
-            reason = data.get("reason") if isinstance(data, dict) else None
-            if isinstance(reason, str) and reason in refused:
-                return False
-        return True
-
-    def _classify_receipt(self, receipt: Dict[str, Any], tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        outcome = receipt.get("outcome")
-        if outcome in ("cancelled", "steered", "unknown"):
-            return _failed("executor_failed", f"executor turn ended {outcome} (unsettled)")
-        result = receipt.get("result")
-        if not _plain_object(result):
-            return _failed("executor_failed", "executor receipt carried no result")
-        error = result.get("error") or result.get("failed")
-        if error:
-            return _failed("tool_failed", str(error))
-        if not _find_mandated_tool_call(result.get("messages"), tool, args):
-            return _failed(
-                "executor_failed",
-                f"executor turn did not call {tool} with the mandated arguments",
-            )
-        final = str(result.get("final_response") or "").strip()
-        if final.lower().startswith("failed"):
-            reason = final.split(":", 1)[1].strip() if ":" in final else ""
-            return _failed("tool_failed", reason or "executor tool reported failure")
-        return {"settled": True, "committed": True, "ok": True, "code": None, "message": ""}
+    error = payload.get("error")
+    if error:
+        return _failed("tool_failed", str(error))
+    return {"settled": True, "committed": True, "ok": True, "code": None, "message": ""}
 
 
 def _failed(code: str, message: str) -> Dict[str, Any]:
     return {"settled": True, "committed": True, "ok": False, "code": code, "message": message}
-
-
-def _brief(exc: Optional[BaseException]) -> str:
-    return (
-        f"{type(exc).__name__}: {str(exc)[:_MAX_ERROR_CHARS]}"
-        if exc is not None
-        else "unknown error"
-    )
-
-
-def _executor_prompt(tool: str, args: Dict[str, Any], op_id: str) -> str:
-    return (
-        f'Kanban op {op_id}. Reply with only "ok" or "failed: <error>" after you:\n'
-        f"call tool {tool} EXACTLY once with EXACTLY these arguments (JSON): "
-        f"{json.dumps(args, separators=(',', ':'))}\n"
-        "Do not call any other tool and do not ask questions."
-    )
-
-
-def _json_args(raw: Any) -> Any:
-    if isinstance(raw, str):
-        try:
-            return json.loads(raw)
-        except ValueError:
-            return raw
-    return raw
-
-
-def _find_mandated_tool_call(messages: Any, tool: str, args: Dict[str, Any]) -> bool:
-    """Whether the turn's history contains the mandated tool_use with these args.
-
-    Accepts both the OpenAI-ish ``tool_calls`` history rows and content-block
-    ``tool_use`` entries, so a host-side shape change degrades to a negative
-    ack instead of a false positive.
-    """
-    if not isinstance(messages, list):
-        return False
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        for call in message.get("tool_calls") or []:
-            fn = call.get("function") if isinstance(call, dict) else None
-            if (
-                isinstance(fn, dict)
-                and fn.get("name") == tool
-                and _json_args(fn.get("arguments")) == args
-            ):
-                return True
-        blocks = message.get("content")
-        if not isinstance(blocks, list):
-            continue
-        for block in blocks:
-            if (
-                isinstance(block, dict)
-                and block.get("type") == "tool_use"
-                and block.get("name") == tool
-                and block.get("input") == args
-            ):
-                return True
-    return False
 
 
 def _warn_private_import(module: str, exc: Exception) -> None:

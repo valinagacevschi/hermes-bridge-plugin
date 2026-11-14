@@ -7,6 +7,7 @@ both transcript rows; the bridge delivers the final reply on the phone chat.
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
@@ -308,6 +309,21 @@ PLATFORM_NAME = "hermes_bridge"
 # WS can drop on any network blip — the supervisor loop reconnects forever.
 _RECONNECT_INITIAL = 1.0
 _RECONNECT_MAX = 30.0
+
+# Long-lived viewer holds, one per continued local- session (#135). Way beyond
+# any real phone usage; past it new sessions fall back to the per-turn shape.
+_LOCAL_VIEWER_LIMIT = 32
+
+
+class _LocalViewerEntry:
+    """One held owner connection: the session's subscriber seat (#135)."""
+
+    __slots__ = ("session_id", "task", "ready")
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        self.task: "Optional[asyncio.Task]" = None
+        self.ready = asyncio.Event()
 
 # Fallback ceiling on the durable-queue replay window (#41, seconds).
 #
@@ -807,6 +823,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             # Phone must re-advertise after reconnect; don't keep a stale flag.
             self._client_streaming_tts = False
             await self._cancel_all_stt_sessions("phone_disconnected")
+            await self._release_local_viewers()
             # The high-water mark is connection-scoped (#41) — the next
             # connect's replay starts fresh from `_inbound_cursor` (durable),
             # so a seq the relay legitimately resends must not be rejected as
@@ -891,6 +908,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             self._bot_notify_task = None
         await self._cancel_all_stt_sessions("phone_disconnected")
         self._client_streaming_tts = False
+        await self._release_local_viewers()
         if self._ws:
             await self._ws.close()
             self._ws = None
@@ -2331,7 +2349,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         receiver = getattr(self, "_kanban_op_receiver_cache", None)
         if receiver is None:
             receiver = kanban_op_exec.KanbanOpReceiver(
-                kanban_op_exec.GatewayKanbanExecutor(self._profile_id),
+                kanban_op_exec.DirectKanbanExecutor(),
                 ledger=kanban_op_exec.KanbanOpLedger(kanban_op_exec.ledger_path(self._profile_id)),
                 version_fn=kanban_snapshot.build_snapshot,
                 on_mutated=self._kanban_snapshot_tick,
@@ -2346,8 +2364,8 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         envelope itself was already verified and decrypted in ``_read_frame``).
         The returned data is an Ack body mirrored from lib/kanban-wire.ts with
         a mandatory op_id echo, acked in order under the receiver's serial
-        lock. Only a body without a usable op_id and an executor turn that
-        does not settle within its bound raise: those become rpc errors
+        lock. Only a body without a usable op_id and an op that does not
+        settle within the receiver's bound raise: those become rpc errors
         ("malformed…" / "executor_timeout") so the phone's op queue treats
         them as retryable transport failures, never as successes.
         """
@@ -2691,12 +2709,91 @@ class HermesBridgeAdapter(BasePlatformAdapter):
     def _connect_local_owner(self, profile):
         return local_owner.connect(profile, _warn_private_import_once)
 
+    # ── Local-session viewer holds (#135) ─────────────────────────────────────
+    # v0.22.6+'s orphan reaping ends a laptop local session whose last viewer
+    # left, `sessions.orphan_end_grace_s` (default 300 s) after the detach. The
+    # bridge's own owner connection is per-turn, so a CLI/TUI/Desktop session a
+    # phone keeps continuing had NO viewer between phone turns and was reaped
+    # while the phone was still using it (device-verified on the AVD,
+    # end_reason='ws_orphan_reap'). A session the bridge continues therefore
+    # holds ONE long-lived owner connection (session.resume — a subscriber, the
+    # same client class a terminal is) from its first continue, released when
+    # the adapter stops or the relay drops (phone unreachable): that session
+    # then reaps through the owner's normal policy. Phone turns that follow a
+    # release re-register the hold through the per-turn path.
+
+    def _ensure_local_viewer(self, session_id, profile):
+        """Start holding *session_id* as its viewer, or return the live hold.
+
+        A hold may end at any moment (owner stopped, adapter releasing); the
+        turn path treats a dead hold like no hold. Past the cap the call degrades
+        to the per-turn shape instead of leaking holds."""
+        entries = getattr(self, "_local_viewer_entries", None)
+        if entries is None:
+            entries = self._local_viewer_entries = {}
+        entry = entries.get(session_id)
+        if entry is not None and not entry.task.done():
+            return entry
+        if len(entries) >= _LOCAL_VIEWER_LIMIT:
+            logger.info("[hermes_bridge] local viewer cap reached; per-turn shape for %s", session_id)
+            return None
+        entry = _LocalViewerEntry(session_id)
+        entry.task = asyncio.create_task(self._hold_local_viewer(session_id, profile, entry))
+        entries[session_id] = entry
+        return entry
+
+    async def _hold_local_viewer(self, session_id, profile, entry):
+        """One owner connection held for *session_id*: the subscriber seat.
+
+        The event pump only keeps the client's queue drained; replies reach the
+        phone through each turn's own connection as before."""
+        try:
+            async with self._connect_local_owner(profile) as client:
+                await client.rpc("session.resume", session_id=session_id)
+                entry.ready.set()
+                while True:
+                    if isinstance((frame := await client.events.get()), BaseException):
+                        raise frame
+        except asyncio.CancelledError:
+            logger.info("[hermes_bridge] local viewer released for %s", session_id)
+            raise
+        except Exception as exc:
+            logger.info("[hermes_bridge] local viewer ended for %s: %s: %s",
+                        session_id, type(exc).__name__, exc)
+        finally:
+            if isinstance(getattr(self, "_local_viewer_entries", None), dict) \
+                    and self._local_viewer_entries.get(session_id) is entry:
+                del self._local_viewer_entries[session_id]
+
+    async def _release_local_viewers(self):
+        """End every viewer hold: the adapter is stopping or the phone became
+        unreachable (relay drop / before reconnect). Each ws close detaches its
+        session; the owner's orphan policy takes over from there (#135)."""
+        entries = getattr(self, "_local_viewer_entries", None)
+        if not entries:
+            self._local_viewer_entries = {}
+            return
+        self._local_viewer_entries = {}
+        tasks = [entry.task for entry in entries.values() if not entry.task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info("[hermes_bridge] local viewers released: %d hold(s)", len(tasks))
+
     async def _continue_local_owned(self, session_id, profile):
         try:
             async with self._connect_local_owner(profile) as client:
                 attached = await client.rpc("session.resume", session_id=session_id)
                 if not isinstance(attached.get("session_id"), str) or not attached["session_id"]:
                     raise ValueError("Owner returned no runtime session id")
+            entry = self._ensure_local_viewer(session_id, profile)
+            if entry is not None:
+                # The hold counts as the session's viewer; keep continuing only
+                # if that seat really landed (#135). A hold that died or never
+                # attached degrades to the per-turn shape, not to a fork.
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(entry.ready.wait(), 30)
         except Exception as exc:
             logger.warning("[hermes_bridge] local owner unavailable; falling back to fork: %s: %s",
                            type(exc).__name__, exc)
@@ -2759,6 +2856,10 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 admission = receipt["admission_id"]
                 admitted = True
                 ready.set()
+                # #135: a confirmed turn re-arms the session's viewer hold, so a
+                # phone continuing through a per-turn connection (fresh app run
+                # after an adapter release) also keeps the session alive.
+                self._ensure_local_viewer(target, profile)
                 if receipt["status"] == "terminal":
                     if receipt.get("outcome") in ("cancelled", "steered"):
                         return True
@@ -4762,23 +4863,30 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                     logger.debug("[hermes_bridge] kanban events unavailable: %s", db_path)
             else:
                 unavailable_logged = False
-                events, cursor = result
-                if cursor != saved_cursor:
+                events, batch_cursor = result
+                # Persist only what was delivered: a send that fails while the
+                # relay is unreachable keeps that event for the next tick.
+                cursor = await kanban_events.deliver_batch(
+                    events, cursor, batch_cursor, self._send_kanban_event
+                )
+                if cursor is not None and cursor != saved_cursor:
                     kanban_events.save_cursor(cursor_path, cursor)
                     saved_cursor = cursor
-                for event in events:
-                    wire = dict(event)
-                    assignee = wire.pop("assignee", None)
-                    metadata: Dict[str, Any] = {"kanban_event": wire}
-                    if isinstance(assignee, str) and assignee:
-                        metadata["profile"] = assignee
-                    await self.send(
-                        chat_id="kanban",
-                        content=kanban_events.event_content(event),
-                        metadata=metadata,
-                    )
 
             await asyncio.sleep(_KANBAN_POLL_INTERVAL_S)
+
+    async def _send_kanban_event(self, event: Dict[str, Any]) -> bool:
+        """Send one board event; True only when the phone will get it."""
+        wire, assignee = kanban_events.wire_event(event)
+        metadata: Dict[str, Any] = {"kanban_event": wire}
+        if assignee:
+            metadata["profile"] = assignee
+        result = await self.send(
+            chat_id="kanban",
+            content=kanban_events.event_content(event),
+            metadata=metadata,
+        )
+        return bool(getattr(result, "success", False))
 
     async def _kanban_snapshot_tick(self) -> None:
         """One build-compare-send cycle for kanban.snapshot (PRD_Inbox_Kanban.md
