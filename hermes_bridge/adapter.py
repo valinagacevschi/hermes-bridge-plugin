@@ -95,6 +95,42 @@ logger = logging.getLogger(__name__)
 _PRIVATE_IMPORT_WARNED: set[str] = set()
 
 
+class _LineageSessionDB:
+    """``resolve_resume_session_id`` / ``get_compression_lineage`` over a storage handle's lineage reader.
+
+    The caller probes a SessionDB by those two names; Hermes v0.23.3 renamed the reads to
+    ``resolve_resume_target`` / ``resume_lineage_ids`` on ``handle.lineage``. Both answers carry the
+    same meaning: the session a resume loads, and the segments a display resume reads.
+    """
+
+    def __init__(self, lineage: Any) -> None:
+        self._lineage = lineage
+
+    def resolve_resume_session_id(self, session_id: str) -> str:
+        return str(self._lineage.resolve_resume_target(session_id))
+
+    def get_compression_lineage(self, session_id: str) -> List[str]:
+        # The caller keeps lineage only when it is a list; the storage seam answers a tuple.
+        return [str(sid) for sid in self._lineage.resume_lineage_ids(session_id)]
+
+
+def _lineage_session_db(store: Any) -> Any:
+    """The SessionDB-shaped reader for a store whose ``_db`` is pin-only, else None."""
+    try:
+        handle = store._scoped_persistence()
+    except Exception as exc:
+        _warn_private_import_once("gateway.session.SessionStore._scoped_persistence", exc)
+        return None
+    lineage = getattr(handle, "lineage", None) if handle is not None else None
+    if lineage is None:
+        return None
+    if not callable(getattr(lineage, "resolve_resume_target", None)):
+        return None
+    if not callable(getattr(lineage, "resume_lineage_ids", None)):
+        return None
+    return _LineageSessionDB(lineage)
+
+
 def _warn_private_import_once(module: str, exc: Exception) -> None:
     if not isinstance(exc, (ImportError, AttributeError)):
         return
@@ -2500,10 +2536,16 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             return None
         # PRIVATE: SessionStore keeps the SQLite handle as `_db` (see PRIVATE_IMPORTS.md).
         try:
-            return getattr(store, "_db", None)
+            db = getattr(store, "_db", None)
         except Exception as exc:
             _warn_private_import_once("gateway.session.SessionStore._db", exc)
-            return None
+            db = None
+        if db is not None:
+            return db
+        # v0.23.3+ leaves `_db` at its explicit pin, so a running gateway answers None here and
+        # resolves the handle per call through the storage interface.
+        # PRIVATE: `_scoped_persistence()` and its `lineage` reader (see PRIVATE_IMPORTS.md).
+        return _lineage_session_db(store)
 
     def _canonicalize_for_continue(self, source: Any) -> None:
         """Pin RoutingIdentity the same way core ingress does before key derivation.
