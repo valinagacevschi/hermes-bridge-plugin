@@ -409,17 +409,48 @@ async def _require_rooms(host: Any) -> Dict[str, Any]:
 def _context_rpc_error(exc: _LocalRpcError) -> str:
     """groups.state/context LocalRpcError → phone error.
 
-    Heuristic on the upstream message: a disbanded or unknown room is gone;
-    every other upstream failure is transient/unavailable.
+    Heuristic on the upstream message (gateway/hosted_room_context.py raises
+    HostedRoomError with fixed English text): a disbanded or unknown room is
+    gone; a lead that is missing or not seated is recipient_unknown; the host's
+    length limits keep the phone's own names; everything else is transient.
     """
     message = str(getattr(exc, "message", "") or "").lower()
     if "disband" in message or "not found" in message or "unknown room" in message:
         return "room_gone"
+    if "lead must be a member" in message or "lead routing needs a lead_member_id" in message:
+        return "recipient_unknown"
+    if message.startswith("purpose must be at most"):
+        return "purpose_too_long"
+    if message.startswith("notes must be at most"):
+        return "notes_too_long"
     return "rooms_unavailable"
 
 
+def _patched_text(params: Dict[str, Any], field: str) -> Optional[str]:
+    """The phone's value for *field*: None = key absent (keep live), "" = clear.
+
+    Phones released with #154 send JSON null to clear purpose/notes and to drop
+    the lead on routing=everyone; null is an explicit clear, never invalid.
+    """
+    if field not in params:
+        return None
+    value = params[field]
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise _RpcError("invalid_params")
+    return value
+
+
 async def context(host: Any, params: Dict[str, Any]) -> Dict[str, Any]:
-    """rooms.context: PATCH purpose/notes/routing; omitted fields keep live values."""
+    """rooms.context: PATCH purpose/notes/routing; omitted fields keep live values.
+
+    Upstream groups.context requires purpose and notes, so omitted ones are
+    filled from groups.state. Routing and lead are forwarded only when the
+    phone changed them: upstream keeps omitted routing fields from the latest
+    room.context_set under its append write lock, so a concurrent routing edit
+    on the laptop is never written back stale by a purpose/notes save.
+    """
     require_bots_enabled()
     await _require_rooms(host)
     room_id = str(params.get("room_id") or "").strip()
@@ -428,6 +459,14 @@ async def context(host: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     event_id = str(params.get("event_id") or "").strip()
     if not event_id:
         raise _RpcError("invalid_event")
+    patched_purpose = _patched_text(params, "purpose")
+    patched_notes = _patched_text(params, "notes")
+    patched_lead = _patched_text(params, "lead_member_id")
+    patched_routing = params.get("routing") if "routing" in params else None
+    if "routing" in params and (
+        not isinstance(patched_routing, str) or patched_routing not in _ROUTING_MODES
+    ):
+        raise _RpcError("invalid_routing")
     try:
         state = await host._local_rpc("groups.state", {"room_id": room_id})
     except _LocalRpcError as exc:
@@ -441,19 +480,13 @@ async def context(host: Any, params: Dict[str, Any]) -> Dict[str, Any]:
         "routing": _ROUTING_EVERYONE,
         "lead_member_id": "",
     }
-    # Key absent = keep live value; "" is an explicit clear.
-    for field in ("purpose", "notes", "lead_member_id"):
-        if field in params and not isinstance(params[field], str):
-            raise _RpcError("invalid_params")
-    purpose = params["purpose"] if "purpose" in params else current["purpose"]
-    notes = params["notes"] if "notes" in params else current["notes"]
-    lead_member_id = (
-        params["lead_member_id"] if "lead_member_id" in params else current["lead_member_id"]
-    )
-    routing = params["routing"] if "routing" in params else current["routing"]
-    if not isinstance(routing, str) or routing not in _ROUTING_MODES:
-        raise _RpcError("invalid_routing")
-    if routing == _ROUTING_LEAD:
+    purpose = current["purpose"] if patched_purpose is None else patched_purpose
+    notes = current["notes"] if patched_notes is None else patched_notes
+    routing = current["routing"] if patched_routing is None else patched_routing
+    lead_member_id = current["lead_member_id"] if patched_lead is None else patched_lead
+    # Pre-check the lead against the seated members so the phone gets a named
+    # error without a write; upstream re-checks under its lock.
+    if routing == _ROUTING_LEAD and (patched_routing is not None or patched_lead is not None):
         members_raw = room_raw.get("members") if isinstance(room_raw.get("members"), list) else []
         seated = {
             str(m.get("member_id") or "")
@@ -462,29 +495,31 @@ async def context(host: Any, params: Dict[str, Any]) -> Dict[str, Any]:
         }
         if not lead_member_id or lead_member_id not in seated:
             raise _RpcError("recipient_unknown")
+    upstream: Dict[str, Any] = {
+        "room_id": room_id,
+        "event_id": event_id,
+        "purpose": purpose,
+        "notes": notes,
+    }
+    if patched_routing is not None:
+        upstream["routing"] = patched_routing
+    if patched_lead is not None:
+        upstream["lead_member_id"] = patched_lead
     try:
-        await host._local_rpc(
-            "groups.context",
-            {
-                "room_id": room_id,
-                "event_id": event_id,
-                "purpose": purpose,
-                "notes": notes,
-                "routing": routing,
-                "lead_member_id": lead_member_id,
-            },
-        )
+        result = await host._local_rpc("groups.context", upstream)
     except _LocalRpcError as exc:
         raise _RpcError(_context_rpc_error(exc)) from exc
+    # Upstream returns the record it stored: normalized text, the lead dropped
+    # off lead routing, and the first write's values on a retried event_id.
+    saved = _project_context(result.get("context") if isinstance(result, dict) else None) or {
+        "purpose": purpose,
+        "notes": notes,
+        "routing": routing,
+        "lead_member_id": lead_member_id if routing == _ROUTING_LEAD else "",
+    }
     return {
         "ok": True,
-        "context": {
-            "purpose": purpose,
-            "notes": notes,
-            "routing": routing,
-            "lead_member_id": lead_member_id,
-            "unmentioned_delivery": _delivery_from_routing(routing),
-        },
+        "context": {**saved, "unmentioned_delivery": _delivery_from_routing(saved["routing"])},
     }
 
 

@@ -46,9 +46,6 @@ from . import (
     bot_notify,
     bot_rooms,
     bot_subagents,
-    kanban_events,
-    kanban_op_exec,
-    kanban_snapshot,
     local_owner,
     session_queued,
 )
@@ -62,6 +59,7 @@ from .bots_policy import (
 from .capability import CapabilityDescriptor
 from .crypto import load_psk, open_blob, open_frame, seal, seal_blob
 from .local_api import API_SERVER_PORT, SESSION_HEADER, LocalApi
+from .local_progress import LocalTurnProgress
 from .operation_dispatch import OperationDispatcher, _LocalRpcError, _RpcError, _http_error_detail
 from .pair_command import register_pair_command
 from .session_continue import (
@@ -92,14 +90,6 @@ from .streaming_voice import (
 )
 
 _LIVE_EDIT_INTERVAL_S = 0.8
-# Read-only kanban.db poll (PRD_Inbox_Kanban.md §3). Same order of magnitude as
-# the pending-writes poll: cheap indexed reads, and nobody expects a board
-# change to reach the phone in less than a few seconds.
-_KANBAN_POLL_INTERVAL_S = 20.0
-# kanban.snapshot emitter (PRD_Inbox_Kanban.md §3/§4 wire contract) — feeds
-# the phone's kanban cache directly, so it polls faster than the Inbox-only
-# board-event watcher above; a snapshot is only pushed when it changed.
-_KANBAN_SNAPSHOT_POLL_INTERVAL_S = 5.0
 
 logger = logging.getLogger(__name__)
 _PRIVATE_IMPORT_WARNED: set[str] = set()
@@ -649,20 +639,6 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         # Background poll for newly staged memory/skill writes (PRD_Features.md
         # §2.7) — see _poll_pending_writes for why this is polling, not a push.
         self._approval_poll_task: Optional[asyncio.Task] = None
-        # Board events (PRD_Inbox_Kanban.md §3) — read-only poll of kanban.db.
-        # None means the watcher never started; the task disables itself when
-        # no watch profiles are configured.
-        self._kanban_poll_task: Optional[asyncio.Task] = None
-        # kanban.snapshot emitter (PRD_Inbox_Kanban.md §3/§4) — full-board
-        # push on change, feeds lib/kanban-cache.ts. Separate from the
-        # per-profile Inbox board-event watcher above.
-        self._kanban_snapshot_poll_task: Optional[asyncio.Task] = None
-        # Last emitted snapshot_json() string. None forces a resend on the
-        # next tick — true at process start, and reset on every reconnect
-        # (see _run_loop) so a phone that was offline for a board change
-        # gets the current state instead of waiting for the next change.
-        self._kanban_snapshot_last: Optional[str] = None
-        self._kanban_snapshot_db_missing_logged: bool = False
         # Capability handshake received from the relay on this connection (#40).
         # None means "no hello has arrived yet on this connection" — distinct
         # from an empty-ops descriptor, and reset on every reconnect since a
@@ -715,6 +691,9 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         # Phone-advertised streaming TTS playback (client.capabilities). Old phones
         # never call it → False → core keeps whole-file send_voice.
         self._client_streaming_tts: bool = False
+        # Phone-advertised live tool progress for continued Local chat turns
+        # (#153, client.capabilities tool_progress). Old phones → no frames.
+        self._client_tool_progress: bool = False
         # handle id → StreamingTtsState for concurrent write serialization.
         self._tts_streams: Dict[str, StreamingTtsState] = {}
         # Cap: one live host-dictation session per chat (keyed by stream_id).
@@ -764,13 +743,6 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         self._run_task = asyncio.ensure_future(self._run_loop())
         if self._approval_poll_task is None or self._approval_poll_task.done():
             self._approval_poll_task = asyncio.ensure_future(self._poll_pending_writes())
-        if getattr(self, "_kanban_poll_task", None) is None or self._kanban_poll_task.done():
-            self._kanban_poll_task = asyncio.ensure_future(self._poll_kanban_events())
-        if (
-            getattr(self, "_kanban_snapshot_poll_task", None) is None
-            or self._kanban_snapshot_poll_task.done()
-        ):
-            self._kanban_snapshot_poll_task = asyncio.ensure_future(self._poll_kanban_snapshot())
         self._ensure_bot_notify_observer()
         return ok
 
@@ -823,6 +795,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             self._descriptor = None
             # Phone must re-advertise after reconnect; don't keep a stale flag.
             self._client_streaming_tts = False
+            self._client_tool_progress = False
             await self._cancel_all_stt_sessions("phone_disconnected")
             await self._release_local_viewers()
             # The high-water mark is connection-scoped (#41) — the next
@@ -830,10 +803,6 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             # so a seq the relay legitimately resends must not be rejected as
             # already-seen from the PREVIOUS connection's state.
             self._inbound_seen_seq = 0
-            # A reconnect may have missed a board change while offline — force
-            # a resend on the first kanban.snapshot tick of the new
-            # connection instead of waiting for the board to change again.
-            self._kanban_snapshot_last = None
             # Any stream still awaiting its finalize died with the socket. The
             # flush in edit_message already ran for whichever edit failed.
             for message_id in list(self._stream_pending):
@@ -886,20 +855,6 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             self._approval_poll_task = None
-        if getattr(self, "_kanban_poll_task", None):
-            self._kanban_poll_task.cancel()
-            try:
-                await self._kanban_poll_task
-            except asyncio.CancelledError:
-                pass
-            self._kanban_poll_task = None
-        if getattr(self, "_kanban_snapshot_poll_task", None):
-            self._kanban_snapshot_poll_task.cancel()
-            try:
-                await self._kanban_snapshot_poll_task
-            except asyncio.CancelledError:
-                pass
-            self._kanban_snapshot_poll_task = None
         self._stop_bot_notify_observer()
         if self._bot_notify_task:
             try:
@@ -909,6 +864,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             self._bot_notify_task = None
         await self._cancel_all_stt_sessions("phone_disconnected")
         self._client_streaming_tts = False
+        self._client_tool_progress = False
         await self._release_local_viewers()
         if self._ws:
             await self._ws.close()
@@ -1001,12 +957,11 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         # dedicated "origin" flag exists upstream — job_id's presence is the
         # only reliable signal. The phone uses this to route the message to a
         # dedicated "Agent" inbox session instead of whatever chat is open.
-        kanban_event = metadata.get("kanban_event") if metadata else None
         # Board events carry no job_id, but they are unsolicited in exactly the
         # same sense: no Hermes session and no triggering user message. Keep
         # the marker distinct so the cron-owner lookup below (which would RPC
         # on a job that does not exist) is never reached for them.
-        is_unsolicited = bool(metadata and ("job_id" in metadata or kanban_event))
+        is_unsolicited = bool(metadata and "job_id" in metadata)
         core_profile = None
         if is_unsolicited:
             owner = metadata.get("profile") or metadata.get("profile_name")
@@ -1057,8 +1012,6 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             payload["unsolicited"] = True
             if core_profile:
                 payload["core_profile"] = core_profile
-        if isinstance(kanban_event, dict):
-            payload["kanban_event"] = kanban_event
         thread_id = metadata.get("thread_id") if metadata else None
         outbound_session_id = self._outbound_phone_session_id(
             thread_id, is_unsolicited=is_unsolicited
@@ -2330,54 +2283,6 @@ class HermesBridgeAdapter(BasePlatformAdapter):
     # connection errors propagate — _handle_rpc classifies them uniformly.
     # ------------------------------------------------------------------
 
-    async def _rpc_kanban_resync(self, p: Dict[str, Any]) -> Any:
-        """Resend the current board after the phone's stream reconnects
-        (PRD_Inbox_Kanban.md §3/§4).
-
-        `_kanban_snapshot_last` records a successful bridge→relay WS send,
-        not phone delivery — the relay publishes live frames with no
-        per-phone buffer. A phone that reconnects after a board change hence
-        keeps a stale cache until the board changes again. Clearing the
-        watermark forces _kanban_snapshot_tick to resend even when the body
-        is unchanged; the send stays durable=False (live-only, no push).
-        """
-        self._kanban_snapshot_last = None
-        await self._kanban_snapshot_tick()
-        return {"ok": True}
-
-    def _kanban_op_receiver(self) -> kanban_op_exec.KanbanOpReceiver:
-        """The kanban.op receiver (GitLab #156) — lazily built, test-replaceable."""
-        receiver = getattr(self, "_kanban_op_receiver_cache", None)
-        if receiver is None:
-            receiver = kanban_op_exec.KanbanOpReceiver(
-                kanban_op_exec.DirectKanbanExecutor(),
-                ledger=kanban_op_exec.KanbanOpLedger(kanban_op_exec.ledger_path(self._profile_id)),
-                version_fn=kanban_snapshot.build_snapshot,
-                on_mutated=self._kanban_snapshot_tick,
-            )
-            self._kanban_op_receiver_cache = receiver
-        return receiver
-
-    async def _rpc_kanban_op(self, p: Dict[str, Any]) -> Any:
-        """Kanban op receiver (PRD_Inbox_Kanban.md §2.1/§4; GitLab #156).
-
-        ``p`` is the phone's sealed-frame OpRequest body verbatim (the sealed
-        envelope itself was already verified and decrypted in ``_read_frame``).
-        The returned data is an Ack body mirrored from lib/kanban-wire.ts with
-        a mandatory op_id echo, acked in order under the receiver's serial
-        lock. Only a body without a usable op_id and an op that does not
-        settle within the receiver's bound raise: those become rpc errors
-        ("malformed…" / "executor_timeout") so the phone's op queue treats
-        them as retryable transport failures, never as successes.
-        """
-        receiver = self._kanban_op_receiver()
-        try:
-            return await receiver.handle(p)
-        except kanban_op_exec.KanbanOpTransportError as exc:
-            raise _RpcError(str(exc))
-        except kanban_op_exec.KanbanOpExecutionTimeout:
-            raise _RpcError("executor_timeout")
-
     async def _listed_bridge_sessions(
         self,
         core_profile: Optional[str] = None,
@@ -2839,8 +2744,22 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         # Admission answers promptly; do not block the inbound FIFO on the whole model turn.
         await ready.wait()
 
+    def _local_turn_progress(self, payload, request_id, admission):
+        """Progress relay for this turn, only when the phone advertised it (#153)."""
+        if not getattr(self, "_client_tool_progress", False) or not isinstance(admission, str):
+            return None
+        return LocalTurnProgress(session_id=payload["session_id"], reply_to=payload["msg_id"],
+                                 turn_id=request_id, admission_id=admission)
+
+    async def _end_local_turn_progress(self, progress, reason):
+        if progress is None or (frame := progress.end(reason)) is None:
+            return
+        with contextlib.suppress(Exception):
+            await self._send_live_payload(frame)
+
     async def _run_local_owner(self, payload, profile, request_id, ready, receipt=None):
         admitted = receipt is not None
+        progress = None
         try:
             async with self._connect_local_owner(profile) as client:
                 attached = await client.rpc("session.resume", session_id=payload["session_id"])
@@ -2861,6 +2780,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 # phone continuing through a per-turn connection (fresh app run
                 # after an adapter release) also keeps the session alive.
                 self._ensure_local_viewer(target, profile)
+                progress = self._local_turn_progress(payload, request_id, admission)
                 if receipt["status"] == "terminal":
                     if receipt.get("outcome") in ("cancelled", "steered"):
                         return True
@@ -2879,9 +2799,12 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                         if not isinstance(params, dict) or params.get("admission_id") != admission:
                             continue
                         if params.get("type") != "message.complete":
+                            if progress is not None and (live := progress.observe(params)) is not None:
+                                await self._send_live_payload(live)
                             continue
                         event_payload = params.get("payload") or {}
                         if event_payload.get("outcome") in ("cancelled", "steered"):
+                            await self._end_local_turn_progress(progress, event_payload["outcome"])
                             return True
                         content = event_payload.get("text")
                         if content is None:
@@ -2891,6 +2814,7 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                                                      admission_id=admission, include_result=True)
                             result = saved.get("result")
                             content = result.get("final_response") if isinstance(result, dict) else None
+                        await self._end_local_turn_progress(progress, "complete")
                         await self._deliver_local_owner_reply(payload, request_id, content)
                         return True
         except local_owner.OwnerUnconfirmed as exc:
@@ -2904,6 +2828,8 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             return None if admitted else False
         finally:
             ready.set()
+            # Error, disconnect, timeout or cancellation: the phone's bars never outlive the turn.
+            await self._end_local_turn_progress(progress, "error")
 
     async def _deliver_local_owner_reply(self, payload, request_id, content):
         if not isinstance(content, str):
@@ -3475,26 +3401,6 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         query = {"days": days, **await self._profile_body(p)}
         return await self._api.get(f"/api/analytics/usage?{urlencode(query)}")
 
-    def _kanban_feature_enabled(self) -> bool:
-        """Prefer the live runner's plugin gate; old runtimes fall back to its DB."""
-        try:
-            runner = getattr(self, "gateway_runner", None)
-            config = getattr(runner, "config", None) if runner is not None else None
-            plugins = config.get("plugins") if isinstance(config, dict) else getattr(config, "plugins", None)
-            if plugins is not None:
-                enabled = plugins.get("enabled") if isinstance(plugins, dict) else getattr(plugins, "enabled", None)
-                disabled = plugins.get("disabled") if isinstance(plugins, dict) else getattr(plugins, "disabled", None)
-                if enabled is not None or disabled is not None:
-                    enabled_names = set(enabled) if isinstance(enabled, (list, tuple, set)) else set()
-                    disabled_names = set(disabled) if isinstance(disabled, (list, tuple, set)) else set()
-                    return "kanban" in enabled_names and "kanban" not in disabled_names
-        except Exception:
-            pass
-        try:
-            return os.path.isfile(kanban_events.kanban_db_path())
-        except Exception:
-            return False
-
     async def _rpc_agents_list(self, p: Dict[str, Any]) -> Any:
         deadline = asyncio.get_running_loop().time() + _AGENTS_SUBCALL_TIMEOUT
 
@@ -3599,7 +3505,6 @@ class HermesBridgeAdapter(BasePlatformAdapter):
                 "can_update_hermes": status.get("can_update_hermes") if isinstance(status, dict) else None,
                 "plugin_version": version_match.group(1) if version_match else None,
                 "profile_scoping": profile_scoping,
-                "features": {"inbox": True, "kanban": self._kanban_feature_enabled()},
                 "agents": agents}
 
     @staticmethod
@@ -4144,10 +4049,13 @@ class HermesBridgeAdapter(BasePlatformAdapter):
         """
         if p.get("streaming_tts") is True:
             self._client_streaming_tts = True
+        if p.get("tool_progress") is True:
+            self._client_tool_progress = True
         live_stt = await self._probe_live_stt(p)
         return {
             "streaming_tts": bool(self._client_streaming_tts),
             "live_stt": live_stt,
+            "tool_progress": bool(getattr(self, "_client_tool_progress", False)),
         }
 
     async def _probe_live_stt(self, p: Dict[str, Any]) -> bool:
@@ -4828,123 +4736,6 @@ class HermesBridgeAdapter(BasePlatformAdapter):
             # Seed attempt failed — retry almost immediately rather than
             # waiting out a full interval with an unestablished baseline.
             await asyncio.sleep(self._APPROVAL_POLL_INTERVAL_S if seeded else 1)
-
-    async def _poll_kanban_events(self) -> None:
-        """Emit watched card transitions as unsolicited inbox frames.
-
-        Read-only by construction (``kanban_events.poll`` opens the DB with
-        ``mode=ro``). Disabled — with one log line — when no watch profiles
-        resolve, when the board file is absent, or when the file is not a
-        readable kanban schema; none of those may crash the gateway.
-        """
-        watched = kanban_events.watch_profiles(
-            getattr(self, "config", None), self._own_core_profile_name()
-        )
-        if not watched:
-            logger.info("[hermes_bridge] kanban events disabled: no watch profiles")
-            return
-        db_path = kanban_events.kanban_db_path()
-        cursor_path = kanban_events.state_path(self._profile_id)
-        cursor = kanban_events.load_cursor(cursor_path)
-        saved_cursor = cursor
-        unavailable_logged = False
-
-        while self._should_run:
-            try:
-                result = await asyncio.to_thread(
-                    kanban_events.poll, db_path, cursor, watched
-                )
-            except Exception as exc:
-                logger.warning("[hermes_bridge] kanban poll failed: %s", exc)
-                result = None
-
-            if result is None:
-                if not unavailable_logged:
-                    unavailable_logged = True
-                    logger.debug("[hermes_bridge] kanban events unavailable: %s", db_path)
-            else:
-                unavailable_logged = False
-                events, batch_cursor = result
-                # Persist only what was delivered: a send that fails while the
-                # relay is unreachable keeps that event for the next tick.
-                cursor = await kanban_events.deliver_batch(
-                    events, cursor, batch_cursor, self._send_kanban_event
-                )
-                if cursor is not None and cursor != saved_cursor:
-                    kanban_events.save_cursor(cursor_path, cursor)
-                    saved_cursor = cursor
-
-            await asyncio.sleep(_KANBAN_POLL_INTERVAL_S)
-
-    async def _send_kanban_event(self, event: Dict[str, Any]) -> bool:
-        """Send one board event; True only when the phone will get it."""
-        wire, assignee = kanban_events.wire_event(event)
-        metadata: Dict[str, Any] = {"kanban_event": wire}
-        if assignee:
-            metadata["profile"] = assignee
-        result = await self.send(
-            chat_id="kanban",
-            content=kanban_events.event_content(event),
-            metadata=metadata,
-        )
-        return bool(getattr(result, "success", False))
-
-    async def _kanban_snapshot_tick(self) -> None:
-        """One build-compare-send cycle for kanban.snapshot (PRD_Inbox_Kanban.md
-        §3/§4). Pulled out of _poll_kanban_snapshot so a test can drive one
-        cycle directly, same reason _diff_new_pending is a plain function.
-
-        Reuses _deliver, but with durable=False: seal-and-push-live only, no
-        durable enqueue (see the comment at the call site below). _run_loop's
-        reconnect of the gateway's own socket to the relay resets
-        `_kanban_snapshot_last`, so the first tick after THAT reconnect
-        treats the board as changed and retries the send — but it only
-        reaches the phone if the phone itself is connected when the frame
-        goes out. That reset is not proof that a phone which was offline
-        when the board changed gets the snapshot once the phone reconnects.
-        """
-        try:
-            snapshot = await asyncio.to_thread(kanban_snapshot.build_snapshot)
-        except FileNotFoundError:
-            if not self._kanban_snapshot_db_missing_logged:
-                self._kanban_snapshot_db_missing_logged = True
-                logger.debug("[hermes_bridge] kanban snapshot unavailable: no kanban.db")
-            return
-        except Exception as exc:
-            logger.warning("[hermes_bridge] kanban snapshot build failed: %s", exc)
-            return
-
-        self._kanban_snapshot_db_missing_logged = False
-        body = kanban_snapshot.snapshot_json(snapshot)
-        if body == self._kanban_snapshot_last:
-            return
-
-        msg_id = str(uuid.uuid4())
-        payload: Dict[str, Any] = {"role": "kanban.snapshot", "content": body, "msg_id": msg_id}
-        try:
-            # durable=False: live push only, no durable enqueue and no "New
-            # message" push. A phone that is not connected when the frame
-            # goes out misses it until the board changes again or the
-            # gateway reconnects to the relay (_run_loop resets
-            # _kanban_snapshot_last on that reconnect, forcing a retry).
-            result = await self._deliver(msg_id, payload, category=None, durable=False)
-        except Exception as exc:
-            logger.warning("[hermes_bridge] kanban snapshot send failed: %s", exc)
-            return
-        if result.success:
-            self._kanban_snapshot_last = body
-
-    async def _poll_kanban_snapshot(self) -> None:
-        """Push the full board to the phone's kanban cache on change.
-
-        Unlike _poll_kanban_events (per-profile Inbox items), this always
-        covers board "default" with no watch-profile gating. Errors are
-        logged and swallowed per tick — same contract as
-        _poll_pending_writes — so a bad tick never kills the connection.
-        """
-        while self._should_run:
-            await self._kanban_snapshot_tick()
-            await asyncio.sleep(_KANBAN_SNAPSHOT_POLL_INTERVAL_S)
 
     async def _upload_blob(self, sealed: bytes, mime: str) -> str:
         """POST sealed bytes to the relay's sealed-blob store
